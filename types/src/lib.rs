@@ -111,3 +111,7 @@ mod unphased {
     #[cfg(test)]
     pub mod spec_tests;
 }
+
+pub mod eip_8025 {
+    pub mod consts;
+}
