@@ -21,8 +21,8 @@ use ssz::{
 use strum::{Display, EnumString};
 use typenum::{
     B1, IsGreaterOrEqual, NonZero, Prod, Quot, Sub1, Sum, True, U1, U2, U4, U8, U16, U17, U32, U64,
-    U128, U256, U512, U2048, U4096, U8192, U65536, U262144, U1048576, U16777216, U134217728,
-    U1073741824, U1099511627776, Unsigned,
+    U128, U256, U512, U2048, U4096, U8192, U65536, U262144, U1048576, U4194304, U16777216,
+    U134217728, U1073741824, U1099511627776, Unsigned,
 };
 
 use crate::{
@@ -245,6 +245,9 @@ pub trait Preset: Copy + Eq + Ord + Hash + Default + Debug + Send + Sync + 'stat
         + Send
         + Sync;
 
+    // EIP-8025
+    type MaxProofSize: MerkleElements<u8> + Eq + Debug + Send + Sync;
+
     // Derived type-level variables
     type MaxAttestersPerSlot: MerkleElements<ValidatorIndex>
         + MerkleBits
@@ -389,6 +392,9 @@ impl Preset for Mainnet {
     type BuilderRegistryLimit = U1099511627776;
     type BuilderPendingWithdrawalsLimit = U1048576;
 
+    // EIP-8025
+    type MaxProofSize = U4194304;
+
     // Derived type-level variables
     type MaxAttestersPerSlot = Prod<Self::MaxValidatorsPerCommittee, Self::MaxCommitteesPerSlot>;
     type MaxCellProofsPerBlock =
@@ -470,6 +476,9 @@ impl Preset for Minimal {
         type MaxPayloadAttestation;
         type BuilderRegistryLimit;
         type BuilderPendingWithdrawalsLimit;
+
+        // EIP-8025
+        type MaxProofSize;
     }
 
     // Phase 0
@@ -587,6 +596,9 @@ impl Preset for Medalla {
         type MaxPayloadAttestation;
         type BuilderRegistryLimit;
         type BuilderPendingWithdrawalsLimit;
+
+        // EIP-8025
+        type MaxProofSize;
 
         // Derived type-level variables
         type MaxAttestersPerSlot;
