@@ -114,5 +114,6 @@ mod unphased {
 
 pub mod eip_8025 {
     pub mod consts;
+    pub mod containers;
     pub mod primitives;
 }
