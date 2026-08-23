@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_containers_reject_unknown_fields() {
+    fn proof_containers_reject_unknown_fields() -> serde_json::Result<()> {
         let message = json!({
             "proof_data": "0x00",
             "proof_type": "7",
@@ -118,6 +118,8 @@ mod tests {
                 "new_payload_request_root": format!("0x{}", "bb".repeat(32)),
             },
         });
+
+        serde_json::from_value::<ExecutionProof<Mainnet>>(message.clone())?;
 
         serde_json::from_value::<ExecutionProof<Mainnet>>(json_with_unknown_field(&message))
             .expect_err("deserialization should fail due to unknown field");
@@ -128,8 +130,34 @@ mod tests {
             "signature": format!("0x{}", "00".repeat(96)),
         });
 
+        serde_json::from_value::<SignedExecutionProof<Mainnet>>(signed.clone())?;
+
         serde_json::from_value::<SignedExecutionProof<Mainnet>>(json_with_unknown_field(&signed))
             .expect_err("deserialization should fail due to unknown field");
+
+        Ok(())
+    }
+
+    #[test]
+    fn execution_proof_serializes_proof_type_as_string_in_json() -> serde_json::Result<()> {
+        let json = serde_json::to_value(populated_signed_execution_proof().message)?;
+
+        assert_eq!(json["proof_type"], json!("7"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn execution_proof_deserializes_proof_type_from_number_in_json() -> serde_json::Result<()> {
+        let mut json = serde_json::to_value(populated_signed_execution_proof().message)?;
+        json["proof_type"] = json!(7);
+
+        assert_eq!(
+            serde_json::from_value::<ExecutionProof<Mainnet>>(json)?,
+            populated_signed_execution_proof().message,
+        );
+
+        Ok(())
     }
 
     #[test]
