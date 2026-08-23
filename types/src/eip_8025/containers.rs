@@ -12,6 +12,7 @@ use crate::{
 #[serde(bound = "", deny_unknown_fields)]
 pub struct ExecutionProof<P: Preset> {
     pub proof_data: ProofData<P>,
+    #[serde(with = "serde_utils::string_or_native")]
     pub proof_type: ProofType,
     pub public_input: PublicInput,
 }
