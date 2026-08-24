@@ -17,7 +17,7 @@ pub use crate::{
     error::{IndexError, PushError, ReadError, WriteError},
     hc::Hc,
     incomplete_persistent_vector::IncompletePersistentVector,
-    merkle_tree::{MerkleTree, ProofWithLength, mix_in_length},
+    merkle_tree::{MerkleTree, ProofWithLength, merkleize_progressive, mix_in_length},
     persistent_list::PersistentList,
     persistent_vector::PersistentVector,
     porcelain::{SszHash, SszRead, SszReadDefault, SszSize, SszWrite},

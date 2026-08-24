@@ -15573,6 +15573,7 @@ dependencies = [
  "ethereum-types",
  "generic-array 0.14.7",
  "hashing",
+ "hex-literal 1.1.0",
  "itertools 0.14.0",
  "nonzero_ext",
  "num-traits",

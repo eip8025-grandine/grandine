@@ -296,6 +296,94 @@ impl<D: ArrayLength<H256>> MerkleTree<D> {
 
 pub type ProofWithLength<N> = ContiguousVector<H256, Add1<N>>;
 
+/// [`merkleize_progressive`](https://github.com/ethereum/consensus-specs/blob/a08d8a6e2b45f0b8c0d379abc15583427c643689/ssz/simple-serialize.md#merkleization)
+///
+/// Splits `chunks` into consecutive subtrees of 1, 4, 16, 64… leaves and combines their roots
+/// from right to left. The result does not depend on any capacity, which is what makes this
+/// usable for types that have no length bound.
+///
+/// [`MerkleTree`] cannot be used for the subtrees because it takes its depth from the type level,
+/// whereas the depth of a progressive subtree depends on the number of chunks passed in.
+#[must_use]
+pub fn merkleize_progressive(
+    chunks: impl IntoIterator<IntoIter = impl ExactSizeIterator<Item = H256>>,
+) -> H256 {
+    let mut chunks = chunks.into_iter();
+    let mut subtree_roots = Vec::new();
+    let mut depth = 0;
+
+    while chunks.len() > 0 {
+        let leaves = 1 << depth;
+
+        subtree_roots.push(merkleize_chunks_with_depth(
+            chunks.by_ref().take(leaves),
+            depth,
+        ));
+
+        depth = depth.saturating_add(2);
+    }
+
+    // The recursion in the specification is right-leaning and bottoms out at a zero value.
+    subtree_roots
+        .into_iter()
+        .rev()
+        .fold(H256::zero(), |right, left| {
+            hashing::hash_256_256(left, right)
+        })
+}
+
+/// [`MerkleTree::merkleize_chunks`] with the depth of the tree passed in at runtime.
+///
+/// The chunks are padded to `1 << depth` virtually, as in [`MerkleTree`].
+fn merkleize_chunks_with_depth(
+    chunks: impl IntoIterator<IntoIter = impl ExactSizeIterator<Item = H256>>,
+    depth: usize,
+) -> H256 {
+    let chunks = chunks.into_iter();
+    let chunk_count = chunks.len();
+
+    if chunk_count == 0 {
+        return ZERO_HASHES[depth];
+    }
+
+    assert!(chunk_count <= 1 << depth);
+
+    let last_index = chunk_count.saturating_sub(1);
+
+    let mut sibling_hashes = vec![H256::zero(); depth];
+    let mut root = H256::zero();
+
+    for (index, chunk) in chunks.enumerate() {
+        let sibling_to_update = binary_carry_sequence(index);
+
+        let mut hash = chunk;
+
+        for sibling_hash in sibling_hashes.iter().take(sibling_to_update) {
+            hash = hashing::hash_256_256(*sibling_hash, hash);
+        }
+
+        if index < last_index {
+            if sibling_to_update < depth {
+                sibling_hashes[sibling_to_update] = hash;
+            }
+
+            continue;
+        }
+
+        for height in sibling_to_update..depth {
+            hash = if index.get_bit(height) {
+                hashing::hash_256_256(sibling_hashes[height], hash)
+            } else {
+                hashing::hash_256_256(hash, ZERO_HASHES[height])
+            };
+        }
+
+        root = hash;
+    }
+
+    root
+}
+
 /// [`mix_in_length`](https://github.com/ethereum/consensus-specs/blob/4c54bddb6cd144ca8a0a01b7155f43b295c70458/ssz/simple-serialize.md#merkleization)
 ///
 /// The SSZ specification does not state that `length` should be limited to `u64`.
@@ -327,7 +415,9 @@ fn binary_carry_sequence(index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use typenum::{U0, U2, U3};
+    use hex_literal::hex;
+    use test_case::test_case;
+    use typenum::{U0, U2, U3, U4, Unsigned};
 
     use super::*;
 
@@ -477,5 +567,82 @@ mod tests {
     fn usize_fits_in_h256() {
         hash_of_length(usize::MIN);
         hash_of_length(usize::MAX);
+    }
+
+    // The expected roots below were produced by an independent implementation of
+    // `merkleize_progressive` transcribed from `ssz/simple-serialize.md` at the pinned
+    // `consensus-specs` revision.
+    //
+    // They are NOT cross-checked against the pyspec, which design 0001 requires and which
+    // cannot be run here. That verification gap is still open.
+    //
+    // The chunk counts straddle the subtree boundaries, which fall at 1, 5, 21 and 85 chunks.
+    #[test_case(0, hex!("0000000000000000000000000000000000000000000000000000000000000000"))]
+    #[test_case(1, hex!("037d6dfb3a369a41e01100fdd53c35ee3fb69ddec5830d61e1138d066a4c2285"))]
+    #[test_case(2, hex!("2dfe47da19ad9ff11afe44dd8de4db8517cefd5a9bddffe6652b26a1b91ea5ac"))]
+    #[test_case(4, hex!("860e625c823ed369bad6d7cde0b59908637627f73df2eff13b4e56a4b3a049ac"))]
+    #[test_case(5, hex!("3fd53b812118ddea60b9deab5c72d32b0c4dcfd2c94deda753e6e1d548fbc274"))]
+    #[test_case(6, hex!("2e2a2abd4d0e28498ec0cdd817c715b246aa15e7b34767061b7632337188429e"))]
+    #[test_case(20, hex!("31dd06398738f5e83c63b4dd34040b0b9d51fb527168cdc68565c4033eb81692"))]
+    #[test_case(21, hex!("f148f679afbfebfe5616080a45461aee3d1f4ce2cc752ce824c3f067d2707623"))]
+    #[test_case(22, hex!("040be60071c540aafc1d44f366239ab6a41bf8740a38f9d52ab0bbd9cd974c45"))]
+    #[test_case(85, hex!("24ea21562226364be74fd2696d0824a4347cfac7dd4b2ae28cd0e9cc22bc341d"))]
+    #[test_case(86, hex!("b73c4c427974f47c74c2812d353c966f5dadae70c44f6fe9a15e179b86914977"))]
+    fn merkleize_progressive_matches_reference(chunk_count: usize, expected: [u8; 32]) {
+        let chunks = test_chunks(chunk_count);
+
+        assert_eq!(merkleize_progressive(chunks), H256(expected));
+    }
+
+    #[test]
+    fn merkleize_progressive_handles_zero_chunks() {
+        assert_eq!(merkleize_progressive([]), H256::zero());
+    }
+
+    // A single chunk is merkleized as a subtree of one leaf, then combined with the zero value
+    // that the recursion bottoms out at.
+    #[test]
+    fn merkleize_progressive_handles_single_chunk() {
+        let chunk = H256::repeat_byte(1);
+
+        assert_eq!(
+            merkleize_progressive([chunk]),
+            hashing::hash_256_256(chunk, H256::zero()),
+        );
+    }
+
+    // `MerkleTree` is already covered by `consensus-spec-tests`, so agreeing with it pins the
+    // binary part of progressive merkleization to something independently tested.
+    #[test]
+    fn merkleize_chunks_with_depth_matches_merkle_tree() {
+        assert_matches_merkle_tree::<U0>();
+        assert_matches_merkle_tree::<U2>();
+        assert_matches_merkle_tree::<U3>();
+        assert_matches_merkle_tree::<U4>();
+    }
+
+    fn assert_matches_merkle_tree<D: ArrayLength<H256>>() {
+        for chunk_count in 0..=1 << D::USIZE {
+            let chunks = test_chunks(chunk_count);
+
+            assert_eq!(
+                merkleize_chunks_with_depth(chunks.iter().copied(), D::USIZE),
+                MerkleTree::<D>::merkleize_chunks(chunks.iter().copied()),
+                "depth {} with {chunk_count} chunks",
+                D::USIZE,
+            );
+        }
+    }
+
+    fn test_chunks(chunk_count: usize) -> Vec<H256> {
+        (0..chunk_count).map(test_chunk).collect()
+    }
+
+    // Matches `chunk` in the reference implementation.
+    fn test_chunk(index: usize) -> H256 {
+        let byte =
+            u8::try_from(index.saturating_add(1) % 256).expect("value modulo 256 should fit in u8");
+
+        H256::repeat_byte(byte)
     }
 }
