@@ -33,7 +33,7 @@ use crate::{
     config::Config,
     deneb::{
         consts::BytesPerFieldElement,
-        primitives::{Blob, KzgCommitment, KzgProof},
+        primitives::{Blob, KzgCommitment, KzgProof, VersionedHash},
     },
     electra::containers::{
         Attestation as ElectraAttestation, AttesterSlashing as ElectraAttesterSlashing,
@@ -190,6 +190,8 @@ pub trait Preset: Copy + Eq + Ord + Hash + Default + Debug + Send + Sync + 'stat
     type MaxBlobCommitmentsPerBlock: MerkleElements<Blob<Self>>
         + MerkleElements<Cell<Self>>
         + MerkleElements<KzgCommitment>
+        // Needed for `NewPayloadRequest.versioned_hashes`, which is a list of `VersionedHash`.
+        + MerkleElements<VersionedHash>
         + Eq
         + Debug
         + Send

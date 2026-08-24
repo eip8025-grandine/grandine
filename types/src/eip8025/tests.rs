@@ -1,20 +1,32 @@
 use bls::SignatureBytes;
 use hex_literal::hex;
-use ssz::{H256, Hc, ReadError, SszHash as _, SszReadDefault as _, SszWrite as _};
+use ssz::{
+    ContiguousList, H256, Hc, MerkleTree, ReadError, SszHash as _, SszReadDefault as _,
+    SszWrite as _,
+};
 use test_case::test_case;
+use typenum::U2;
 
 use crate::{
+    bellatrix::containers::ExecutionPayload as BellatrixExecutionPayload,
+    capella::containers::Withdrawal,
+    combined::{ExecutionPayload as CombinedExecutionPayload, ExecutionPayloadParams},
+    deneb::containers::ExecutionPayload,
     eip8025::{
         consts::{
             MAX_PROOF_SIZE, MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE, STATELESS_INPUT_SCHEMA_ID,
         },
+        container_impls::new_payload_request_root,
         containers::{
-            ExecutionProof, ExecutionProofEnvelope, ProofData, PublicInput,
+            ExecutionProof, ExecutionProofEnvelope, NewPayloadRequest, ProofData, PublicInput,
             SignedExecutionProofEnvelope,
         },
+        error::PayloadBindingError,
         primitives::ProofType,
     },
+    electra::containers::ExecutionRequests,
     phase0::primitives::ValidatorIndex,
+    preset::{Mainnet, Minimal, Preset},
 };
 
 // Sample values mirrored exactly in the reference implementation.
@@ -376,4 +388,141 @@ fn test_bytes(length: usize) -> Vec<u8> {
     (0..length)
         .map(|index| u8::try_from(index % 256).expect("value modulo 256 should fit in u8"))
         .collect()
+}
+
+// The container merkleizes as a four field container. This pins the field set and their order,
+// which is what a wrong `new_payload_request_root` would most likely get wrong. The subtree roots
+// themselves come from types already covered by `ssz_static` spec tests.
+#[test]
+fn new_payload_request_root_is_merkleization_of_field_roots() {
+    let request = test_request::<Mainnet>();
+
+    let field_roots = [
+        request.execution_payload.hash_tree_root(),
+        request.versioned_hashes.hash_tree_root(),
+        request.parent_beacon_block_root.hash_tree_root(),
+        request.execution_requests.hash_tree_root(),
+    ];
+
+    assert_eq!(
+        request.hash_tree_root(),
+        MerkleTree::<U2>::merkleize_chunks(field_roots),
+    );
+}
+
+// This is why binding is Mainnet only. `MaxWithdrawalsPerPayload` is 16 on Mainnet and 4 on
+// Minimal, and a list root depends on its limit even when the list is short, so the same logical
+// request hashes differently under the two presets.
+#[test]
+fn preset_bounds_change_the_root() {
+    assert_ne!(
+        test_request::<Mainnet>().hash_tree_root(),
+        test_request::<Minimal>().hash_tree_root(),
+    );
+}
+
+#[test]
+fn new_payload_request_ssz_round_trip() {
+    let request = test_request::<Mainnet>();
+
+    let bytes = request.to_ssz().expect("request should be serializable");
+    let decoded = NewPayloadRequest::<Mainnet>::from_ssz_default(&bytes)
+        .expect("request should be decodable");
+
+    assert_eq!(decoded, request);
+    assert_eq!(decoded.hash_tree_root(), request.hash_tree_root());
+}
+
+#[test]
+fn new_payload_request_root_matches_constructed_request() {
+    let payload = test_combined_payload::<Mainnet>();
+    let params = test_params::<Mainnet>();
+
+    let root = new_payload_request_root(&payload, &params).expect("request should be buildable");
+
+    let request =
+        NewPayloadRequest::<Mainnet>::new(&payload, &params).expect("request should be buildable");
+
+    assert_eq!(root, request.hash_tree_root());
+}
+
+#[test]
+fn new_carries_the_fields_it_is_given() {
+    let payload = test_combined_payload::<Mainnet>();
+    let params = test_params::<Mainnet>();
+
+    let request =
+        NewPayloadRequest::<Mainnet>::new(&payload, &params).expect("request should be buildable");
+
+    let ExecutionPayloadParams::Electra {
+        versioned_hashes,
+        parent_beacon_block_root,
+        execution_requests,
+    } = &params
+    else {
+        panic!("test params should be Electra");
+    };
+
+    assert_eq!(
+        request.versioned_hashes.as_ref(),
+        versioned_hashes.as_slice()
+    );
+    assert_eq!(request.parent_beacon_block_root, *parent_beacon_block_root);
+    assert_eq!(&request.execution_requests, execution_requests);
+}
+
+// EIP-8025 builds on Gloas, which inherits the Electra shape of `NewPayloadRequest`.
+#[test]
+fn new_rejects_pre_electra_params() {
+    let payload = test_combined_payload::<Mainnet>();
+
+    let params = ExecutionPayloadParams::Deneb {
+        versioned_hashes: vec![H256::repeat_byte(1)],
+        parent_beacon_block_root: H256::repeat_byte(2),
+    };
+
+    let error = NewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect_err("Deneb params should be rejected");
+
+    assert!(
+        matches!(error, PayloadBindingError::ExecutionRequestsMissing),
+        "{error}",
+    );
+}
+
+#[test]
+fn new_rejects_pre_deneb_payload() {
+    let payload =
+        CombinedExecutionPayload::<Mainnet>::Bellatrix(BellatrixExecutionPayload::default());
+    let params = test_params::<Mainnet>();
+
+    let error = NewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect_err("Bellatrix payload should be rejected");
+
+    assert!(
+        matches!(error, PayloadBindingError::PayloadPhaseNotSupported { .. }),
+        "{error}",
+    );
+}
+
+fn test_request<P: Preset>() -> NewPayloadRequest<P> {
+    NewPayloadRequest::new(&test_combined_payload::<P>(), &test_params::<P>())
+        .expect("request should be buildable")
+}
+
+fn test_combined_payload<P: Preset>() -> CombinedExecutionPayload<P> {
+    CombinedExecutionPayload::Deneb(ExecutionPayload {
+        block_number: 42,
+        withdrawals: ContiguousList::try_from(vec![Withdrawal::default()])
+            .expect("one withdrawal fits in both presets"),
+        ..Default::default()
+    })
+}
+
+fn test_params<P: Preset>() -> ExecutionPayloadParams<P> {
+    ExecutionPayloadParams::Electra {
+        versioned_hashes: vec![H256::repeat_byte(1), H256::repeat_byte(2)],
+        parent_beacon_block_root: H256::repeat_byte(3),
+        execution_requests: ExecutionRequests::default(),
+    }
 }
