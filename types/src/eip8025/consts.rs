@@ -11,9 +11,11 @@
 //!
 //! [EIP-8025]: https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/beacon-chain.md
 
+use hex_literal::hex;
 use typenum::Unsigned as _;
 
 use crate::eip8025::primitives::MaxProofSize;
+use crate::phase0::primitives::{DomainType, H32};
 
 /// The maximum length of
 /// [`ProofData`](crate::eip8025::containers::ProofData) in bytes, 4
@@ -48,3 +50,6 @@ pub const STATELESS_INPUT_SCHEMA_ID: u16 = 0x1501;
 /// part of `ExecutionProofEnvelope` (an offset, a `ProofType` and a
 /// `Root`), plus a maximum-length `ProofData`.
 pub const MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE: usize = 108 + 37 + MAX_PROOF_SIZE;
+
+/// The domain used for signing execution proofs.
+pub const DOMAIN_EXECUTION_PROOF: DomainType = H32(hex!("0F000000"));
