@@ -25,6 +25,7 @@ use types::{
     },
     config::Config,
     deneb::containers::BeaconBlock as DenebBeaconBlock,
+    eip8025::{consts::DOMAIN_EXECUTION_PROOF, containers::ExecutionProof},
     electra::containers::{
         AggregateAndProof as ElectraAggregateAndProof, BeaconBlock as ElectraBeaconBlock,
     },
@@ -523,4 +524,10 @@ impl<P: Preset> SignForSingleFork<P> for ProposerPreferences {
 impl SignForAllForks for BuilderDepositMessage {
     const DOMAIN_TYPE: DomainType = DOMAIN_BUILDER_DEPOSIT;
     const SIGNATURE_KIND: SignatureKind = SignatureKind::BuilderDeposit;
+}
+
+/// <https://github.com/ethereum/consensus-specs/blob/321eca5b71049fcac6c63c2d956e5c5d7b60d689/specs/_features/eip8025/prover.md#new-get_execution_proof_envelope_signature>
+impl<P: Preset> SignForSingleForkAtSlot<P> for ExecutionProof {
+    const DOMAIN_TYPE: DomainType = DOMAIN_EXECUTION_PROOF;
+    const SIGNATURE_KIND: SignatureKind = SignatureKind::ExecutionProof;
 }
