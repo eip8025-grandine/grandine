@@ -531,3 +531,6 @@ impl<P: Preset> SignForSingleForkAtSlot<P> for ExecutionProof {
     const DOMAIN_TYPE: DomainType = DOMAIN_EXECUTION_PROOF;
     const SIGNATURE_KIND: SignatureKind = SignatureKind::ExecutionProof;
 }
+
+#[cfg(test)]
+mod tests;
