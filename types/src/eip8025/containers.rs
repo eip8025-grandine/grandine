@@ -15,16 +15,18 @@ use crate::{
 
 /// The opaque proof bytes of an execution proof.
 ///
-/// The spec defines this as a `ProgressiveByteList`, which has no length bound. Merkleization
-/// does not depend on the bound, so the root does not depend on `MAX_PROOF_SIZE`, which matters
+/// The spec defines this as a `ProgressiveList[Byte]`, which has
+/// no length bound. Merkleization does not depend on the bound, so
+/// the root does not depend on `MAX_PROOF_SIZE`, which matters
 /// because that constant is still provisional.
 ///
-/// The bound is enforced here, on construction and on decoding, and again by `MaxProofSize` on
-/// the inner list, which bounds decoding but not the root. Both report the same
-/// [`ReadError::ListTooLong`].
+/// The bound is enforced here, on construction and on decoding, and
+/// again by `MaxProofSize` on the inner list, which bounds decoding
+/// but not the root. Both report the same [`ReadError::ListTooLong`].
 ///
-/// There is deliberately no conversion from `ProgressiveByteList`: it would let callers build a
-/// `ProofData` without going through the explicit bound. `TryFrom<Vec<u8>>` is the way in.
+/// There is deliberately no conversion from `ProgressiveByteList`: it
+/// would let callers build a `ProofData` without going through the
+/// explicit bound. `TryFrom<Vec<u8>>` is the way in.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Serialize)]
 #[serde(transparent)]
 pub struct ProofData {
@@ -100,12 +102,26 @@ impl SszHash for ProofData {
     }
 }
 
+/// The public input a verifier reconstructs and checks an
+/// [`ExecutionProof`] against.
+///
+/// A `ProgressiveContainer` in consensus-specs, so its root mixes in
+/// the active-field layout and stays stable as fields are added.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(deny_unknown_fields)]
+#[ssz(stable(active = [1; 4]))]
 pub struct PublicInput {
     pub new_payload_request_root: H256,
+    pub successful_validation: bool,
+    #[serde(with = "serde_utils::string_or_native")]
+    pub chain_id: u64,
+    #[serde(with = "serde_utils::string_or_native")]
+    pub schema_id: u16,
 }
 
+/// The proof-engine input a verifier assembles locally.
+///
+/// Neither signed nor gossiped: [`ExecutionProofEnvelope`] is the object that travels.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProof {
@@ -115,15 +131,33 @@ pub struct ExecutionProof {
     pub public_input: PublicInput,
 }
 
-/// An [`ExecutionProof`] signed by the validator that produced it.
+/// A proof bound to the payload it certifies, by the block root that
+/// payload belongs to.
 ///
-/// The message is wrapped in [`Hc`] the way `SignedBeaconBlock` wraps its message, so the object
-/// root is merkleized once and serves both consumers: the gossip de-duplication key, and the
-/// `object_root` the domain-separated signing root is built from.
+/// This is the gossiped object, not [`ExecutionProof`]. It carries
+/// `beacon_block_root` in place of `public_input`: the verifier
+/// derives the public input locally from the stored payload so it
+/// never travels with the proof.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(deny_unknown_fields)]
-pub struct SignedExecutionProof {
-    pub message: Hc<ExecutionProof>,
+pub struct ExecutionProofEnvelope {
+    pub proof_data: ProofData,
+    #[serde(with = "serde_utils::string_or_native")]
+    pub proof_type: ProofType,
+    pub beacon_block_root: H256,
+}
+
+/// An [`ExecutionProofEnvelope`] signed by the validator that
+/// produced the proof.
+///
+/// The message is wrapped in [`Hc`] the way `SignedBeaconBlock` wraps
+/// its message, so the object root is merkleized once and serves both
+/// consumers: the gossip de-duplication key, and the `object_root`
+/// the domain-separated signing root is built from.
+#[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
+#[serde(deny_unknown_fields)]
+pub struct SignedExecutionProofEnvelope {
+    pub message: Hc<ExecutionProofEnvelope>,
     #[serde(with = "serde_utils::string_or_native")]
     pub validator_index: ValidatorIndex,
     pub signature: SignatureBytes,
