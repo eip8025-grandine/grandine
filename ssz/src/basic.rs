@@ -1,6 +1,6 @@
 use byteorder::ByteOrder as _;
 use ethereum_types::H256;
-use typenum::{U2, U4, U8, U32};
+use typenum::{U2, U4, U8, U16, U32};
 
 use crate::{
     consts::Endianness,
@@ -8,9 +8,6 @@ use crate::{
     porcelain::{SszHash, SszRead, SszSize, SszWrite},
     size::Size,
 };
-
-#[cfg(test)]
-use typenum::U16;
 
 impl SszSize for bool {
     const SIZE: Size = Size::Fixed {
@@ -78,14 +75,12 @@ impl SszHash for u8 {
     }
 }
 
-#[cfg(test)]
 impl SszSize for u16 {
     const SIZE: Size = Size::Fixed {
         size: size_of::<Self>(),
     };
 }
 
-#[cfg(test)]
 impl<C> SszRead<C> for u16 {
     #[inline]
     fn from_ssz_unchecked(_context: &C, bytes: &[u8]) -> Result<Self, ReadError> {
@@ -93,7 +88,6 @@ impl<C> SszRead<C> for u16 {
     }
 }
 
-#[cfg(test)]
 impl SszWrite for u16 {
     #[inline]
     fn write_fixed(&self, bytes: &mut [u8]) {
@@ -101,7 +95,6 @@ impl SszWrite for u16 {
     }
 }
 
-#[cfg(test)]
 impl SszHash for u16 {
     type PackingFactor = U16;
 
