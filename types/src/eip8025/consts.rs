@@ -9,7 +9,7 @@
 //! uses `0x0D000000`, which is also assigned to Gloas
 //! `DOMAIN_PROPOSER_PREFERENCES`.
 //!
-//! [EIP-8025]: https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/beacon-chain.md
+//! [EIP-8025]: https://github.com/frisitano/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/beacon-chain.md
 
 use typenum::Unsigned as _;
 

@@ -2,15 +2,19 @@ use bls::SignatureBytes;
 use ethereum_types::H256;
 use serde::{Deserialize, Deserializer, Serialize};
 use ssz::{
-    Hc, ProgressiveByteList, ReadError, Size, Ssz, SszHash, SszRead, SszSize, SszWrite, WriteError,
+    ContiguousList, Hc, ProgressiveByteList, ReadError, Size, Ssz, SszHash, SszRead, SszSize,
+    SszWrite, WriteError,
 };
 
 use crate::{
+    deneb::primitives::VersionedHash,
     eip8025::{
         consts::MAX_PROOF_SIZE,
         primitives::{MaxProofSize, ProofType},
     },
+    gloas::containers::{ExecutionPayload, ExecutionRequests},
     phase0::primitives::ValidatorIndex,
+    preset::Preset,
 };
 
 /// The opaque proof bytes of an execution proof.
@@ -121,7 +125,8 @@ pub struct PublicInput {
 
 /// The proof-engine input a verifier assembles locally.
 ///
-/// Neither signed nor gossiped: [`ExecutionProofEnvelope`] is the object that travels.
+/// Neither signed nor gossiped: [`ExecutionProofEnvelope`] is the
+/// object that travels.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProof {
@@ -161,4 +166,33 @@ pub struct SignedExecutionProofEnvelope {
     #[serde(with = "serde_utils::string_or_native")]
     pub validator_index: ValidatorIndex,
     pub signature: SignatureBytes,
+}
+
+/// The `SSZNewPayloadRequest` whose execution a proof certifies.
+///
+/// `hash_tree_root` of this container is
+/// `public_input.new_payload_request_root`, the only link between a
+/// proof and the payload it certifies.
+///
+/// A `ProgressiveContainer` in consensus-specs, built from the Gloas
+/// `ExecutionPayload` and `ExecutionRequests`. Grandine's Rust name
+/// follows the spec's `SSZNewPayloadRequest`; the `SSZ` prefix
+/// distinguishes it from the Engine API request of the same name,
+/// which is not an SSZ container at all.
+///
+/// The root is preset-independent. Under Gloas every list that could
+/// carry a limit into it is progressive, and the preset-derived
+/// bounds that do reach it are equal across presets, which
+/// `container_impls` asserts.
+#[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
+#[serde(bound = "", deny_unknown_fields)]
+#[ssz(stable(active = [1; 4]))]
+pub struct SszNewPayloadRequest<P: Preset> {
+    pub execution_payload: ExecutionPayload<P>,
+    // consensus-specs bounds this at
+    // `MAX_BLOB_COMMITMENTS_PER_BLOCK`, which is what
+    // `MaxBlobCommitmentsPerBlock` is.
+    pub versioned_hashes: ContiguousList<VersionedHash, P::MaxBlobCommitmentsPerBlock>,
+    pub parent_beacon_block_root: H256,
+    pub execution_requests: ExecutionRequests<P>,
 }
