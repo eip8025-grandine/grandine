@@ -89,6 +89,15 @@ pub mod fulu {
     mod spec_tests;
 }
 
+pub mod eip8025 {
+    pub mod consts;
+    pub mod containers;
+    pub mod primitives;
+
+    #[cfg(test)]
+    mod tests;
+}
+
 pub mod gloas {
     pub mod beacon_state;
     pub mod consts;
