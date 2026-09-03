@@ -190,7 +190,8 @@ pub trait Preset: Copy + Eq + Ord + Hash + Default + Debug + Send + Sync + 'stat
     type MaxBlobCommitmentsPerBlock: MerkleElements<Blob<Self>>
         + MerkleElements<Cell<Self>>
         + MerkleElements<KzgCommitment>
-        // Needed for `NewPayloadRequest.versioned_hashes`, which is a list of `VersionedHash`.
+        // Needed for `SszNewPayloadRequest.versioned_hashes`, which
+        // is a list of `VersionedHash`.
         + MerkleElements<VersionedHash>
         + Eq
         + Debug
