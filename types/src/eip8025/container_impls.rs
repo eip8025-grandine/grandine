@@ -1,4 +1,4 @@
-use ssz::{ContiguousList, H256, SszHash as _};
+use ssz::ContiguousList;
 use static_assertions::const_assert_eq;
 use try_from_iterator::TryFromIterator as _;
 use typenum::Unsigned as _;
@@ -94,15 +94,4 @@ impl<P: Preset> SszNewPayloadRequest<P> {
             execution_requests: execution_requests.clone(),
         })
     }
-}
-
-/// Computes `public_input.new_payload_request_root` for a payload and
-/// its params.
-///
-/// The root does not depend on the preset; see the assertions above.
-pub fn new_payload_request_root<P: Preset>(
-    payload: &CombinedExecutionPayload<P>,
-    params: &ExecutionPayloadParams<P>,
-) -> Result<H256, PayloadBindingError> {
-    SszNewPayloadRequest::new(payload, params).map(|request| request.hash_tree_root())
 }

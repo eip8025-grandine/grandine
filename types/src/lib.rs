@@ -91,10 +91,11 @@ pub mod fulu {
 
 pub mod eip8025 {
     pub mod consts;
-    pub mod container_impls;
     pub mod containers;
     pub mod error;
     pub mod primitives;
+
+    mod container_impls;
 
     #[cfg(test)]
     mod tests;
