@@ -182,9 +182,8 @@ pub struct SignedExecutionProofEnvelope {
 ///
 /// The root is preset-independent. Under Gloas every list that could
 /// carry a limit into it is progressive, and the preset-derived
-/// bounds that do reach it are equal across presets; see
-/// [`container_impls`](super::container_impls), where that is
-/// asserted.
+/// bounds that do reach it are equal across presets, which
+/// `container_impls` asserts.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(bound = "", deny_unknown_fields)]
 #[ssz(stable(active = [1; 4]))]
