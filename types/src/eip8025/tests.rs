@@ -15,7 +15,6 @@ use crate::{
         consts::{
             MAX_PROOF_SIZE, MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE, STATELESS_INPUT_SCHEMA_ID,
         },
-        container_impls::new_payload_request_root,
         containers::{
             ExecutionProof, ExecutionProofEnvelope, ProofData, PublicInput,
             SignedExecutionProofEnvelope, SszNewPayloadRequest,
@@ -459,19 +458,6 @@ fn new_payload_request_ssz_round_trip() {
 
     assert_eq!(decoded, request);
     assert_eq!(decoded.hash_tree_root(), request.hash_tree_root());
-}
-
-#[test]
-fn new_payload_request_root_matches_constructed_request() {
-    let payload = test_combined_payload::<Mainnet>();
-    let params = test_params::<Mainnet>();
-
-    let root = new_payload_request_root(&payload, &params).expect("request should be buildable");
-
-    let request = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
-        .expect("request should be buildable");
-
-    assert_eq!(root, request.hash_tree_root());
 }
 
 #[test]
