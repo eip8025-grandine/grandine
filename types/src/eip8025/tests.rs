@@ -5,6 +5,7 @@ use ssz::{
     SszWrite as _, mix_in_active_fields,
 };
 use test_case::test_case;
+use typenum::Unsigned as _;
 
 use crate::{
     bellatrix::containers::ExecutionPayload as BellatrixExecutionPayload,
@@ -50,6 +51,10 @@ const EXECUTION_PROOF_FIXED_PART: usize = 4 + 1 + PUBLIC_INPUT_SIZE;
 // as its active fields concatenated: a `Root`, a `Boolean`, a
 // `Uint64` and a `Uint16`.
 const PUBLIC_INPUT_SIZE: usize = 32 + 1 + 8 + 2;
+
+// The bound `versioned_hashes` carries into the root. Equal across
+// presets, which `container_impls` asserts.
+const MAX_VERSIONED_HASHES: usize = <Mainnet as Preset>::MaxBlobCommitmentsPerBlock::USIZE;
 
 // The expected roots below were produced by an independent
 // implementation using merkleization primitives from
@@ -529,6 +534,50 @@ fn new_rejects_pre_gloas_payload() {
         matches!(error, PayloadBindingError::PayloadPhaseNotSupported { .. }),
         "{error}",
     );
+}
+
+// consensus-specs bounds `versioned_hashes` at
+// `MAX_BLOB_COMMITMENTS_PER_BLOCK`, but derives it from the Gloas
+// `blob_kzg_commitments`, which is a progressive list and therefore
+// unbounded. Binding must reject values that exceed the target bound.
+#[test]
+fn new_rejects_too_many_versioned_hashes() {
+    let payload = test_combined_payload::<Mainnet>();
+    let params = test_params_with_versioned_hashes::<Mainnet>(MAX_VERSIONED_HASHES + 1);
+
+    let error = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect_err("too many versioned hashes should be rejected");
+
+    let PayloadBindingError::VersionedHashesTooLong(source) = error else {
+        panic!("{error}");
+    };
+
+    assert_eq!(
+        source,
+        ReadError::ListTooLong {
+            maximum: MAX_VERSIONED_HASHES,
+            actual: MAX_VERSIONED_HASHES + 1,
+        },
+    );
+}
+
+#[test]
+fn new_accepts_max_versioned_hashes() {
+    let payload = test_combined_payload::<Mainnet>();
+    let params = test_params_with_versioned_hashes::<Mainnet>(MAX_VERSIONED_HASHES);
+
+    let request = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect("the maximum number of versioned hashes should be accepted");
+
+    assert_eq!(request.versioned_hashes.as_ref().len(), MAX_VERSIONED_HASHES);
+}
+
+fn test_params_with_versioned_hashes<P: Preset>(count: usize) -> ExecutionPayloadParams<P> {
+    ExecutionPayloadParams::Gloas {
+        versioned_hashes: vec![H256::repeat_byte(1); count],
+        parent_beacon_block_root: H256::repeat_byte(3),
+        execution_requests: ExecutionRequests::default(),
+    }
 }
 
 fn test_request<P: Preset>() -> SszNewPayloadRequest<P> {
