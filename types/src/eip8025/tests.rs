@@ -1,30 +1,28 @@
 use bls::SignatureBytes;
 use hex_literal::hex;
 use ssz::{
-    ContiguousList, H256, Hc, MerkleTree, ReadError, SszHash as _, SszReadDefault as _,
-    SszWrite as _,
+    H256, Hc, ProgressiveList, ProgressiveMerkleTree, ReadError, SszHash as _, SszReadDefault as _,
+    SszWrite as _, mix_in_active_fields,
 };
 use test_case::test_case;
-use typenum::U2;
 
 use crate::{
     bellatrix::containers::ExecutionPayload as BellatrixExecutionPayload,
     capella::containers::Withdrawal,
     combined::{ExecutionPayload as CombinedExecutionPayload, ExecutionPayloadParams},
-    deneb::containers::ExecutionPayload,
     eip8025::{
         consts::{
             MAX_PROOF_SIZE, MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE, STATELESS_INPUT_SCHEMA_ID,
         },
         container_impls::new_payload_request_root,
         containers::{
-            ExecutionProof, ExecutionProofEnvelope, NewPayloadRequest, ProofData, PublicInput,
-            SignedExecutionProofEnvelope,
+            ExecutionProof, ExecutionProofEnvelope, ProofData, PublicInput,
+            SignedExecutionProofEnvelope, SszNewPayloadRequest,
         },
         error::PayloadBindingError,
         primitives::ProofType,
     },
-    electra::containers::ExecutionRequests,
+    gloas::containers::{ExecutionPayload, ExecutionRequests},
     phase0::primitives::ValidatorIndex,
     preset::{Mainnet, Minimal, Preset},
 };
@@ -390,11 +388,14 @@ fn test_bytes(length: usize) -> Vec<u8> {
         .collect()
 }
 
-// The container merkleizes as a four field container. This pins the field set and their order,
-// which is what a wrong `new_payload_request_root` would most likely get wrong. The subtree roots
-// themselves come from types already covered by `ssz_static` spec tests.
+// `SSZNewPayloadRequest` is a progressive container, so its root is
+// the progressive merkleization of the four field roots with the
+// active-field layout mixed in — not the fixed-depth merkleization a
+// plain container would use. The subtree roots themselves come from
+// types already covered by `ssz_static` spec tests, including the
+// Gloas `ExecutionPayload` and `ExecutionRequests`.
 #[test]
-fn new_payload_request_root_is_merkleization_of_field_roots() {
+fn new_payload_request_root_is_progressive_merkleization_of_field_roots() {
     let request = test_request::<Mainnet>();
 
     let field_roots = [
@@ -404,20 +405,42 @@ fn new_payload_request_root_is_merkleization_of_field_roots() {
         request.execution_requests.hash_tree_root(),
     ];
 
+    // The active-field layout word: the low four bits of a 256-bit word, least significant
+    // bit first.
+    let active_fields = H256(hex!(
+        "0f00000000000000000000000000000000000000000000000000000000000000"
+    ));
+
     assert_eq!(
         request.hash_tree_root(),
-        MerkleTree::<U2>::merkleize_chunks(field_roots),
+        mix_in_active_fields(
+            ProgressiveMerkleTree::merkleize_progressive(field_roots),
+            active_fields,
+        ),
     );
 }
 
-// This is why binding is Mainnet only. `MaxWithdrawalsPerPayload` is 16 on Mainnet and 4 on
-// Minimal, and a list root depends on its limit even when the list is short, so the same logical
-// request hashes differently under the two presets.
+// Binding is preset-independent under Gloas. Every list that could
+// carry a limit into the root is progressive, and the bounds that do
+// reach it are equal across presets, so the same logical request must
+// hash identically under Mainnet and Minimal.
 #[test]
-fn preset_bounds_change_the_root() {
-    assert_ne!(
+fn root_does_not_depend_on_preset() {
+    assert_eq!(
         test_request::<Mainnet>().hash_tree_root(),
         test_request::<Minimal>().hash_tree_root(),
+    );
+}
+
+// A progressive container root is not the root of its first field,
+// and it is not the plain container root either.
+#[test]
+fn new_payload_request_root_differs_from_execution_payload_root() {
+    let request = test_request::<Mainnet>();
+
+    assert_ne!(
+        request.hash_tree_root(),
+        request.execution_payload.hash_tree_root(),
     );
 }
 
@@ -426,7 +449,7 @@ fn new_payload_request_ssz_round_trip() {
     let request = test_request::<Mainnet>();
 
     let bytes = request.to_ssz().expect("request should be serializable");
-    let decoded = NewPayloadRequest::<Mainnet>::from_ssz_default(&bytes)
+    let decoded = SszNewPayloadRequest::<Mainnet>::from_ssz_default(&bytes)
         .expect("request should be decodable");
 
     assert_eq!(decoded, request);
@@ -440,8 +463,8 @@ fn new_payload_request_root_matches_constructed_request() {
 
     let root = new_payload_request_root(&payload, &params).expect("request should be buildable");
 
-    let request =
-        NewPayloadRequest::<Mainnet>::new(&payload, &params).expect("request should be buildable");
+    let request = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect("request should be buildable");
 
     assert_eq!(root, request.hash_tree_root());
 }
@@ -451,16 +474,16 @@ fn new_carries_the_fields_it_is_given() {
     let payload = test_combined_payload::<Mainnet>();
     let params = test_params::<Mainnet>();
 
-    let request =
-        NewPayloadRequest::<Mainnet>::new(&payload, &params).expect("request should be buildable");
+    let request = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect("request should be buildable");
 
-    let ExecutionPayloadParams::Electra {
+    let ExecutionPayloadParams::Gloas {
         versioned_hashes,
         parent_beacon_block_root,
         execution_requests,
     } = &params
     else {
-        panic!("test params should be Electra");
+        panic!("test params should be Gloas");
     };
 
     assert_eq!(
@@ -471,9 +494,12 @@ fn new_carries_the_fields_it_is_given() {
     assert_eq!(&request.execution_requests, execution_requests);
 }
 
-// EIP-8025 builds on Gloas, which inherits the Electra shape of `NewPayloadRequest`.
+// EIP-8025 builds on Gloas, which has its own `ExecutionPayload` and
+// `ExecutionRequests`. The Electra params carry the Electra
+// `ExecutionRequests`, which is a different container with a
+// different root, so they cannot be bound either.
 #[test]
-fn new_rejects_pre_electra_params() {
+fn new_rejects_pre_gloas_params() {
     let payload = test_combined_payload::<Mainnet>();
 
     let params = ExecutionPayloadParams::Deneb {
@@ -481,22 +507,22 @@ fn new_rejects_pre_electra_params() {
         parent_beacon_block_root: H256::repeat_byte(2),
     };
 
-    let error = NewPayloadRequest::<Mainnet>::new(&payload, &params)
+    let error = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
         .expect_err("Deneb params should be rejected");
 
     assert!(
-        matches!(error, PayloadBindingError::ExecutionRequestsMissing),
+        matches!(error, PayloadBindingError::ExecutionRequestsNotGloas),
         "{error}",
     );
 }
 
 #[test]
-fn new_rejects_pre_deneb_payload() {
+fn new_rejects_pre_gloas_payload() {
     let payload =
         CombinedExecutionPayload::<Mainnet>::Bellatrix(BellatrixExecutionPayload::default());
     let params = test_params::<Mainnet>();
 
-    let error = NewPayloadRequest::<Mainnet>::new(&payload, &params)
+    let error = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
         .expect_err("Bellatrix payload should be rejected");
 
     assert!(
@@ -505,22 +531,22 @@ fn new_rejects_pre_deneb_payload() {
     );
 }
 
-fn test_request<P: Preset>() -> NewPayloadRequest<P> {
-    NewPayloadRequest::new(&test_combined_payload::<P>(), &test_params::<P>())
+fn test_request<P: Preset>() -> SszNewPayloadRequest<P> {
+    SszNewPayloadRequest::new(&test_combined_payload::<P>(), &test_params::<P>())
         .expect("request should be buildable")
 }
 
 fn test_combined_payload<P: Preset>() -> CombinedExecutionPayload<P> {
-    CombinedExecutionPayload::Deneb(ExecutionPayload {
+    CombinedExecutionPayload::Gloas(ExecutionPayload {
         block_number: 42,
-        withdrawals: ContiguousList::try_from(vec![Withdrawal::default()])
-            .expect("one withdrawal fits in both presets"),
+        withdrawals: ProgressiveList::try_from(vec![Withdrawal::default()])
+            .expect("one withdrawal fits in a progressive list"),
         ..Default::default()
     })
 }
 
 fn test_params<P: Preset>() -> ExecutionPayloadParams<P> {
-    ExecutionPayloadParams::Electra {
+    ExecutionPayloadParams::Gloas {
         versioned_hashes: vec![H256::repeat_byte(1), H256::repeat_byte(2)],
         parent_beacon_block_root: H256::repeat_byte(3),
         execution_requests: ExecutionRequests::default(),

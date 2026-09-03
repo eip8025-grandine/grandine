@@ -7,12 +7,12 @@ use ssz::{
 };
 
 use crate::{
-    deneb::{containers::ExecutionPayload, primitives::VersionedHash},
+    deneb::primitives::VersionedHash,
     eip8025::{
         consts::MAX_PROOF_SIZE,
         primitives::{MaxProofSize, ProofType},
     },
-    electra::containers::ExecutionRequests,
+    gloas::containers::{ExecutionPayload, ExecutionRequests},
     phase0::primitives::ValidatorIndex,
     preset::Preset,
 };
@@ -125,7 +125,8 @@ pub struct PublicInput {
 
 /// The proof-engine input a verifier assembles locally.
 ///
-/// Neither signed nor gossiped: [`ExecutionProofEnvelope`] is the object that travels.
+/// Neither signed nor gossiped: [`ExecutionProofEnvelope`] is the
+/// object that travels.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProof {
@@ -167,30 +168,31 @@ pub struct SignedExecutionProofEnvelope {
     pub signature: SignatureBytes,
 }
 
-/// The Engine API `NewPayloadRequest` whose execution a proof certifies.
+/// The `SSZNewPayloadRequest` whose execution a proof certifies.
 ///
-/// `hash_tree_root` of this container is `public_input.new_payload_request_root`, the only link
-/// between a proof and the payload it certifies.
+/// `hash_tree_root` of this container is
+/// `public_input.new_payload_request_root`, the only link between a
+/// proof and the payload it certifies.
 ///
-/// The spec gives this container fixed bounds, whereas the fields here are reused from Grandine's
-/// preset-derived types. Those agree on Mainnet but not on Minimal, so binding is Mainnet-only;
-/// see [`new_payload_request_root`](super::container_impls::new_payload_request_root), which is
-/// where that restriction is enforced and where the bounds are asserted.
+/// A `ProgressiveContainer` in consensus-specs, built from the Gloas
+/// `ExecutionPayload` and `ExecutionRequests`. Grandine's Rust name
+/// follows the spec's `SSZNewPayloadRequest`; the `SSZ` prefix
+/// distinguishes it from the Engine API request of the same name,
+/// which is not an SSZ container at all.
 ///
-/// The root this produces cannot match a prover's yet. The EIP's `ExecutionPayload` schema
-/// includes EIP-7928's `block_access_list`, which Grandine does not support, so the container is
-/// missing a field the prover commits to. Payload binding stays provisional until that lands.
+/// The root is preset-independent. Under Gloas every list that could
+/// carry a limit into it is progressive, and the preset-derived
+/// bounds that do reach it are equal across presets; see
+/// [`container_impls`](super::container_impls), where that is
+/// asserted.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(bound = "", deny_unknown_fields)]
-pub struct NewPayloadRequest<P: Preset> {
+#[ssz(stable(active = [1; 4]))]
+pub struct SszNewPayloadRequest<P: Preset> {
     pub execution_payload: ExecutionPayload<P>,
-    // PROTOTYPE ASSUMPTION, NOT A SETTLED PROTOCOL RULE.
-    //
-    // Neither pinned source specifies a bound for this field: consensus-specs has an unbounded
-    // `Sequence[VersionedHash]` and the EIP has a `Tuple[VersionedHash, ...]`. Versioned hashes
-    // are derived one-to-one from blob commitments, so the commitment bound is the natural
-    // stand-in, but it changes every root it takes part in and must be revisited once the design
-    // question is resolved. It is isolated here so that replacing it is a one-line change.
+    // consensus-specs bounds this at
+    // `MAX_BLOB_COMMITMENTS_PER_BLOCK`, which is what
+    // `MaxBlobCommitmentsPerBlock` is.
     pub versioned_hashes: ContiguousList<VersionedHash, P::MaxBlobCommitmentsPerBlock>,
     pub parent_beacon_block_root: H256,
     pub execution_requests: ExecutionRequests<P>,
