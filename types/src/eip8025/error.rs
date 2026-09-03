@@ -7,14 +7,14 @@ use crate::nonstandard::Phase;
 pub enum PayloadBindingError {
     #[error(
         "execution payload of phase {phase} cannot be bound; \
-         EIP-8025 builds on the Electra shape of NewPayloadRequest"
+         EIP-8025 binds the Gloas shape of SSZNewPayloadRequest"
     )]
     PayloadPhaseNotSupported { phase: Phase },
     #[error(
-        "execution payload params without execution requests cannot be bound; \
-         EIP-8025 builds on the Electra shape of NewPayloadRequest"
+        "execution payload params without Gloas execution requests cannot be bound; \
+         EIP-8025 binds the Gloas shape of SSZNewPayloadRequest"
     )]
-    ExecutionRequestsMissing,
+    ExecutionRequestsNotGloas,
     #[error("too many versioned hashes to bind")]
     VersionedHashesTooLong(#[source] ReadError),
 }
