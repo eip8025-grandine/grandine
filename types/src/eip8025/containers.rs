@@ -168,6 +168,23 @@ pub struct SignedExecutionProofEnvelope {
     pub signature: SignatureBytes,
 }
 
+/// Which proof types to generate, for the prover-role `request_proofs` call.
+///
+/// Mirrors the `ProofAttributes` dataclass in
+/// [`proof-engine.md`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-proofattributes):
+/// a sequence of requested [`ProofType`]s.
+///
+/// The spec sequence is unbounded, so this is a plain [`Vec`], not an SSZ
+/// list: like the [`ProofData`] bound story, any limit belongs to the
+/// validation bodies, not the shape. Nothing reads this yet — Grandine is
+/// verifier-only, so the prover-role stubs reject without looking at it.
+#[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProofAttributes {
+    #[serde(with = "serde_utils::string_or_native_sequence")]
+    pub proof_types: Vec<ProofType>,
+}
+
 /// The `SSZNewPayloadRequest` whose execution a proof certifies.
 ///
 /// `hash_tree_root` of this container is
