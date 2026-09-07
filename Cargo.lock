@@ -11909,6 +11909,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proof_engine"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.18",
+ "types",
+]
+
+[[package]]
 name = "proptest"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
