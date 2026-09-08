@@ -30,8 +30,9 @@ use crate::{
         ExecutionPayloadEnvelopeTask, ExecutionPayloadEnvelopeVerifyForGossipTask,
         PayloadAttestationBatchTask, PayloadAttestationTask, PersistBlobSidecarsTask,
         PersistDataColumnSidecarsTask, PersistExecutionPayloadEnvelopesTask,
-        PersistPubkeyCacheTask, PreprocessStateTask, ProposerPreferencesTask, PruneStateCacheTask,
-        RetryDataColumnSidecarTask, Run, StateAtSlotCacheFlushTask,
+        PersistPubkeyCacheTask, PreprocessStateTask, ProcessExecutionProofTask,
+        ProposerPreferencesTask, PruneStateCacheTask, RetryDataColumnSidecarTask, Run,
+        StateAtSlotCacheFlushTask,
     },
     wait::Wait,
 };
@@ -157,6 +158,9 @@ enum LowPriorityTask<P: Preset, W> {
     AttesterSlashing(AttesterSlashingTask<P, W>),
     // TODO: (gloas): figure out whether it should be low or mid priority
     PayloadBid(ExecutionPayloadBidTask<P, W>),
+    // Proofs up to 4 MiB plus BLS plus a potentially slow external
+    // verification never run on the critical path.
+    ExecutionProof(ProcessExecutionProofTask<P, W>),
     PayloadAttestation(PayloadAttestationTask<P, W>),
     PayloadAttestationBatch(PayloadAttestationBatchTask<P, W>),
     ProposerPreferences(ProposerPreferencesTask<P, W>),
@@ -177,6 +181,7 @@ impl<P: Preset, W> Run for LowPriorityTask<P, W> {
             Self::BlockPayloadAttestations(task) => task.run(),
             Self::AttesterSlashing(task) => task.run(),
             Self::PayloadBid(task) => task.run(),
+            Self::ExecutionProof(task) => task.run(),
             Self::PayloadAttestation(task) => task.run(),
             Self::PayloadAttestationBatch(task) => task.run(),
             Self::ProposerPreferences(task) => task.run(),
@@ -267,6 +272,12 @@ impl<P: Preset, E, W> Spawn<P, E, W> for AttesterSlashingTask<P, W> {
 }
 
 impl<P: Preset, E, W> Spawn<P, E, W> for ExecutionPayloadBidTask<P, W> {
+    fn spawn(self, critical: &mut Critical<P, E, W>) {
+        critical.low_priority_tasks.push_back(self.into())
+    }
+}
+
+impl<P: Preset, E, W> Spawn<P, E, W> for ProcessExecutionProofTask<P, W> {
     fn spawn(self, critical: &mut Critical<P, E, W>) {
         critical.low_priority_tasks.push_back(self.into())
     }

@@ -12,8 +12,9 @@ use fork_choice_store::{
     AggregateAndProofOrigin, AttestationItem, AttestationOrigin, AttesterSlashingOrigin,
     BlobSidecarOrigin, BlockAction, BlockItem, BlockOrigin, DataColumnSidecarAction,
     DataColumnSidecarOrigin, ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction,
-    ExecutionPayloadEnvelopeOrigin, PayloadAttestationItem, PayloadAttestationOrigin,
-    ProposerPreferencesOrigin, StateCacheProcessor, Store,
+    ExecutionPayloadEnvelopeOrigin, ExecutionProofAction, ExecutionProofOrigin,
+    PayloadAttestationItem, PayloadAttestationOrigin, ProposerPreferencesOrigin,
+    StateCacheProcessor, Store,
 };
 use futures::channel::mpsc::Sender as MultiSender;
 use helper_functions::{
@@ -33,6 +34,7 @@ use types::{
     },
     config::Config,
     deneb::containers::{BlobIdentifier, BlobSidecar},
+    eip8025::containers::SignedExecutionProofEnvelope,
     fulu::containers::DataColumnIdentifier,
     gloas::containers::{
         SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope, SignedProposerPreferences,
@@ -721,6 +723,37 @@ impl<P: Preset, W> Run for ExecutionPayloadBidTask<P, W> {
     }
 }
 
+// Engine wiring intentionally absent on this branch: the `ProofVerifier`
+// facade vs `fn is_null()` decision lives on child branches. This keeps a
+// compilable end-to-end stub so queue, message, and mutator plumbing stay
+// exercised while the engine debate is open.
+pub struct ProcessExecutionProofTask<P: Preset, W> {
+    pub store_snapshot: Arc<Store<P, Storage<P>>>,
+    pub mutator_tx: Sender<MutatorMessage<P, W>>,
+    pub signed_proof: Arc<SignedExecutionProofEnvelope>,
+    pub origin: ExecutionProofOrigin,
+}
+
+impl<P: Preset, W> Run for ProcessExecutionProofTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "ProcessExecutionProofTask::run")]
+    fn run(self) {
+        let Self {
+            store_snapshot,
+            mutator_tx,
+            signed_proof,
+            origin,
+        } = self;
+
+        // Reserved for the spec-ordered pipeline follow-up.
+        let _ = (&store_snapshot, &signed_proof);
+
+        // TODO(eip8025-grandine): spec-ordered `validate_execution_proof_gossip` pipeline.
+        let result = Ok(ExecutionProofAction::Ignore("stub pipeline"));
+
+        MutatorMessage::ExecutionProof { result, origin }.send(&mutator_tx);
+    }
+}
+
 pub struct PayloadAttestationTask<P: Preset, W> {
     pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
@@ -1142,3 +1175,5 @@ impl<P: Preset> Run for StateAtSlotCacheFlushTask<P> {
         }
     }
 }
+
+

@@ -38,9 +38,9 @@ use fork_choice_store::{
     BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockItem, BlockOrigin, ChainLink,
     DataColumnSidecarAction, DataColumnSidecarOrigin, Error, ExecutionPayloadBidAction,
     ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-    PayloadAction, PayloadAttestationAction, PayloadAttestationItem, PayloadPresence,
-    ProposerPreferencesAction, ProposerPreferencesOrigin, StateCacheProcessor, Store,
-    ValidAttestation, ValidPayloadAttestation,
+    ExecutionProofAction, ExecutionProofOrigin, PayloadAction, PayloadAttestationAction,
+    PayloadAttestationItem, PayloadPresence, ProposerPreferencesAction, ProposerPreferencesOrigin,
+    StateCacheProcessor, Store, ValidAttestation, ValidPayloadAttestation,
 };
 use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSender};
 use helper_functions::{accessors, misc, predicates, verifier::NullVerifier};
@@ -358,6 +358,9 @@ where
                 ),
                 MutatorMessage::PayloadBid { result, origin } => {
                     self.handle_payload_bid(result, origin)
+                }
+                MutatorMessage::ExecutionProof { result, origin } => {
+                    self.handle_execution_proof(result, origin)
                 }
                 MutatorMessage::PayloadAttestation { wait_group, result } => {
                     self.handle_payload_attestation(&wait_group, result)
@@ -2570,6 +2573,63 @@ where
                     sender,
                     Err(anyhow!(source)),
                 );
+            }
+        }
+    }
+
+    // Skeleton stub: no store insert yet. Signals p2p per `origin.split()`
+    // so peer scoring stays wired while the pipeline lands.
+    fn handle_execution_proof(
+        &self,
+        result: Result<ExecutionProofAction>,
+        origin: ExecutionProofOrigin,
+    ) {
+        match result {
+            Ok(ExecutionProofAction::Accept(signed_proof)) => {
+                trace_with_peers!("execution proof accepted (signed_proof: {signed_proof:?})");
+
+                let (gossip_id, sender) = origin.split();
+
+                if let Some(gossip_id) = gossip_id {
+                    self.send_to_p2p(P2pMessage::Accept(gossip_id));
+                }
+
+                reply_execution_proof_validation_result_to_http_api(
+                    sender,
+                    Ok(ValidationOutcomeWithReason::Accept),
+                );
+
+                // TODO(eip8025-grandine): store bare `.message` per spec
+                // `on_execution_proof` once the pipeline lands.
+            }
+            Ok(ExecutionProofAction::Ignore(message)) => {
+                debug_with_peers!("execution proof ignored (reason: {message})");
+
+                let (gossip_id, sender) = origin.split();
+
+                if let Some(gossip_id) = gossip_id {
+                    self.send_to_p2p(P2pMessage::Ignore(gossip_id));
+                }
+
+                reply_execution_proof_validation_result_to_http_api(
+                    sender,
+                    Ok(ValidationOutcomeWithReason::Ignore(message)),
+                );
+            }
+            Err(error) => {
+                let source = error.to_string();
+                warn_with_peers!("execution proof rejected (error: {error:?})",);
+
+                let (gossip_id, sender) = origin.split();
+
+                if gossip_id.is_some() {
+                    self.send_to_p2p(P2pMessage::Reject(
+                        gossip_id,
+                        MutatorRejectionReason::InvalidExecutionProof,
+                    ));
+                }
+
+                reply_execution_proof_validation_result_to_http_api(sender, Err(anyhow!(source)));
             }
         }
     }
@@ -5660,6 +5720,17 @@ fn reply_block_validation_result_to_http_api(
 }
 
 fn reply_execution_payload_bid_validation_result_to_http_api(
+    sender: Option<OneshotSender<Result<ValidationOutcomeWithReason>>>,
+    reply: Result<ValidationOutcomeWithReason>,
+) {
+    if let Some(sender) = sender
+        && let Err(reply) = sender.send(reply)
+    {
+        debug_with_peers!("reply to HTTP API failed because the receiver was dropped: {reply:?}");
+    }
+}
+
+fn reply_execution_proof_validation_result_to_http_api(
     sender: Option<OneshotSender<Result<ValidationOutcomeWithReason>>>,
     reply: Result<ValidationOutcomeWithReason>,
 ) {
