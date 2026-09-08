@@ -24,13 +24,14 @@ use execution_engine::{ExecutionEngine, PayloadStatusV1};
 use fork_choice_store::{
     AggregateAndProofOrigin, AttestationItem, AttestationOrigin, AttesterSlashingOrigin,
     BlobSidecarOrigin, BlockItem, BlockOrigin, DataColumnSidecarOrigin, ExecutionPayloadBidOrigin,
-    ExecutionPayloadEnvelopeOrigin, PayloadAttestationItem,
+    ExecutionPayloadEnvelopeOrigin, ExecutionProofOrigin, PayloadAttestationItem,
     PayloadAttestationOrigin, ProposerPreferencesOrigin, StateCacheProcessor, Store, StoreConfig,
 };
 use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSender};
 use genesis::AnchorCheckpointProvider;
 use logging::debug_with_peers;
 use prometheus_metrics::Metrics;
+use proof_engine::ProofEngine;
 use pubkey_cache::PubkeyCache;
 use scc::HashMap as SccHashMap;
 use spec_test_utils::BlsSetting;
@@ -44,6 +45,7 @@ use types::{
     },
     config::Config as ChainConfig,
     deneb::containers::BlobSidecar,
+    eip8025::containers::SignedExecutionProofEnvelope,
     fulu::{containers::DataColumnIdentifier, primitives::ColumnIndex},
     gloas::containers::{
         PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
@@ -76,8 +78,8 @@ use crate::{
         AggregateAndProofTask, AttestationTask, AttesterSlashingTask, BlobSidecarTask, BlockTask,
         BlockVerifyForGossipTask, DataColumnSidecarTask, ExecutionPayloadBidTask,
         ExecutionPayloadEnvelopeTask, ExecutionPayloadEnvelopeVerifyForGossipTask,
-        PayloadAttestationBatchTask, PayloadAttestationTask, ProposerPreferencesTask,
-        StateAtSlotCacheFlushTask,
+        PayloadAttestationBatchTask, PayloadAttestationTask, ProcessExecutionProofTask,
+        ProposerPreferencesTask, StateAtSlotCacheFlushTask,
     },
     thread_pool::{Spawn, ThreadPool},
     unbounded_sink::UnboundedSink,
@@ -993,6 +995,25 @@ where
             store_snapshot: self.owned_store_snapshot(),
             mutator_tx: self.owned_mutator_tx(),
             payload_bid,
+            origin,
+        })
+    }
+
+    // Nothing calls this until gossip wiring lands. The generic `PE` is erased
+    // into `Arc<dyn ProofVerifier<P>>` here so `Controller` and `ThreadPool`
+    // stay free of a second engine generic.
+    #[expect(dead_code)]
+    fn spawn_execution_proof_task<PE: ProofEngine<P> + Send + Sync + 'static>(
+        &self,
+        signed_proof: Arc<SignedExecutionProofEnvelope>,
+        origin: ExecutionProofOrigin,
+        proof_engine: Arc<PE>,
+    ) {
+        self.spawn(ProcessExecutionProofTask {
+            store_snapshot: self.owned_store_snapshot(),
+            proof_engine,
+            mutator_tx: self.owned_mutator_tx(),
+            signed_proof,
             origin,
         })
     }

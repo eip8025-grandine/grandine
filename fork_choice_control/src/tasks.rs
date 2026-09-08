@@ -23,6 +23,7 @@ use helper_functions::{
 };
 use logging::{debug_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
+use proof_engine::ProofEngine;
 use pubkey_cache::PubkeyCache;
 use spec_test_utils::BlsSetting;
 use ssz::SszHash as _;
@@ -723,12 +724,25 @@ impl<P: Preset, W> Run for ExecutionPayloadBidTask<P, W> {
     }
 }
 
-// Engine wiring intentionally absent on this branch: the `ProofVerifier`
-// facade vs `fn is_null()` decision lives on child branches. This keeps a
-// compilable end-to-end stub so queue, message, and mutator plumbing stay
-// exercised while the engine debate is open.
+// `ProofEngine` carries `const IS_NULL`, so it is not dyn-compatible
+// (`E0038`). This narrow object-safe facade exposes only what the
+// low-priority task needs and is blanket-implemented for every
+// `ProofEngine`. It keeps `Controller` and `ThreadPool` free of a second
+// engine generic; the full `validate_execution_proof_gossip` pipeline will
+// call through this facade in place.
+pub trait ProofVerifier<P: Preset>: Send + Sync {
+    fn is_null(&self) -> bool;
+}
+
+impl<P: Preset, E: ProofEngine<P> + Send + Sync> ProofVerifier<P> for E {
+    fn is_null(&self) -> bool {
+        E::IS_NULL
+    }
+}
+
 pub struct ProcessExecutionProofTask<P: Preset, W> {
     pub store_snapshot: Arc<Store<P, Storage<P>>>,
+    pub proof_engine: Arc<dyn ProofVerifier<P>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub signed_proof: Arc<SignedExecutionProofEnvelope>,
     pub origin: ExecutionProofOrigin,
@@ -739,6 +753,7 @@ impl<P: Preset, W> Run for ProcessExecutionProofTask<P, W> {
     fn run(self) {
         let Self {
             store_snapshot,
+            proof_engine,
             mutator_tx,
             signed_proof,
             origin,
@@ -747,8 +762,15 @@ impl<P: Preset, W> Run for ProcessExecutionProofTask<P, W> {
         // Reserved for the spec-ordered pipeline follow-up.
         let _ = (&store_snapshot, &signed_proof);
 
-        // TODO(eip8025-grandine): spec-ordered `validate_execution_proof_gossip` pipeline.
-        let result = Ok(ExecutionProofAction::Ignore("stub pipeline"));
+        // Skeleton stub: the spec-ordered `validate_execution_proof_gossip`
+        // pipeline replaces this in place. Both arms return `Ignore` for now;
+        // the `is_null` short-circuit preserves the opt-out invariant.
+        let result = if proof_engine.is_null() {
+            Ok(ExecutionProofAction::Ignore("proof engine not enabled"))
+        } else {
+            // TODO(eip8025-grandine): spec-ordered pipeline
+            Ok(ExecutionProofAction::Ignore("stub pipeline"))
+        };
 
         MutatorMessage::ExecutionProof { result, origin }.send(&mutator_tx);
     }
@@ -1176,4 +1198,99 @@ impl<P: Preset> Run for StateAtSlotCacheFlushTask<P> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, mpsc::channel};
 
+    use eth2_libp2p::GossipId;
+    use fork_choice_store::ExecutionProofOrigin;
+    use proof_engine::{MockProofEngine, NullProofEngine};
+    use pubkey_cache::PubkeyCache;
+    use ssz::Hc;
+    use types::{
+        config::Config,
+        eip8025::containers::{ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope},
+        phase0::primitives::H256,
+        preset::Minimal,
+    };
+
+    use crate::{
+        messages::MutatorMessage,
+        specialized::TestController,
+        tasks::{ProcessExecutionProofTask, Run as _},
+    };
+
+    fn test_signed_proof() -> Arc<SignedExecutionProofEnvelope> {
+        let proof_data = ProofData::try_from(vec![1, 2, 3]).expect("proof data should build");
+
+        Arc::new(SignedExecutionProofEnvelope {
+            message: Hc::from(ExecutionProofEnvelope {
+                proof_data,
+                proof_type: 1,
+                beacon_block_root: H256::zero(),
+            }),
+            validator_index: 0,
+            signature: Default::default(),
+        })
+    }
+
+    fn run_stub_task(
+        proof_engine: Arc<dyn super::ProofVerifier<Minimal>>,
+    ) -> MutatorMessage<Minimal, ()> {
+        let config = Arc::new(Config::minimal());
+        let genesis_state = factory::min_genesis_state::<Minimal>(&config, &PubkeyCache::default())
+            .expect("should build beacon state")
+            .0;
+        let genesis_block = Arc::new(genesis::beacon_block(&genesis_state));
+        let (controller, _mutator_handle) =
+            TestController::quiet(config, genesis_block, genesis_state);
+
+        let (mutator_tx, mutator_rx) = channel();
+
+        ProcessExecutionProofTask {
+            store_snapshot: controller.owned_store_snapshot(),
+            proof_engine,
+            mutator_tx,
+            signed_proof: test_signed_proof(),
+            origin: ExecutionProofOrigin::Gossip(GossipId::default()),
+        }
+        .run();
+
+        mutator_rx
+            .try_recv()
+            .expect("stub task should send exactly one outcome message")
+    }
+
+    #[test]
+    fn stub_pipeline_ignores_against_mock_engine() {
+        for execution_proof_valid in [true, false] {
+            let proof_engine: Arc<dyn super::ProofVerifier<Minimal>> =
+                Arc::new(MockProofEngine::new(execution_proof_valid));
+
+            let message = run_stub_task(proof_engine);
+
+            assert!(
+                matches!(
+                    message,
+                    MutatorMessage::ExecutionProof { result: Ok(_), .. }
+                ),
+                "stub pipeline should emit an outcome message",
+            );
+        }
+    }
+
+    #[test]
+    fn null_proof_engine_short_circuits_to_ignore() {
+        let proof_engine: Arc<dyn super::ProofVerifier<Minimal>> = Arc::new(NullProofEngine);
+
+        let message = run_stub_task(proof_engine);
+
+        assert!(
+            matches!(
+                message,
+                MutatorMessage::ExecutionProof { result: Ok(_), .. }
+            ),
+            "null engine should short-circuit to `Ignore`",
+        );
+    }
+}
