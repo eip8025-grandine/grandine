@@ -41,7 +41,9 @@ impl MockProofEngine {
 }
 
 impl<P: Preset> ProofEngine<P> for MockProofEngine {
-    const IS_NULL: bool = false;
+    fn is_null(&self) -> bool {
+        false
+    }
 
     fn verify_execution_proof(&self, _execution_proof: ExecutionProof) -> bool {
         self.execution_proof_valid
@@ -93,7 +95,7 @@ mod tests {
 
     #[test]
     fn mock_engine_is_not_null() {
-        assert!(!<MockProofEngine as ProofEngine<Minimal>>::IS_NULL);
+        assert!(!MockProofEngine::new(true).is_null());
     }
 
     #[test]

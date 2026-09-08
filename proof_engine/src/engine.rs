@@ -18,7 +18,12 @@ use types::{
 /// reject them. Grandine is verifier-only for now, so only
 /// [`verify_execution_proof`](Self::verify_execution_proof) is ever wired.
 pub trait ProofEngine<P: Preset> {
-    const IS_NULL: bool;
+    /// Whether this engine opts out of execution-proof verification.
+    ///
+    /// A method (rather than an `IS_NULL` associated const) so the trait
+    /// stays `dyn`-compatible (`E0038`): callers can hold
+    /// `Arc<dyn ProofEngine<P> + Send + Sync>` directly with no facade.
+    fn is_null(&self) -> bool;
 
     /// [`verify_execution_proof`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-verify_execution_proof)
     fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool;
@@ -41,7 +46,9 @@ pub trait ProofEngine<P: Preset> {
 }
 
 impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for &E {
-    const IS_NULL: bool = E::IS_NULL;
+    fn is_null(&self) -> bool {
+        (*self).is_null()
+    }
 
     fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool {
         (*self).verify_execution_proof(execution_proof)
@@ -67,7 +74,9 @@ impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for &E {
 }
 
 impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for Arc<E> {
-    const IS_NULL: bool = E::IS_NULL;
+    fn is_null(&self) -> bool {
+        self.as_ref().is_null()
+    }
 
     fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool {
         self.as_ref().verify_execution_proof(execution_proof)
@@ -95,7 +104,11 @@ impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for Arc<E> {
 }
 
 impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for Mutex<E> {
-    const IS_NULL: bool = E::IS_NULL;
+    fn is_null(&self) -> bool {
+        self.lock()
+            .expect("proof engine mutex is poisoned")
+            .is_null()
+    }
 
     fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool {
         self.lock()

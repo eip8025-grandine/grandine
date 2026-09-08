@@ -12,7 +12,7 @@ use crate::engine::{ProofEngine, ProofEngineError};
 /// A [`ProofEngine`] that does nothing.
 ///
 /// Used by nodes that opt out of execution-proof verification: the gossip
-/// task short-circuits on [`IS_NULL`](ProofEngine::IS_NULL) to `Ignore`
+/// task short-circuits on [`is_null`](ProofEngine::is_null) to `Ignore`
 /// before any pipeline work (and such nodes subscribe to nothing), so the
 /// fail-closed [`verify_execution_proof`](ProofEngine::verify_execution_proof)
 /// below is unreachable in practice.
@@ -20,7 +20,9 @@ use crate::engine::{ProofEngine, ProofEngineError};
 pub struct NullProofEngine;
 
 impl<P: Preset> ProofEngine<P> for NullProofEngine {
-    const IS_NULL: bool = true;
+    fn is_null(&self) -> bool {
+        true
+    }
 
     fn verify_execution_proof(&self, _execution_proof: ExecutionProof) -> bool {
         false
@@ -70,7 +72,7 @@ mod tests {
 
     #[test]
     fn null_engine_reports_itself_as_null() {
-        assert!(<NullProofEngine as ProofEngine<Minimal>>::IS_NULL);
+        assert!(NullProofEngine.is_null());
     }
 
     #[test]
