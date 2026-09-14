@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use types::{
     eip8025::{
         containers::{ExecutionProof, ProofAttributes, SszNewPayloadRequest},
@@ -9,20 +7,23 @@ use types::{
     preset::Preset,
 };
 
-/// The implementation-dependent proof engine protocol.
+/// Verification half of the EIP-8025 `ProofEngine` protocol.
 ///
-/// Mirrors the `ProofEngine` protocol in
-/// [`proof-engine.md`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#proof-engine):
-/// proof verification plus asynchronous proof generation. Generation and
-/// retrieval are prover-role only; implementations without generation support
-/// reject them. Grandine is verifier-only for now, so only
-/// [`verify_execution_proof`](Self::verify_execution_proof) is ever wired.
-pub trait ProofEngine<P: Preset> {
-    const IS_NULL: bool;
+/// Non-generic and object-safe: `verify_execution_proof` receives an already
+/// reconstructed `ExecutionProof`, so it needs no `P: Preset`.
+pub trait ProofVerifier: Send + Sync + 'static {
+    /// Whether this verifier opts out of execution-proof verification.
+    fn is_null(&self) -> bool;
 
     /// [`verify_execution_proof`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-verify_execution_proof)
     fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool;
+}
 
+/// Generation half of the EIP-8025 `ProofEngine` protocol.
+///
+/// Generic over `P` because `request_proofs` takes the full
+/// `SszNewPayloadRequest<P>`. Unwired for now: Grandine is verifier-only.
+pub trait ProofProver<P: Preset>: Send + Sync + 'static {
     /// [`request_proofs`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-request_proofs)
     fn request_proofs(
         &self,
@@ -38,92 +39,6 @@ pub trait ProofEngine<P: Preset> {
         new_payload_request_root: H256,
         proof_type: ProofType,
     ) -> Result<ExecutionProof, ProofEngineError>;
-}
-
-impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for &E {
-    const IS_NULL: bool = E::IS_NULL;
-
-    fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool {
-        (*self).verify_execution_proof(execution_proof)
-    }
-
-    fn request_proofs(
-        &self,
-        new_payload_request: SszNewPayloadRequest<P>,
-        chain_id: u64,
-        schema_id: u16,
-        proof_attributes: ProofAttributes,
-    ) -> Result<H256, ProofEngineError> {
-        (*self).request_proofs(new_payload_request, chain_id, schema_id, proof_attributes)
-    }
-
-    fn get_proof(
-        &self,
-        new_payload_request_root: H256,
-        proof_type: ProofType,
-    ) -> Result<ExecutionProof, ProofEngineError> {
-        (*self).get_proof(new_payload_request_root, proof_type)
-    }
-}
-
-impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for Arc<E> {
-    const IS_NULL: bool = E::IS_NULL;
-
-    fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool {
-        self.as_ref().verify_execution_proof(execution_proof)
-    }
-
-    fn request_proofs(
-        &self,
-        new_payload_request: SszNewPayloadRequest<P>,
-        chain_id: u64,
-        schema_id: u16,
-        proof_attributes: ProofAttributes,
-    ) -> Result<H256, ProofEngineError> {
-        self.as_ref()
-            .request_proofs(new_payload_request, chain_id, schema_id, proof_attributes)
-    }
-
-    fn get_proof(
-        &self,
-        new_payload_request_root: H256,
-        proof_type: ProofType,
-    ) -> Result<ExecutionProof, ProofEngineError> {
-        self.as_ref()
-            .get_proof(new_payload_request_root, proof_type)
-    }
-}
-
-impl<P: Preset, E: ProofEngine<P>> ProofEngine<P> for Mutex<E> {
-    const IS_NULL: bool = E::IS_NULL;
-
-    fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool {
-        self.lock()
-            .expect("proof engine mutex is poisoned")
-            .verify_execution_proof(execution_proof)
-    }
-
-    fn request_proofs(
-        &self,
-        new_payload_request: SszNewPayloadRequest<P>,
-        chain_id: u64,
-        schema_id: u16,
-        proof_attributes: ProofAttributes,
-    ) -> Result<H256, ProofEngineError> {
-        self.lock()
-            .expect("proof engine mutex is poisoned")
-            .request_proofs(new_payload_request, chain_id, schema_id, proof_attributes)
-    }
-
-    fn get_proof(
-        &self,
-        new_payload_request_root: H256,
-        proof_type: ProofType,
-    ) -> Result<ExecutionProof, ProofEngineError> {
-        self.lock()
-            .expect("proof engine mutex is poisoned")
-            .get_proof(new_payload_request_root, proof_type)
-    }
 }
 
 #[derive(Debug, thiserror::Error)]

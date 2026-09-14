@@ -7,16 +7,16 @@ use types::{
     preset::Preset,
 };
 
-use crate::engine::{ProofEngine, ProofEngineError};
+use crate::engine::{ProofEngineError, ProofProver, ProofVerifier};
 
-/// A [`ProofEngine`] fake for tests.
+/// A [`ProofVerifier`] fake for tests.
 ///
 /// Mirrors [`MockExecutionEngine`](execution_engine::MockExecutionEngine):
 /// `execution_proof_valid` drives the happy + reject paths of
-/// [`verify_execution_proof`](ProofEngine::verify_execution_proof) with no
+/// [`verify_execution_proof`](ProofVerifier::verify_execution_proof) with no
 /// real verifier. The prover-role methods stay reject-stubs, except that a
 /// canned proof (set with [`with_canned_proof`](Self::with_canned_proof))
-/// makes [`get_proof`](ProofEngine::get_proof) succeed, so tests can cover
+/// makes [`get_proof`](ProofProver::get_proof) succeed, so tests can cover
 /// both the canned-proof and the rejection paths.
 #[derive(Clone, Debug, Default)]
 pub struct MockProofEngine {
@@ -40,13 +40,17 @@ impl MockProofEngine {
     }
 }
 
-impl<P: Preset> ProofEngine<P> for MockProofEngine {
-    const IS_NULL: bool = false;
+impl ProofVerifier for MockProofEngine {
+    fn is_null(&self) -> bool {
+        false
+    }
 
     fn verify_execution_proof(&self, _execution_proof: ExecutionProof) -> bool {
         self.execution_proof_valid
     }
+}
 
+impl<P: Preset> ProofProver<P> for MockProofEngine {
     fn request_proofs(
         &self,
         _new_payload_request: SszNewPayloadRequest<P>,
@@ -93,28 +97,18 @@ mod tests {
 
     #[test]
     fn mock_engine_is_not_null() {
-        assert!(!<MockProofEngine as ProofEngine<Minimal>>::IS_NULL);
+        assert!(!MockProofEngine::new(true).is_null());
     }
 
     #[test]
     fn verify_follows_the_configured_flag() {
-        assert!(
-            <MockProofEngine as ProofEngine<Minimal>>::verify_execution_proof(
-                &MockProofEngine::new(true),
-                test_proof(),
-            )
-        );
-        assert!(
-            !<MockProofEngine as ProofEngine<Minimal>>::verify_execution_proof(
-                &MockProofEngine::new(false),
-                test_proof(),
-            )
-        );
+        assert!(MockProofEngine::new(true).verify_execution_proof(test_proof()));
+        assert!(!MockProofEngine::new(false).verify_execution_proof(test_proof()));
     }
 
     #[test]
     fn request_proofs_rejects() {
-        let error = <MockProofEngine as ProofEngine<Minimal>>::request_proofs(
+        let error = <MockProofEngine as ProofProver<Minimal>>::request_proofs(
             &MockProofEngine::new(true),
             SszNewPayloadRequest::default(),
             5,
@@ -132,7 +126,7 @@ mod tests {
     fn get_proof_returns_the_canned_proof_or_rejects() {
         let proof = test_proof();
 
-        let returned = <MockProofEngine as ProofEngine<Minimal>>::get_proof(
+        let returned = <MockProofEngine as ProofProver<Minimal>>::get_proof(
             &MockProofEngine::new(true).with_canned_proof(proof.clone()),
             H256::default(),
             1,
@@ -141,7 +135,7 @@ mod tests {
 
         assert_eq!(returned, proof);
 
-        let error = <MockProofEngine as ProofEngine<Minimal>>::get_proof(
+        let error = <MockProofEngine as ProofProver<Minimal>>::get_proof(
             &MockProofEngine::new(true),
             H256::default(),
             1,
