@@ -1,5 +1,5 @@
 pub use crate::{
-    engine::{ProofEngine, ProofEngineError},
+    engine::{ProofEngineError, ProofProver, ProofVerifier},
     mock_engine::MockProofEngine,
     null_engine::NullProofEngine,
 };
