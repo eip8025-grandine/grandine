@@ -1,20 +1,30 @@
 use bls::SignatureBytes;
 use hex_literal::hex;
-use ssz::{H256, Hc, ReadError, SszHash as _, SszReadDefault as _, SszWrite as _};
+use ssz::{
+    H256, Hc, ProgressiveList, ProgressiveMerkleTree, ReadError, SszHash as _, SszReadDefault as _,
+    SszWrite as _, mix_in_active_fields,
+};
 use test_case::test_case;
+use typenum::Unsigned as _;
 
 use crate::{
+    bellatrix::containers::ExecutionPayload as BellatrixExecutionPayload,
+    capella::containers::Withdrawal,
+    combined::{ExecutionPayload as CombinedExecutionPayload, ExecutionPayloadParams},
     eip8025::{
         consts::{
             MAX_PROOF_SIZE, MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE, STATELESS_INPUT_SCHEMA_ID,
         },
         containers::{
             ExecutionProof, ExecutionProofEnvelope, ProofData, PublicInput,
-            SignedExecutionProofEnvelope,
+            SignedExecutionProofEnvelope, SszNewPayloadRequest,
         },
+        error::PayloadBindingError,
         primitives::ProofType,
     },
+    gloas::containers::{ExecutionPayload, ExecutionRequests},
     phase0::primitives::ValidatorIndex,
+    preset::{Mainnet, Minimal, Preset},
 };
 
 // Sample values mirrored exactly in the reference implementation.
@@ -40,6 +50,10 @@ const EXECUTION_PROOF_FIXED_PART: usize = 4 + 1 + PUBLIC_INPUT_SIZE;
 // as its active fields concatenated: a `Root`, a `Boolean`, a
 // `Uint64` and a `Uint16`.
 const PUBLIC_INPUT_SIZE: usize = 32 + 1 + 8 + 2;
+
+// The bound `versioned_hashes` carries into the root. Equal across
+// presets, which `container_impls` asserts.
+const MAX_VERSIONED_HASHES: usize = <Mainnet as Preset>::MaxBlobCommitmentsPerBlock::USIZE;
 
 // The expected roots below were produced by an independent
 // implementation using merkleization primitives from
@@ -376,4 +390,200 @@ fn test_bytes(length: usize) -> Vec<u8> {
     (0..length)
         .map(|index| u8::try_from(index % 256).expect("value modulo 256 should fit in u8"))
         .collect()
+}
+
+// `SSZNewPayloadRequest` is a progressive container, so its root is
+// the progressive merkleization of the four field roots with the
+// active-field layout mixed in — not the fixed-depth merkleization a
+// plain container would use. The subtree roots themselves come from
+// types already covered by `ssz_static` spec tests, including the
+// Gloas `ExecutionPayload` and `ExecutionRequests`.
+#[test]
+fn new_payload_request_root_is_progressive_merkleization_of_field_roots() {
+    let request = test_request::<Mainnet>();
+
+    let field_roots = [
+        request.execution_payload.hash_tree_root(),
+        request.versioned_hashes.hash_tree_root(),
+        request.parent_beacon_block_root.hash_tree_root(),
+        request.execution_requests.hash_tree_root(),
+    ];
+
+    // The active-field layout word: the low four bits of a 256-bit word, least significant
+    // bit first.
+    let active_fields = H256(hex!(
+        "0f00000000000000000000000000000000000000000000000000000000000000"
+    ));
+
+    assert_eq!(
+        request.hash_tree_root(),
+        mix_in_active_fields(
+            ProgressiveMerkleTree::merkleize_progressive(field_roots),
+            active_fields,
+        ),
+    );
+}
+
+// Binding is preset-independent under Gloas. Every list that could
+// carry a limit into the root is progressive, and the bounds that do
+// reach it are equal across presets, so the same logical request must
+// hash identically under Mainnet and Minimal.
+#[test]
+fn root_does_not_depend_on_preset() {
+    assert_eq!(
+        test_request::<Mainnet>().hash_tree_root(),
+        test_request::<Minimal>().hash_tree_root(),
+    );
+}
+
+// A progressive container root is not the root of its first field,
+// and it is not the plain container root either.
+#[test]
+fn new_payload_request_root_differs_from_execution_payload_root() {
+    let request = test_request::<Mainnet>();
+
+    assert_ne!(
+        request.hash_tree_root(),
+        request.execution_payload.hash_tree_root(),
+    );
+}
+
+#[test]
+fn new_payload_request_ssz_round_trip() {
+    let request = test_request::<Mainnet>();
+
+    let bytes = request.to_ssz().expect("request should be serializable");
+    let decoded = SszNewPayloadRequest::<Mainnet>::from_ssz_default(&bytes)
+        .expect("request should be decodable");
+
+    assert_eq!(decoded, request);
+    assert_eq!(decoded.hash_tree_root(), request.hash_tree_root());
+}
+
+#[test]
+fn new_carries_the_fields_it_is_given() {
+    let payload = test_combined_payload::<Mainnet>();
+    let params = test_params::<Mainnet>();
+
+    let request = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect("request should be buildable");
+
+    let ExecutionPayloadParams::Gloas {
+        versioned_hashes,
+        parent_beacon_block_root,
+        execution_requests,
+    } = &params
+    else {
+        panic!("test params should be Gloas");
+    };
+
+    assert_eq!(
+        request.versioned_hashes.as_ref(),
+        versioned_hashes.as_slice()
+    );
+    assert_eq!(request.parent_beacon_block_root, *parent_beacon_block_root);
+    assert_eq!(&request.execution_requests, execution_requests);
+}
+
+// EIP-8025 builds on Gloas, which has its own `ExecutionPayload` and
+// `ExecutionRequests`. The Electra params carry the Electra
+// `ExecutionRequests`, which is a different container with a
+// different root, so they cannot be bound either.
+#[test]
+fn new_rejects_pre_gloas_params() {
+    let payload = test_combined_payload::<Mainnet>();
+
+    let params = ExecutionPayloadParams::Deneb {
+        versioned_hashes: vec![H256::repeat_byte(1)],
+        parent_beacon_block_root: H256::repeat_byte(2),
+    };
+
+    let error = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect_err("Deneb params should be rejected");
+
+    assert!(
+        matches!(error, PayloadBindingError::ExecutionRequestsNotGloas),
+        "{error}",
+    );
+}
+
+#[test]
+fn new_rejects_pre_gloas_payload() {
+    let payload =
+        CombinedExecutionPayload::<Mainnet>::Bellatrix(BellatrixExecutionPayload::default());
+    let params = test_params::<Mainnet>();
+
+    let error = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect_err("Bellatrix payload should be rejected");
+
+    assert!(
+        matches!(error, PayloadBindingError::PayloadPhaseNotSupported { .. }),
+        "{error}",
+    );
+}
+
+// consensus-specs bounds `versioned_hashes` at
+// `MAX_BLOB_COMMITMENTS_PER_BLOCK`, but derives it from the Gloas
+// `blob_kzg_commitments`, which is a progressive list and therefore
+// unbounded. Binding must reject values that exceed the target bound.
+#[test]
+fn new_rejects_too_many_versioned_hashes() {
+    let payload = test_combined_payload::<Mainnet>();
+    let params = test_params_with_versioned_hashes::<Mainnet>(MAX_VERSIONED_HASHES + 1);
+
+    let error = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect_err("too many versioned hashes should be rejected");
+
+    let PayloadBindingError::VersionedHashesTooLong(source) = error else {
+        panic!("{error}");
+    };
+
+    assert_eq!(
+        source,
+        ReadError::ListTooLong {
+            maximum: MAX_VERSIONED_HASHES,
+            actual: MAX_VERSIONED_HASHES + 1,
+        },
+    );
+}
+
+#[test]
+fn new_accepts_max_versioned_hashes() {
+    let payload = test_combined_payload::<Mainnet>();
+    let params = test_params_with_versioned_hashes::<Mainnet>(MAX_VERSIONED_HASHES);
+
+    let request = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
+        .expect("the maximum number of versioned hashes should be accepted");
+
+    assert_eq!(request.versioned_hashes.as_ref().len(), MAX_VERSIONED_HASHES);
+}
+
+fn test_params_with_versioned_hashes<P: Preset>(count: usize) -> ExecutionPayloadParams<P> {
+    ExecutionPayloadParams::Gloas {
+        versioned_hashes: vec![H256::repeat_byte(1); count],
+        parent_beacon_block_root: H256::repeat_byte(3),
+        execution_requests: ExecutionRequests::default(),
+    }
+}
+
+fn test_request<P: Preset>() -> SszNewPayloadRequest<P> {
+    SszNewPayloadRequest::new(&test_combined_payload::<P>(), &test_params::<P>())
+        .expect("request should be buildable")
+}
+
+fn test_combined_payload<P: Preset>() -> CombinedExecutionPayload<P> {
+    CombinedExecutionPayload::Gloas(ExecutionPayload {
+        block_number: 42,
+        withdrawals: ProgressiveList::try_from(vec![Withdrawal::default()])
+            .expect("one withdrawal fits in a progressive list"),
+        ..Default::default()
+    })
+}
+
+fn test_params<P: Preset>() -> ExecutionPayloadParams<P> {
+    ExecutionPayloadParams::Gloas {
+        versioned_hashes: vec![H256::repeat_byte(1), H256::repeat_byte(2)],
+        parent_beacon_block_root: H256::repeat_byte(3),
+        execution_requests: ExecutionRequests::default(),
+    }
 }
