@@ -59,6 +59,7 @@ options=(
     --package panics
     --package predefined_chains
     --package prometheus_metrics
+    --package proof_engine
     --package pubkey_cache
     --package runtime
     --package serde_utils

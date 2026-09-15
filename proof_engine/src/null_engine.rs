@@ -7,25 +7,28 @@ use types::{
     preset::Preset,
 };
 
-use crate::engine::{ProofEngine, ProofEngineError};
+use crate::engine::{ProofEngineError, ProofProver, ProofVerifier};
 
-/// A [`ProofEngine`] that does nothing.
+/// The opt-out [`ProofVerifier`].
 ///
-/// Used by nodes that opt out of execution-proof verification: the gossip
-/// task short-circuits on [`IS_NULL`](ProofEngine::IS_NULL) to `Ignore`
-/// before any pipeline work (and such nodes subscribe to nothing), so the
-/// fail-closed [`verify_execution_proof`](ProofEngine::verify_execution_proof)
-/// below is unreachable in practice.
+/// The task short-circuits on [`is_null`](ProofVerifier::is_null) before any
+/// pipeline work, so the fail-closed
+/// [`verify_execution_proof`](ProofVerifier::verify_execution_proof) is
+/// unreachable in practice.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct NullProofEngine;
 
-impl<P: Preset> ProofEngine<P> for NullProofEngine {
-    const IS_NULL: bool = true;
+impl ProofVerifier for NullProofEngine {
+    fn is_null(&self) -> bool {
+        true
+    }
 
     fn verify_execution_proof(&self, _execution_proof: ExecutionProof) -> bool {
         false
     }
+}
 
+impl<P: Preset> ProofProver<P> for NullProofEngine {
     fn request_proofs(
         &self,
         _new_payload_request: SszNewPayloadRequest<P>,
@@ -70,22 +73,17 @@ mod tests {
 
     #[test]
     fn null_engine_reports_itself_as_null() {
-        assert!(<NullProofEngine as ProofEngine<Minimal>>::IS_NULL);
+        assert!(NullProofEngine.is_null());
     }
 
     #[test]
     fn verify_is_fail_closed() {
-        assert!(
-            !<NullProofEngine as ProofEngine<Minimal>>::verify_execution_proof(
-                &NullProofEngine,
-                test_proof(),
-            )
-        );
+        assert!(!NullProofEngine.verify_execution_proof(test_proof()));
     }
 
     #[test]
     fn prover_methods_reject() {
-        let error = <NullProofEngine as ProofEngine<Minimal>>::request_proofs(
+        let error = <NullProofEngine as ProofProver<Minimal>>::request_proofs(
             &NullProofEngine,
             SszNewPayloadRequest::default(),
             5,
@@ -96,7 +94,7 @@ mod tests {
 
         assert!(matches!(error, ProofEngineError::Unsupported));
 
-        let error = <NullProofEngine as ProofEngine<Minimal>>::get_proof(
+        let error = <NullProofEngine as ProofProver<Minimal>>::get_proof(
             &NullProofEngine,
             H256::default(),
             1,
