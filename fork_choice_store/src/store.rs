@@ -55,6 +55,7 @@ use types::{
         containers::{BlobIdentifier, BlobSidecar},
         primitives::{BlobIndex, KzgCommitment},
     },
+    eip8025::{containers::ExecutionProofEnvelope, primitives::ProofType},
     electra::containers::IndexedAttestation as ElectraIndexedAttestation,
     fulu::{containers::DataColumnIdentifier, primitives::ColumnIndex},
     gloas::{
@@ -182,6 +183,10 @@ pub struct Store<P: Preset, S: Storage<P>> {
     // implementing the spec rule:
     // [IGNORE] This is the first valid aggregate for this aggregator in this epoch.
     seen_gossip_attestations: Arc<Mutex<SeenGossipAttestations>>,
+    // [New in EIP8025]
+    execution_proof_roots: HashMap<H256, HashSet<H256>>,
+    // [New in EIP8025]
+    execution_proof_provers: HashSet<(H256, ProofType, ValidatorIndex)>,
     block_timeliness: HashMap<H256, BlockTimeliness>,
     // `consensus-specs` doesn't explicitly state it, but `Store.checkpoint_states` is effectively a
     // cache, as its contents can be recomputed at any time using data from other fields.
@@ -207,6 +212,8 @@ pub struct Store<P: Preset, S: Storage<P>> {
     payload_vote: HashMap<H256, BitVector<P::PtcSize>>,
     payload_timeliness_vote: HashMap<H256, BitVector<P::PtcSize>>,
     payload_data_availability_vote: HashMap<H256, BitVector<P::PtcSize>>,
+    // [New in EIP8025]
+    execution_proofs: HashMap<H256, HashMap<ProofType, ExecutionProofEnvelope>>,
     // TODO(Grandine Team): Process current slot attestations incrementally to speed up
     //                      `Store::apply_tick`. Update the comment to match the new design.
     //
@@ -374,6 +381,8 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             total_active_balance: OnceLock::new(),
             latest_messages,
             seen_gossip_attestations: Arc::default(),
+            execution_proof_roots: HashMap::new(),
+            execution_proof_provers: HashSet::new(),
             block_timeliness: hashmap! { block_root => BlockTimeliness {
                 before_attestation_due: true,
                 before_payload_attestation_due: true,
@@ -384,6 +393,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             payload_vote: HashMap::new(),
             payload_timeliness_vote: HashMap::new(),
             payload_data_availability_vote: HashMap::new(),
+            execution_proofs: HashMap::new(),
             current_slot_attestations: vector![],
             execution_payload_locations: hashmap! {},
             aggregate_and_proof_supersets: Arc::new(AggregateAndProofSupersets::new()),
@@ -5307,6 +5317,23 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             .retain(|&epoch, _| epoch >= oldest_retained_epoch);
     }
 
+    // [New in EIP8025]
+    pub const fn execution_proofs(
+        &self,
+    ) -> &HashMap<H256, HashMap<ProofType, ExecutionProofEnvelope>> {
+        &self.execution_proofs
+    }
+
+    // [New in EIP8025]
+    pub const fn execution_proof_roots(&self) -> &HashMap<H256, HashSet<H256>> {
+        &self.execution_proof_roots
+    }
+
+    // [New in EIP8025]
+    pub const fn execution_proof_provers(&self) -> &HashSet<(H256, ProofType, ValidatorIndex)> {
+        &self.execution_proof_provers
+    }
+
     // `Vector` has no `resize` method as of `im` version 15.1.0.
     fn extend_latest_messages_after_finalization(&mut self) {
         let old_length = self.latest_messages.len();
@@ -6831,4 +6858,82 @@ fn is_builder_exiting<P: Preset>(
 
         pubkey == builder.pubkey && source_address == builder.execution_address
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssz::Hc;
+    use types::{
+        phase0::{
+            beacon_state::BeaconState as Phase0BeaconState,
+            containers::{
+                BeaconBlock as Phase0BeaconBlock, BeaconBlockBody as Phase0BeaconBlockBody,
+                BeaconBlockHeader, SignedBeaconBlock as Phase0SignedBeaconBlock,
+            },
+        },
+        preset::Minimal,
+    };
+
+    struct NoopStorage;
+
+    impl Storage<Minimal> for NoopStorage {
+        fn storage_mode(&self) -> StorageMode {
+            StorageMode::default()
+        }
+
+        fn stored_state_by_block_root(
+            &self,
+            _block_root: H256,
+            _finalized_validators: Option<&dyn SszValidatorList>,
+        ) -> Result<Option<Arc<BeaconState<Minimal>>>> {
+            Ok(None)
+        }
+    }
+
+    fn genesis_store() -> Store<Minimal, NoopStorage> {
+        let body = Phase0BeaconBlockBody::<Minimal>::default();
+        let body_root = body.hash_tree_root();
+
+        let mut phase0_state = Phase0BeaconState::<Minimal>::default();
+        phase0_state.latest_block_header = BeaconBlockHeader {
+            body_root,
+            ..Default::default()
+        };
+
+        let state = Arc::new(BeaconState::<Minimal>::from(phase0_state));
+        let state_root = state.hash_tree_root();
+
+        let block = Phase0SignedBeaconBlock {
+            message: Hc::from(Phase0BeaconBlock {
+                state_root,
+                body,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        Store::new(
+            Arc::new(ChainConfig::default()),
+            Arc::new(PubkeyCache::default()),
+            StoreConfig::default(),
+            Arc::new(SignedBeaconBlock::<Minimal>::from(block)),
+            state,
+            Arc::new(NoopStorage),
+            false,
+            false,
+            StdHashSet::default(),
+            Arc::new(SccHashMap::new()),
+        )
+    }
+
+    #[test]
+    fn execution_proof_state_shapes_empty_at_genesis() {
+        let store = genesis_store();
+
+        assert!(store.execution_proofs().is_empty());
+        assert!(store.execution_proof_roots().is_empty());
+        assert!(store.execution_proof_provers().is_empty());
+    }
 }
