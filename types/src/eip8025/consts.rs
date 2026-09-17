@@ -4,7 +4,7 @@
 //! consensus-specs. In particular, `MAX_PROOF_SIZE` is 4 MiB rather
 //! than 400 KiB.
 //!
-//! [EIP-8025 consensus spec]: https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/beacon-chain.md
+//! [EIP-8025 consensus spec]: https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/beacon-chain.md
 
 use typenum::Unsigned as _;
 
