@@ -2,15 +2,19 @@ use bls::SignatureBytes;
 use ethereum_types::H256;
 use serde::{Deserialize, Deserializer, Serialize};
 use ssz::{
-    Hc, ProgressiveByteList, ReadError, Size, Ssz, SszHash, SszRead, SszSize, SszWrite, WriteError,
+    ContiguousList, Hc, ProgressiveByteList, ReadError, Size, Ssz, SszHash, SszRead, SszSize,
+    SszWrite, WriteError,
 };
 
 use crate::{
+    deneb::primitives::VersionedHash,
     eip8025::{
         consts::MAX_PROOF_SIZE,
         primitives::{MaxProofSize, ProofType},
     },
+    gloas::containers::{ExecutionPayload, ExecutionRequests},
     phase0::primitives::ValidatorIndex,
+    preset::Preset,
 };
 
 /// The opaque proof bytes of an execution proof.
@@ -155,4 +159,28 @@ pub struct SignedExecutionProofEnvelope {
     #[serde(with = "serde_utils::string_or_native")]
     pub validator_index: ValidatorIndex,
     pub signature: SignatureBytes,
+}
+
+/// The `SSZNewPayloadRequest` whose execution a proof certifies.
+///
+/// The `hash_tree_root` of this container is
+/// `public_input.new_payload_request_root`, which binds the proof to
+/// the payload it certifies.
+///
+/// Defined as a `ProgressiveContainer` in consensus-specs and built
+/// from the Gloas `ExecutionPayload` and `ExecutionRequests`.
+///
+/// The `SSZ` prefix distinguishes this type from the Engine API
+/// request of the same name, which is not an SSZ container.
+#[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
+#[serde(bound = "", deny_unknown_fields)]
+#[ssz(stable(active = [1; 4]))]
+pub struct SszNewPayloadRequest<P: Preset> {
+    pub execution_payload: ExecutionPayload<P>,
+    // consensus-specs bounds this by
+    // `MAX_BLOB_COMMITMENTS_PER_BLOCK`, represented here by
+    // `MaxBlobCommitmentsPerBlock`.
+    pub versioned_hashes: ContiguousList<VersionedHash, P::MaxBlobCommitmentsPerBlock>,
+    pub parent_beacon_block_root: H256,
+    pub execution_requests: ExecutionRequests<P>,
 }
