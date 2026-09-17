@@ -163,28 +163,23 @@ pub struct SignedExecutionProofEnvelope {
 
 /// The `SSZNewPayloadRequest` whose execution a proof certifies.
 ///
-/// `hash_tree_root` of this container is
-/// `public_input.new_payload_request_root`, the only link between a
-/// proof and the payload it certifies.
+/// The `hash_tree_root` of this container is
+/// `public_input.new_payload_request_root`, which binds the proof to
+/// the payload it certifies.
 ///
-/// A `ProgressiveContainer` in consensus-specs, built from the Gloas
-/// `ExecutionPayload` and `ExecutionRequests`. Grandine's Rust name
-/// follows the spec's `SSZNewPayloadRequest`; the `SSZ` prefix
-/// distinguishes it from the Engine API request of the same name,
-/// which is not an SSZ container at all.
+/// Defined as a `ProgressiveContainer` in consensus-specs and built
+/// from the Gloas `ExecutionPayload` and `ExecutionRequests`.
 ///
-/// The root is preset-independent. Under Gloas every list that could
-/// carry a limit into it is progressive, and the preset-derived
-/// bounds that do reach it are equal across presets, which
-/// `container_impls` asserts.
+/// The `SSZ` prefix distinguishes this type from the Engine API
+/// request of the same name, which is not an SSZ container.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(bound = "", deny_unknown_fields)]
 #[ssz(stable(active = [1; 4]))]
 pub struct SszNewPayloadRequest<P: Preset> {
     pub execution_payload: ExecutionPayload<P>,
-    // consensus-specs bounds this at
-    // `MAX_BLOB_COMMITMENTS_PER_BLOCK`, which is what
-    // `MaxBlobCommitmentsPerBlock` is.
+    // consensus-specs bounds this by
+    // `MAX_BLOB_COMMITMENTS_PER_BLOCK`, represented here by
+    // `MaxBlobCommitmentsPerBlock`.
     pub versioned_hashes: ContiguousList<VersionedHash, P::MaxBlobCommitmentsPerBlock>,
     pub parent_beacon_block_root: H256,
     pub execution_requests: ExecutionRequests<P>,

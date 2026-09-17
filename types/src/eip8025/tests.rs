@@ -51,8 +51,8 @@ const EXECUTION_PROOF_FIXED_PART: usize = 4 + 1 + PUBLIC_INPUT_SIZE;
 // `Boolean`, a `Uint64`, and a `Uint16`.
 const PUBLIC_INPUT_SIZE: usize = 32 + 1 + 8 + 2;
 
-// The bound `versioned_hashes` carries into the root. Equal across
-// presets, which `container_impls` asserts.
+// The `versioned_hashes` bound affects the root and is equal across
+// presets, as asserted in `container_impls`.
 const MAX_VERSIONED_HASHES: usize = <Mainnet as Preset>::MaxBlobCommitmentsPerBlock::USIZE;
 
 // The expected roots below were produced by an independent
@@ -393,10 +393,10 @@ fn test_bytes(length: usize) -> Vec<u8> {
 
 // `SSZNewPayloadRequest` is a progressive container, so its root is
 // the progressive merkleization of the four field roots with the
-// active-field layout mixed in — not the fixed-depth merkleization a
-// plain container would use. The subtree roots themselves come from
-// types already covered by `ssz_static` spec tests, including the
-// Gloas `ExecutionPayload` and `ExecutionRequests`.
+// active-field layout mixed in, rather than the fixed-depth
+// merkleization used by a plain container. The field roots themselves
+// come from types already covered by `ssz_static` spec tests,
+// including the Gloas `ExecutionPayload` and `ExecutionRequests`.
 #[test]
 fn new_payload_request_root_is_progressive_merkleization_of_field_roots() {
     let request = test_request::<Mainnet>();
@@ -408,8 +408,8 @@ fn new_payload_request_root_is_progressive_merkleization_of_field_roots() {
         request.execution_requests.hash_tree_root(),
     ];
 
-    // The active-field layout word: the low four bits of a 256-bit word, least significant
-    // bit first.
+    // Active-field layout: the low four bits of a 256-bit word, with
+    // field 0 in the least significant bit.
     let active_fields = H256(hex!(
         "0f00000000000000000000000000000000000000000000000000000000000000"
     ));
@@ -423,10 +423,9 @@ fn new_payload_request_root_is_progressive_merkleization_of_field_roots() {
     );
 }
 
-// Binding is preset-independent under Gloas. Every list that could
-// carry a limit into the root is progressive, and the bounds that do
-// reach it are equal across presets, so the same logical request must
-// hash identically under Mainnet and Minimal.
+// Binding is preset-independent under Gloas. The preset-derived bounds
+// that affect the root are equal across Mainnet and Minimal, so the
+// same logical request must hash identically under both presets.
 #[test]
 fn root_does_not_depend_on_preset() {
     assert_eq!(
@@ -435,8 +434,8 @@ fn root_does_not_depend_on_preset() {
     );
 }
 
-// A progressive container root is not the root of its first field,
-// and it is not the plain container root either.
+// A progressive-container root is not simply the root of its first
+// field.
 #[test]
 fn new_payload_request_root_differs_from_execution_payload_root() {
     let request = test_request::<Mainnet>();
@@ -484,10 +483,9 @@ fn new_carries_the_fields_it_is_given() {
     assert_eq!(&request.execution_requests, execution_requests);
 }
 
-// EIP-8025 builds on Gloas, which has its own `ExecutionPayload` and
-// `ExecutionRequests`. The Electra params carry the Electra
-// `ExecutionRequests`, which is a different container with a
-// different root, so they cannot be bound either.
+// EIP-8025 binds the Gloas `ExecutionPayload` and `ExecutionRequests`.
+// Electra params contain the Electra `ExecutionRequests`, a different
+// container with a different root, so those params cannot be bound.
 #[test]
 fn new_rejects_pre_gloas_params() {
     let payload = test_combined_payload::<Mainnet>();
@@ -521,10 +519,10 @@ fn new_rejects_pre_gloas_payload() {
     );
 }
 
-// consensus-specs bounds `versioned_hashes` at
-// `MAX_BLOB_COMMITMENTS_PER_BLOCK`, but derives it from the Gloas
-// `blob_kzg_commitments`, which is a progressive list and therefore
-// unbounded. Binding must reject values that exceed the target bound.
+// consensus-specs bounds `versioned_hashes` by
+// `MAX_BLOB_COMMITMENTS_PER_BLOCK`, but derives them from the Gloas
+// `blob_kzg_commitments`, an unbounded progressive list. Binding must
+// reject a source list that exceeds the target bound.
 #[test]
 fn new_rejects_too_many_versioned_hashes() {
     let payload = test_combined_payload::<Mainnet>();
@@ -554,7 +552,10 @@ fn new_accepts_max_versioned_hashes() {
     let request = SszNewPayloadRequest::<Mainnet>::new(&payload, &params)
         .expect("the maximum number of versioned hashes should be accepted");
 
-    assert_eq!(request.versioned_hashes.as_ref().len(), MAX_VERSIONED_HASHES);
+    assert_eq!(
+        request.versioned_hashes.as_ref().len(),
+        MAX_VERSIONED_HASHES
+    );
 }
 
 fn test_params_with_versioned_hashes<P: Preset>(count: usize) -> ExecutionPayloadParams<P> {

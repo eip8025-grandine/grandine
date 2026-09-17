@@ -11,19 +11,15 @@ use crate::{
 
 // Payload binding is preset-independent under Gloas.
 //
-// Most of what `SSZNewPayloadRequest` contains carries no limit into
-// its root: `transactions`, `withdrawals` and every field of
-// `ExecutionRequests` are progressive lists, and each `Transaction`
-// and the `BlockAccessList` are progressive byte lists, whose roots
-// do not depend on their bounds. Three preset-derived bounds still
-// reach the root — `BytesPerLogsBloom` and `MaxExtraDataBytes`
-// through `ExecutionPayload`, and `MaxBlobCommitmentsPerBlock`
-// through `versioned_hashes` — and `MaxBytesPerTransaction` bounds
-// decoding.
+// Most variable-size collections in `SSZNewPayloadRequest` use
+// progressive lists or progressive byte lists, whose roots do not
+// depend on their bounds. Three preset-derived bounds still affect
+// the root: `BytesPerLogsBloom` and `MaxExtraDataBytes` through
+// `ExecutionPayload`, and `MaxBlobCommitmentsPerBlock` through
+// `versioned_hashes`. `MaxBytesPerTransaction` affects decoding.
 //
-// All four are equal across presets today. If one ever diverges, this
-// stops compiling rather than silently producing a root that depends
-// on which preset a node runs.
+// All four bounds are equal across presets today. These assertions
+// make any divergence explicit at compile time.
 const_assert_eq!(
     <Mainnet as Preset>::BytesPerLogsBloom::USIZE,
     <Minimal as Preset>::BytesPerLogsBloom::USIZE
@@ -41,9 +37,9 @@ const_assert_eq!(
     <Minimal as Preset>::MaxBytesPerTransaction::USIZE
 );
 
-// Equal across presets is not enough on its own: a prover commits to
-// the values consensus-specs pins for mainnet, so those are pinned
-// here too.
+// Equal across presets is not enough: the implementation must also
+// use the mainnet values pinned by consensus-specs, so those are
+// asserted here.
 const_assert_eq!(<Mainnet as Preset>::BytesPerLogsBloom::USIZE, 256);
 const_assert_eq!(<Mainnet as Preset>::MaxExtraDataBytes::USIZE, 32);
 const_assert_eq!(<Mainnet as Preset>::MaxBlobCommitmentsPerBlock::USIZE, 4096);
@@ -58,9 +54,10 @@ impl<P: Preset> SszNewPayloadRequest<P> {
     /// Grandine already holds at the `notify_new_payload` boundary.
     ///
     /// That pair is assembled from the same sources the spec's
-    /// `get_execution_proof` uses: the payload and execution requests
-    /// come from the `ExecutionPayloadEnvelope`, and
-    /// `versioned_hashes` from
+    /// `get_execution_proof` uses: the payload, parent beacon block
+    /// root, and execution requests come from the
+    /// `ExecutionPayloadEnvelope`, while `versioned_hashes` are
+    /// derived from
     /// `state.latest_execution_payload_bid.blob_kzg_commitments`.
     ///
     /// EIP-8025 builds on Gloas, so payloads and params from earlier
