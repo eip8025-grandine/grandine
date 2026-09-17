@@ -17,7 +17,7 @@ use crate::{
     phase0::primitives::ValidatorIndex,
 };
 
-// Sample values mirrored exactly in the reference implementation.
+// Sample values matching the reference implementation.
 const NEW_PAYLOAD_REQUEST_ROOT: H256 = H256(hex!(
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 ));
@@ -36,23 +36,23 @@ const ENVELOPE_FIXED_PART: usize = 37;
 // serialized `PublicInput`.
 const EXECUTION_PROOF_FIXED_PART: usize = 4 + 1 + PUBLIC_INPUT_SIZE;
 
-// `PublicInput` is all-fixed, so a progressive container serializes
-// as its active fields concatenated: a `Root`, a `Boolean`, a
-// `Uint64` and a `Uint16`.
+// `PublicInput` is all fixed-size, so its progressive-container
+// encoding is the concatenation of its active fields: a `Root`, a
+// `Boolean`, a `Uint64`, and a `Uint16`.
 const PUBLIC_INPUT_SIZE: usize = 32 + 1 + 8 + 2;
 
 // The expected roots below were produced by an independent
 // implementation using merkleization primitives from
-// `ethereum/ssz-specs` v0.0.1.dev2. The container composition is
+// `ethereum/ssz-specs` v0.0.1.dev2. The container composition was
 // cross-checked against the `ssz-specs` progressive-container
-// fixtures and the `ProgressiveByteList` vectors.
+// fixtures and `ProgressiveByteList` vectors.
 //
-// They are not cross-checked against the pyspec, and no `ssz_static`
+// They were not cross-checked against the pyspec, and no `ssz_static`
 // vectors exist for EIP-8025.
 
-// `PublicInput` is a progressive container, so its root is not its
-// first field: the four field roots are merkleized progressively and
-// the active-field layout is mixed in.
+// `PublicInput` is a progressive container, so its root is not simply
+// its first field: the four field roots are progressively merkleized,
+// then the active-field layout is mixed in.
 #[test]
 fn public_input_root_matches_reference() {
     let root = test_public_input().hash_tree_root();
@@ -125,8 +125,9 @@ fn envelope_roots_match_reference(
     assert_eq!(signed.hash_tree_root(), H256(expected_signed_root));
 }
 
-// The gossiped object is the envelope, not the proof, so the two must
-// not share a root.
+// `ExecutionProofEnvelope` commits to the beacon block root instead
+// of `PublicInput`, so its root should differ from the corresponding
+// `ExecutionProof` root.
 #[test]
 fn envelope_and_proof_roots_differ() {
     let envelope = ExecutionProofEnvelope::clone(&test_signed_envelope(100).message);
@@ -142,9 +143,8 @@ fn envelope_and_proof_roots_differ() {
     );
 }
 
-// The `Hc` wrapper must not change the object root. That root is both
-// the gossip de-duplication key and the `object_root` the signing
-// root is built from.
+// `Hc` must not change the object root. That root is reused as both
+// the gossip de-duplication key and the `object_root` for signing.
 #[test]
 fn hc_wrapper_preserves_object_root() {
     let signed = test_signed_envelope(100);
@@ -180,9 +180,9 @@ fn execution_proof_ssz_round_trip(proof_data_length: usize) {
     assert_eq!(decoded.hash_tree_root(), proof.hash_tree_root());
 }
 
-// `MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE` is the bound gossip must
-// apply before decoding, so it must match the encoded size of a
-// maximum-sized envelope.
+// `MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE` is the pre-decode gossip
+// bound, so it must equal the encoded size of a maximum-sized
+// envelope.
 #[test]
 fn max_sized_envelope_encodes_to_max_signed_execution_proof_envelope_size() {
     let proof_data =
@@ -221,8 +221,8 @@ fn proof_data_construction_accepts_max_size() {
     ProofData::try_from(vec![0; MAX_PROOF_SIZE]).expect("proof data should be within bounds");
 }
 
-// `ProofData` is a progressive list and therefore unbounded in the
-// spec. Decoding must reject oversize `proof_data` explicitly.
+// `ProofData` is unbounded in the spec, so decoding must explicitly
+// reject values larger than `MAX_PROOF_SIZE`.
 #[test]
 fn envelope_decoding_rejects_oversize_proof_data() {
     let bytes = encoded_envelope(MAX_PROOF_SIZE + 1);
@@ -287,8 +287,8 @@ fn signed_execution_proof_envelope_json_round_trip() {
     assert_eq!(decoded.hash_tree_root(), signed.hash_tree_root());
 }
 
-// The serde path shares the bound with SSZ decoding, so it rejects
-// oversize `proof_data` too.
+// Serde enforces the same bound as SSZ decoding and rejects oversize
+// `proof_data`.
 #[test]
 fn proof_data_deserialization_rejects_oversize() {
     let json = format!("\"0x{}\"", "00".repeat(MAX_PROOF_SIZE.saturating_add(1)));
@@ -299,8 +299,7 @@ fn proof_data_deserialization_rejects_oversize() {
     assert!(error.to_string().contains("no more than"), "{error}");
 }
 
-// Hand-built because `ProofData` cannot be constructed oversize
-// through the public API.
+// Built manually because the public API rejects oversize `ProofData`.
 fn encoded_envelope(proof_data_length: usize) -> Vec<u8> {
     let length = ENVELOPE_FIXED_PART.saturating_add(proof_data_length);
 
@@ -371,7 +370,7 @@ fn test_signature() -> SignatureBytes {
     SignatureBytes::from_slice(&test_bytes(96))
 }
 
-// Matches `test_bytes` in the reference implementation.
+// Matches the reference implementation's `test_bytes`.
 fn test_bytes(length: usize) -> Vec<u8> {
     (0..length)
         .map(|index| u8::try_from(index % 256).expect("value modulo 256 should fit in u8"))
