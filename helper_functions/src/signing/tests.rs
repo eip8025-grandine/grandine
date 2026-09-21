@@ -3,6 +3,7 @@ use hex_literal::hex;
 use ssz::Hc;
 use std_ext::CopyExt as _;
 use tap::{Conv as _, TryConv as _};
+use typenum::Unsigned as _;
 use types::{
     eip8025::{
         consts::STATELESS_INPUT_SCHEMA_ID,
@@ -141,6 +142,51 @@ fn signing_root_matches_formula_across_fork_boundary() {
     assert_signing_root_matches_formula(&envelope, &state, 0);
 }
 
+// The supplied slot must drive fork-version selection even when it differs
+// from `state.slot`: `state.slot` (0) is still in the previous fork, while the
+// supplied slot is inside `fork.epoch`, so `current_version` must be used.
+#[test]
+fn signing_root_uses_supplied_slot_over_state_slot() {
+    let config = Config::minimal();
+
+    let state = Phase0BeaconState::<Minimal> {
+        fork: Fork {
+            previous_version: config.genesis_fork_version,
+            current_version: hex!("01000001").into(),
+            epoch: 1,
+        },
+        ..Phase0BeaconState::default()
+    };
+
+    let envelope = test_envelope();
+    let slot = <Minimal as Preset>::SlotsPerEpoch::U64; // first slot of epoch 1
+
+    let domain = misc::compute_domain(
+        &config,
+        DOMAIN_EXECUTION_PROOF,
+        Some(state.fork().current_version),
+        Some(state.genesis_validators_root()),
+    );
+
+    let signing_root = envelope.signing_root(&config, &state, slot);
+
+    assert_eq!(signing_root, misc::compute_signing_root(&envelope, domain),);
+
+    // Sanity: an implementation that fell back to `state.slot` would pick
+    // `previous_version` and produce a different root.
+    let stale_domain = misc::compute_domain(
+        &config,
+        DOMAIN_EXECUTION_PROOF,
+        Some(state.fork().previous_version),
+        Some(state.genesis_validators_root()),
+    );
+
+    assert_ne!(
+        signing_root,
+        misc::compute_signing_root(&envelope, stale_domain),
+    );
+}
+
 // (b) Pins from container suite + out-of-band script; not pyspec-checked.
 #[test]
 fn signing_root_matches_pinned_vector() {
@@ -196,7 +242,10 @@ fn tampered_message_is_rejected() {
         Error::SignatureInvalid(SignatureKind::ExecutionProofEnvelope),
     ));
 
-    assert_eq!(error.to_string(), "execution proof signature is invalid");
+    assert_eq!(
+        error.to_string(),
+        "execution proof envelope signature is invalid"
+    );
 }
 
 // (e) `Hc` delegates `hash_tree_root`, so bare and wrapped signatures match.
