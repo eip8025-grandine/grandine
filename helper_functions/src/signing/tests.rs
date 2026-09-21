@@ -209,7 +209,7 @@ fn hc_wrapper_preserves_envelope_signature() {
     let signed = SignedExecutionProofEnvelope {
         message: Hc::from(envelope.clone()),
         validator_index: 0,
-        signature: signature.clone().into(),
+        signature: signature.into(),
     };
 
     assert_eq!(signed.message.hash_tree_root(), envelope.hash_tree_root());
