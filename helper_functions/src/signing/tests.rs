@@ -3,6 +3,8 @@ use hex_literal::hex;
 use ssz::Hc;
 use std_ext::CopyExt as _;
 use tap::{Conv as _, TryConv as _};
+use types::phase0::primitives::{ExecutionAddress, Version};
+use types::preset::Mainnet;
 use types::{
     eip8025::{
         consts::STATELESS_INPUT_SCHEMA_ID,
@@ -193,7 +195,7 @@ fn tampered_message_is_rejected() {
         error
             .downcast_ref::<Error>()
             .expect("error should be a signing error"),
-        Error::SignatureInvalid(SignatureKind::ExecutionProof),
+        Error::SignatureInvalid(SignatureKind::ExecutionProofEnvelope),
     ));
 
     assert_eq!(error.to_string(), "execution proof signature is invalid");
@@ -240,4 +242,107 @@ fn envelope_root_differs_from_bare_proof_root() {
     };
 
     assert_ne!(envelope.hash_tree_root(), proof.hash_tree_root());
+}
+
+
+fn fork_info(previous_version: Version, current_version: Version) -> ForkInfo {
+    ForkInfo {
+        fork: Fork {
+            previous_version,
+            current_version,
+            epoch: 0,
+        },
+        genesis_validators_root: H256::repeat_byte(1),
+    }
+}
+
+#[test]
+fn voluntary_exit_domain_is_pinned_to_capella_from_deneb_on() {
+    let config = Config::mainnet();
+
+    let exit = VoluntaryExit {
+        epoch: 0,
+        validator_index: 1,
+    };
+
+    let capella = fork_info(config.bellatrix_fork_version, config.capella_fork_version);
+
+    let capella_root =
+        SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, capella);
+
+    for current_version in [
+        config.deneb_fork_version,
+        config.electra_fork_version,
+        config.fulu_fork_version,
+        config.gloas_fork_version,
+    ] {
+        let later = fork_info(config.capella_fork_version, current_version);
+
+        assert_eq!(
+            SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, later),
+            capella_root,
+            "exit domain under {current_version:?} should be pinned to Capella",
+        );
+    }
+}
+
+#[test]
+fn voluntary_exit_domain_follows_the_fork_before_deneb() {
+    let config = Config::mainnet();
+
+    let exit = VoluntaryExit {
+        epoch: 0,
+        validator_index: 1,
+    };
+
+    let bellatrix = fork_info(config.altair_fork_version, config.bellatrix_fork_version);
+    let capella = fork_info(config.bellatrix_fork_version, config.capella_fork_version);
+
+    assert_ne!(
+        SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, bellatrix),
+        SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, capella),
+    );
+}
+
+// Preferences for the first Gloas epoch are signed an epoch early, from a Fulu fork.
+#[test]
+fn proposer_preferences_domain_follows_the_proposal_epoch() {
+    let mut config = Config::mainnet();
+    config.gloas_fork_epoch = 10;
+
+    let preferences = |proposal_slot| ProposerPreferences {
+        dependent_root: H256::repeat_byte(2),
+        proposal_slot,
+        validator_index: 1,
+        fee_recipient: ExecutionAddress::zero(),
+        target_gas_limit: 0,
+    };
+
+    let gloas_slot = misc::compute_start_slot_at_epoch::<Mainnet>(10);
+    let fulu = fork_info(config.electra_fork_version, config.fulu_fork_version);
+    let gloas = fork_info(config.fulu_fork_version, config.gloas_fork_version);
+
+    let root_from_fulu = SignForSingleFork::<Mainnet>::signing_root_from_fork_info(
+        &preferences(gloas_slot),
+        &config,
+        fulu,
+    );
+
+    assert_eq!(
+        root_from_fulu,
+        SignForSingleFork::<Mainnet>::signing_root_from_fork_info(
+            &preferences(gloas_slot),
+            &config,
+            gloas,
+        ),
+    );
+
+    assert_ne!(
+        root_from_fulu,
+        SignForSingleFork::<Mainnet>::signing_root_from_fork_info(
+            &preferences(gloas_slot - 1),
+            &config,
+            fulu,
+        ),
+    );
 }
