@@ -526,7 +526,7 @@ impl SignForAllForks for BuilderDepositMessage {
     const SIGNATURE_KIND: SignatureKind = SignatureKind::BuilderDeposit;
 }
 
-/// <https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/prover.md#new-get_execution_proof_envelope_signature>
+// <https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/prover.md#new-get_execution_proof_envelope_signature>
 impl<P: Preset> SignForSingleForkAtSlot<P> for ExecutionProofEnvelope {
     const DOMAIN_TYPE: DomainType = DOMAIN_EXECUTION_PROOF;
     const SIGNATURE_KIND: SignatureKind = SignatureKind::ExecutionProofEnvelope;
