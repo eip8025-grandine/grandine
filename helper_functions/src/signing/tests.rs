@@ -214,7 +214,8 @@ fn hc_wrapper_preserves_envelope_signature() {
 
     assert_eq!(signed.message.hash_tree_root(), envelope.hash_tree_root());
 
-    envelope
+    signed
+        .message
         .verify(&config, &state, 0, signature.into(), public_key)
         .expect("signature over envelope should verify");
 }
