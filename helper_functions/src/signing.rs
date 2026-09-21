@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bls::{PublicKey, SecretKey, Signature, SignatureBytes, traits::SecretKey as _};
+use bls::{traits::SecretKey as _, PublicKey, SecretKey, Signature, SignatureBytes};
 use derive_more::From;
 use ssz::{Ssz, SszHash};
 use types::{
@@ -50,7 +50,7 @@ use types::{
             AggregateAndProof as Phase0AggregateAndProof, AttestationData,
             BeaconBlock as Phase0BeaconBlock, BeaconBlockHeader, DepositMessage, VoluntaryExit,
         },
-        primitives::{DomainType, Epoch, H256, Slot},
+        primitives::{DomainType, Epoch, Slot, H256},
     },
     preset::Preset,
     traits::{BeaconBlock, BeaconState},
@@ -529,7 +529,7 @@ impl SignForAllForks for BuilderDepositMessage {
 /// <https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/prover.md#new-get_execution_proof_envelope_signature>
 impl<P: Preset> SignForSingleForkAtSlot<P> for ExecutionProofEnvelope {
     const DOMAIN_TYPE: DomainType = DOMAIN_EXECUTION_PROOF;
-    const SIGNATURE_KIND: SignatureKind = SignatureKind::ExecutionProof;
+    const SIGNATURE_KIND: SignatureKind = SignatureKind::ExecutionProofEnvelope;
 }
 
 #[cfg(test)]

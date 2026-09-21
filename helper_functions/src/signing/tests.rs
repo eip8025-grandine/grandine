@@ -193,7 +193,7 @@ fn tampered_message_is_rejected() {
         error
             .downcast_ref::<Error>()
             .expect("error should be a signing error"),
-        Error::SignatureInvalid(SignatureKind::ExecutionProof),
+        Error::SignatureInvalid(SignatureKind::ExecutionProofEnvelope),
     ));
 
     assert_eq!(error.to_string(), "execution proof signature is invalid");
