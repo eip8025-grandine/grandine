@@ -526,6 +526,8 @@ impl SignForAllForks for BuilderDepositMessage {
     const SIGNATURE_KIND: SignatureKind = SignatureKind::BuilderDeposit;
 }
 
+// The trait honors the caller-supplied slot, but the spec requires callers of this impl to pass `state.slot`.
+// `ExecutionProofEnvelope` has no slot of its own, so nothing else pins the epoch.
 // <https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/prover.md#new-get_execution_proof_envelope_signature>
 impl<P: Preset> SignForSingleForkAtSlot<P> for ExecutionProofEnvelope {
     const DOMAIN_TYPE: DomainType = DOMAIN_EXECUTION_PROOF;
