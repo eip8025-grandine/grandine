@@ -16,7 +16,7 @@ use crate::{
             MAX_PROOF_SIZE, MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE, STATELESS_INPUT_SCHEMA_ID,
         },
         containers::{
-            ExecutionProof, ExecutionProofEnvelope, ProofData, PublicInput,
+            ExecutionProof, ExecutionProofEnvelope, ProofAttributes, ProofData, PublicInput,
             SignedExecutionProofEnvelope, SszNewPayloadRequest,
         },
         error::PayloadBindingError,
@@ -586,4 +586,28 @@ fn test_params<P: Preset>() -> ExecutionPayloadParams<P> {
         parent_beacon_block_root: H256::repeat_byte(3),
         execution_requests: ExecutionRequests::default(),
     }
+}
+
+#[test]
+fn proof_attributes_json_round_trip() {
+    let attributes = ProofAttributes {
+        proof_types: vec![1, 2, 3],
+    };
+
+    let json = serde_json::to_string(&attributes).expect("attributes should be serializable");
+
+    assert_eq!(json, r#"{"proof_types":["1","2","3"]}"#);
+
+    let decoded: ProofAttributes =
+        serde_json::from_str(&json).expect("attributes should be deserializable");
+
+    assert_eq!(decoded, attributes);
+}
+
+#[test]
+fn proof_attributes_accepts_native_integers() {
+    let decoded: ProofAttributes = serde_json::from_str(r#"{"proof_types":[1,2]}"#)
+        .expect("native integers should be accepted");
+
+    assert_eq!(decoded.proof_types, vec![1, 2]);
 }
