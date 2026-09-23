@@ -11,7 +11,7 @@ use crate::engine::{ProofEngineError, ProofProver, ProofVerifier};
 
 /// A [`ProofVerifier`] fake for tests.
 ///
-/// Mirrors [`MockExecutionEngine`](execution_engine::MockExecutionEngine):
+/// Mirrors execution_engine::MockExecutionEngine:
 /// `execution_proof_valid` drives the happy + reject paths of
 /// [`verify_execution_proof`](ProofVerifier::verify_execution_proof) with no
 /// real verifier. The prover-role methods stay reject-stubs, except that a
