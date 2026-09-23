@@ -15,7 +15,7 @@ pub trait ProofVerifier: Send + Sync + 'static {
     /// Whether this verifier opts out of execution-proof verification.
     fn is_null(&self) -> bool;
 
-    /// [`verify_execution_proof`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-verify_execution_proof)
+    /// [`verify_execution_proof`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-verify_execution_proof)
     fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool;
 }
 
@@ -24,7 +24,7 @@ pub trait ProofVerifier: Send + Sync + 'static {
 /// Generic over `P` because `request_proofs` takes the full
 /// `SszNewPayloadRequest<P>`. Unwired for now: Grandine is verifier-only.
 pub trait ProofProver<P: Preset>: Send + Sync + 'static {
-    /// [`request_proofs`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-request_proofs)
+    /// [`request_proofs`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-request_proofs)
     fn request_proofs(
         &self,
         new_payload_request: SszNewPayloadRequest<P>,
@@ -33,7 +33,7 @@ pub trait ProofProver<P: Preset>: Send + Sync + 'static {
         proof_attributes: ProofAttributes,
     ) -> Result<H256, ProofEngineError>;
 
-    /// [`get_proof`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-get_proof)
+    /// [`get_proof`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-get_proof)
     fn get_proof(
         &self,
         new_payload_request_root: H256,
