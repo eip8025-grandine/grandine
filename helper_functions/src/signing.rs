@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bls::{PublicKey, SecretKey, Signature, SignatureBytes, traits::SecretKey as _};
+use bls::{traits::SecretKey as _, PublicKey, SecretKey, Signature, SignatureBytes};
 use derive_more::From;
 use ssz::{Ssz, SszHash};
 use types::{
@@ -25,6 +25,7 @@ use types::{
     },
     config::Config,
     deneb::containers::BeaconBlock as DenebBeaconBlock,
+    eip8025::{consts::DOMAIN_EXECUTION_PROOF, containers::ExecutionProofEnvelope},
     electra::containers::{
         AggregateAndProof as ElectraAggregateAndProof, BeaconBlock as ElectraBeaconBlock,
     },
@@ -50,7 +51,7 @@ use types::{
             AggregateAndProof as Phase0AggregateAndProof, AttestationData,
             BeaconBlock as Phase0BeaconBlock, BeaconBlockHeader, DepositMessage, VoluntaryExit,
         },
-        primitives::{DomainType, Epoch, H256, Slot},
+        primitives::{DomainType, Epoch, Slot, H256},
     },
     preset::Preset,
     traits::{BeaconBlock, BeaconState},
@@ -550,117 +551,13 @@ impl SignForAllForks for BuilderDepositMessage {
     const SIGNATURE_KIND: SignatureKind = SignatureKind::BuilderDeposit;
 }
 
-#[cfg(test)]
-mod tests {
-    use types::{
-        phase0::{
-            containers::Fork,
-            primitives::{ExecutionAddress, Version},
-        },
-        preset::Mainnet,
-    };
-
-    use super::*;
-
-    fn fork_info(previous_version: Version, current_version: Version) -> ForkInfo {
-        ForkInfo {
-            fork: Fork {
-                previous_version,
-                current_version,
-                epoch: 0,
-            },
-            genesis_validators_root: H256::repeat_byte(1),
-        }
-    }
-
-    #[test]
-    fn voluntary_exit_domain_is_pinned_to_capella_from_deneb_on() {
-        let config = Config::mainnet();
-
-        let exit = VoluntaryExit {
-            epoch: 0,
-            validator_index: 1,
-        };
-
-        let capella = fork_info(config.bellatrix_fork_version, config.capella_fork_version);
-
-        let capella_root =
-            SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, capella);
-
-        for current_version in [
-            config.deneb_fork_version,
-            config.electra_fork_version,
-            config.fulu_fork_version,
-            config.gloas_fork_version,
-        ] {
-            let later = fork_info(config.capella_fork_version, current_version);
-
-            assert_eq!(
-                SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, later),
-                capella_root,
-                "exit domain under {current_version:?} should be pinned to Capella",
-            );
-        }
-    }
-
-    #[test]
-    fn voluntary_exit_domain_follows_the_fork_before_deneb() {
-        let config = Config::mainnet();
-
-        let exit = VoluntaryExit {
-            epoch: 0,
-            validator_index: 1,
-        };
-
-        let bellatrix = fork_info(config.altair_fork_version, config.bellatrix_fork_version);
-        let capella = fork_info(config.bellatrix_fork_version, config.capella_fork_version);
-
-        assert_ne!(
-            SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, bellatrix),
-            SignForSingleFork::<Mainnet>::signing_root_from_fork_info(&exit, &config, capella),
-        );
-    }
-
-    // Preferences for the first Gloas epoch are signed an epoch early, from a Fulu fork.
-    #[test]
-    fn proposer_preferences_domain_follows_the_proposal_epoch() {
-        let mut config = Config::mainnet();
-        config.gloas_fork_epoch = 10;
-
-        let preferences = |proposal_slot| ProposerPreferences {
-            dependent_root: H256::repeat_byte(2),
-            proposal_slot,
-            validator_index: 1,
-            fee_recipient: ExecutionAddress::zero(),
-            target_gas_limit: 0,
-        };
-
-        let gloas_slot = misc::compute_start_slot_at_epoch::<Mainnet>(10);
-        let fulu = fork_info(config.electra_fork_version, config.fulu_fork_version);
-        let gloas = fork_info(config.fulu_fork_version, config.gloas_fork_version);
-
-        let root_from_fulu = SignForSingleFork::<Mainnet>::signing_root_from_fork_info(
-            &preferences(gloas_slot),
-            &config,
-            fulu,
-        );
-
-        assert_eq!(
-            root_from_fulu,
-            SignForSingleFork::<Mainnet>::signing_root_from_fork_info(
-                &preferences(gloas_slot),
-                &config,
-                gloas,
-            ),
-        );
-
-        assert_ne!(
-            root_from_fulu,
-            SignForSingleFork::<Mainnet>::signing_root_from_fork_info(
-                &preferences(gloas_slot - 1),
-                &config,
-                fulu,
-            ),
-        );
-    }
+// The trait honors the caller-supplied slot, but the spec requires callers of this impl to pass `state.slot`.
+// `ExecutionProofEnvelope` has no slot of its own, so nothing else pins the epoch.
+// <https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/prover.md#new-get_execution_proof_envelope_signature>
+impl<P: Preset> SignForSingleForkAtSlot<P> for ExecutionProofEnvelope {
+    const DOMAIN_TYPE: DomainType = DOMAIN_EXECUTION_PROOF;
+    const SIGNATURE_KIND: SignatureKind = SignatureKind::ExecutionProofEnvelope;
 }
+
+#[cfg(test)]
+mod tests;

@@ -114,6 +114,8 @@ pub enum SignatureKind {
     ExecutionPayloadBid,
     #[display("execution payload envelope signature")]
     ExecutionPayloadEnvelope,
+    #[display("execution proof envelope signature")]
+    ExecutionProofEnvelope,
     #[display("collection of multiple signatures")]
     Multi,
     #[display("payload attestation signature")]
