@@ -164,7 +164,7 @@ pub struct SignedExecutionProofEnvelope {
 /// Which proof types to generate, for the prover-role `request_proofs` call.
 ///
 /// Mirrors the `ProofAttributes` dataclass in
-/// [`proof-engine.md`](https://github.com/ethereum/consensus-specs/blob/7d6bd46a015a7dd316c5df855bd89e57c4aa6700/specs/_features/eip8025/proof-engine.md#new-proofattributes):
+/// [`proof-engine.md`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-proofattributes):
 /// a sequence of requested [`ProofType`]s.
 ///
 /// The spec sequence is unbounded, so this is a plain [`Vec`], not an SSZ
