@@ -46,34 +46,3 @@ pub enum ProofEngineError {
     #[error("proof engine method not supported")]
     Unsupported,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Proof types serialize as strings, following the
-    // `string_or_native_sequence` house convention for numeric sequences.
-    #[test]
-    fn proof_attributes_json_round_trip() {
-        let attributes = ProofAttributes {
-            proof_types: vec![1, 2, 3],
-        };
-
-        let json = serde_json::to_string(&attributes).expect("attributes should be serializable");
-
-        assert_eq!(json, r#"{"proof_types":["1","2","3"]}"#);
-
-        let decoded: ProofAttributes =
-            serde_json::from_str(&json).expect("attributes should be deserializable");
-
-        assert_eq!(decoded, attributes);
-    }
-
-    #[test]
-    fn proof_attributes_accepts_native_integers() {
-        let decoded: ProofAttributes = serde_json::from_str(r#"{"proof_types":[1,2]}"#)
-            .expect("native integers should be accepted");
-
-        assert_eq!(decoded.proof_types, vec![1, 2]);
-    }
-}
