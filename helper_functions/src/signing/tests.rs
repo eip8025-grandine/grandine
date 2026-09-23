@@ -221,7 +221,7 @@ fn sign_and_verify_round_trip() {
         .expect("signature should verify");
 }
 
-// (d) Tampering must fail with `SignatureKind::ExecutionProof`.
+// (d) Tampering must fail with `SignatureKind::ExecutionProofEnvelope`.
 #[test]
 fn tampered_message_is_rejected() {
     let (config, state, envelope, key, public_key) = signed_setup();
