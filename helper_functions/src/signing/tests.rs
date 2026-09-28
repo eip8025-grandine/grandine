@@ -13,6 +13,7 @@ use types::{
         },
         primitives::ProofType,
     },
+    gloas::beacon_state::BeaconState as GloasBeaconState,
     phase0::{beacon_state::BeaconState as Phase0BeaconState, containers::Fork},
     preset::Minimal,
 };
@@ -219,6 +220,43 @@ fn sign_and_verify_round_trip() {
     envelope
         .verify(&config, &state, 0, signature.into(), public_key)
         .expect("signature should verify");
+}
+
+// Reproduces the store's signed message and signing context with a known test-only key.
+// The store's frozen bytes require its original private key to reproduce exactly.
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "prints reproducible test-only fixture bytes"
+)]
+fn print_reproducible_proof_envelope_fixture() {
+    let mut bytes = SecretKeyBytes::default();
+    bytes.as_mut()[31] = 1; // Deterministic test scalar, never a real validator key.
+    let key: SecretKey = bytes.try_into().expect("scalar one is a valid secret key");
+    let public_key: bls::PublicKeyBytes = key.to_public_key().into();
+
+    let state = types::combined::BeaconState::<Minimal>::from(GloasBeaconState::<Minimal> {
+        slot: 8,
+        ..Default::default()
+    });
+    let envelope = ExecutionProofEnvelope {
+        proof_data: ProofData::try_from(vec![0x42]).expect("one proof byte is within bounds"),
+        proof_type: 1,
+        beacon_block_root: H256::zero(),
+    };
+    let config = Config::default();
+    let signature: SignatureBytes = envelope.sign(&config, &state, 8, &key).into();
+
+    envelope
+        .verify(&config, &state, 8, signature, Arc::new(key.to_public_key()))
+        .expect("generated signature should verify");
+
+    println!("public key: {:02x?}", public_key.as_bytes());
+    println!("signature: {:02x?}", signature.as_bytes());
+    println!(
+        "signing root: {:?}",
+        envelope.signing_root(&config, &state, 8)
+    );
 }
 
 // (d) Tampering must fail with `SignatureKind::ExecutionProofEnvelope`.
