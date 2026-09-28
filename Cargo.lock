@@ -6043,6 +6043,7 @@ dependencies = [
  "panics",
  "parking_lot",
  "prometheus_metrics",
+ "proof_engine",
  "pubkey_cache",
  "reqwest 0.13.2",
  "scc 3.7.0",
@@ -11905,6 +11906,14 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "types",
+]
+
+[[package]]
+name = "proof_engine"
+version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.18",
  "types",
 ]
 
