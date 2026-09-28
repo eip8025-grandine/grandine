@@ -222,8 +222,8 @@ fn sign_and_verify_round_trip() {
         .expect("signature should verify");
 }
 
-// Reproduces the store's signed message and signing context with a known test-only key.
-// The store's frozen bytes require its original private key to reproduce exactly.
+// Regenerates the frozen store fixture from a known test-only key and signing context.
+// The pinned bytes also catch drift in the envelope root or domain.
 #[test]
 #[expect(
     clippy::print_stdout,
@@ -250,6 +250,25 @@ fn print_reproducible_proof_envelope_fixture() {
     envelope
         .verify(&config, &state, 8, signature, Arc::new(key.to_public_key()))
         .expect("generated signature should verify");
+
+    assert_eq!(
+        envelope.signing_root(&config, &state, 8),
+        H256(hex!(
+            "f0f99f89080f5041bf1b34f232ff3490061b0c569156f41bfa6d04d2dd930997"
+        )),
+    );
+    assert_eq!(
+        public_key.as_bytes(),
+        &hex!(
+            "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb"
+        ),
+    );
+    assert_eq!(
+        signature.as_bytes(),
+        &hex!(
+            "97846b23a00198589bda796dabfe7d6ed20db03eea2b2c62e5d6cf9fa37bf862d110d3dc8097a6b98c28ebca7e6987d00191c9924405a6c276d4dab97a5f3c4519f26fb5347682c3ea415b29192436550e3bb41f645a28b2e9297675c72ec144"
+        ),
+    );
 
     println!("public key: {:02x?}", public_key.as_bytes());
     println!("signature: {:02x?}", signature.as_bytes());
