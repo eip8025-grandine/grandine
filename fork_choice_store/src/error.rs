@@ -290,6 +290,27 @@ pub enum Error<P: Preset> {
     },
     #[error("block has invalid execution payload")]
     InvalidExecutionPayload,
+    #[error("execution proof envelope block root does not match the payload")]
+    ExecutionProofEnvelopeBlockRootMismatch,
+    #[error("execution proof envelope has an invalid validator index: {validator_index}")]
+    ExecutionProofEnvelopeInvalidValidatorIndex { validator_index: ValidatorIndex },
+    #[error("execution proof data is empty")]
+    ExecutionProofEnvelopeEmptyProof,
+    #[error("execution proof data exceeds the maximum size (maximum: {maximum}, actual: {actual})")]
+    ExecutionProofEnvelopeProofTooLarge { maximum: usize, actual: usize },
+    #[error("unsupported execution proof type: {proof_type}")]
+    ExecutionProofEnvelopeUnsupportedProofType { proof_type: u8 },
+    #[error(
+        "execution proof producer is inactive (validator index: {validator_index}, epoch: {epoch})"
+    )]
+    ExecutionProofEnvelopeInactiveValidator {
+        validator_index: ValidatorIndex,
+        epoch: Epoch,
+    },
+    #[error(
+        "execution proof envelope has an invalid signature (validator index: {validator_index})"
+    )]
+    ExecutionProofEnvelopeInvalidSignature { validator_index: ValidatorIndex },
     #[error("execution payload bid has invalid signature: {payload_bid:?}")]
     InvalidExecutionPayloadBidSignature {
         payload_bid: Arc<SignedExecutionPayloadBid<P>>,
