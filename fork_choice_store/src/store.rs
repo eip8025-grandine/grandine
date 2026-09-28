@@ -25,7 +25,7 @@ use helper_functions::{
     accessors, electra,
     error::SignatureKind,
     gloas, misc, phase0, predicates,
-    signing::SignForSingleFork as _,
+    signing::{SignForSingleFork as _, SignForSingleForkAtSlot as _},
     slot_report::NullSlotReport,
     verifier::{NullVerifier, SingleVerifier, Verifier, VerifierOption},
 };
@@ -55,7 +55,14 @@ use types::{
         containers::{BlobIdentifier, BlobSidecar},
         primitives::{BlobIndex, KzgCommitment},
     },
-    eip8025::{containers::ExecutionProofEnvelope, primitives::ProofType},
+    eip8025::{
+        consts::{MAX_PROOF_SIZE, STATELESS_INPUT_SCHEMA_ID},
+        containers::{
+            ExecutionProof, ExecutionProofEnvelope, PublicInput, SignedExecutionProofEnvelope,
+            SszNewPayloadRequest,
+        },
+        primitives::{ProofType, get_supported_proof_types},
+    },
     electra::containers::IndexedAttestation as ElectraIndexedAttestation,
     fulu::{containers::DataColumnIdentifier, primitives::ColumnIndex},
     gloas::{
@@ -65,13 +72,14 @@ use types::{
         },
         containers::{
             Builder, BuilderExitRequest, CombinedPayloadAttestation, ExecutionPayloadBid,
-            ExecutionRequests, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
-            SignedProposerPreferences,
+            ExecutionPayloadEnvelope, ExecutionRequests, SignedExecutionPayloadBid,
+            SignedExecutionPayloadEnvelope, SignedProposerPreferences,
         },
         primitives::{BuilderIndex, PayloadStatus as ExecutionPayloadStatus},
     },
     nonstandard::{
-        BlobSidecarWithId, DataColumnSidecarWithId, PayloadStatus, Phase, StorageMode, WithStatus,
+        BlobSidecarWithId, DataColumnSidecarWithId, PartialValidator, PayloadStatus, Phase,
+        StorageMode, WithStatus,
     },
     phase0::{
         consts::{
@@ -4157,6 +4165,125 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         Ok(ExecutionPayloadEnvelopeAction::Accept(envelope))
     }
 
+    /// Implements `verify_execution_proof_envelope`:
+    /// <https://github.com/ethereum/consensus-specs/blob/6946894b02f6e95bf5b1daf4ce39a3c3244a1e41/specs/_features/eip8025/beacon-chain.md#new-verify_execution_proof_envelope>.
+    /// The caller supplies the proven block's post-state and its accepted
+    /// payload envelope.
+    pub fn verify_execution_proof_envelope(
+        &self,
+        state: &BeaconState<P>,
+        signed_proof: &SignedExecutionProofEnvelope,
+        payload_envelope: &ExecutionPayloadEnvelope<P>,
+    ) -> Result<()> {
+        let envelope = &signed_proof.message;
+        let actual_block_root = payload_envelope.beacon_block_root;
+
+        ensure!(
+            envelope.beacon_block_root == actual_block_root,
+            Error::<P>::ExecutionProofEnvelopeBlockRootMismatch
+        );
+
+        let validator = state
+            .validators()
+            .get(signed_proof.validator_index)
+            .map_err(|_| {
+                anyhow!(Error::<P>::ExecutionProofEnvelopeInvalidValidatorIndex {
+                    validator_index: signed_proof.validator_index,
+                })
+            })?;
+        let proof_length = envelope.proof_data.as_bytes().len();
+
+        ensure!(
+            proof_length > 0,
+            Error::<P>::ExecutionProofEnvelopeEmptyProof
+        );
+        ensure!(
+            proof_length <= MAX_PROOF_SIZE,
+            Error::<P>::ExecutionProofEnvelopeProofTooLarge {
+                maximum: MAX_PROOF_SIZE,
+                actual: proof_length,
+            }
+        );
+        ensure!(
+            get_supported_proof_types().contains(&envelope.proof_type),
+            Error::<P>::ExecutionProofEnvelopeUnsupportedProofType {
+                proof_type: envelope.proof_type,
+            }
+        );
+
+        let epoch = accessors::get_current_epoch(state);
+        ensure!(
+            predicates::is_active_validator(&PartialValidator::from(&validator), epoch),
+            Error::<P>::ExecutionProofEnvelopeInactiveValidator {
+                validator_index: signed_proof.validator_index,
+                epoch,
+            }
+        );
+
+        let public_key = self
+            .pubkey_cache
+            .get_or_insert(validator.pubkey)
+            .map_err(|_| Error::<P>::ExecutionProofEnvelopeInvalidSignature {
+                validator_index: signed_proof.validator_index,
+            })?;
+        if envelope
+            .verify(
+                &self.chain_config,
+                state,
+                state.slot(),
+                signed_proof.signature,
+                public_key,
+            )
+            .is_err()
+        {
+            bail!(Error::<P>::ExecutionProofEnvelopeInvalidSignature {
+                validator_index: signed_proof.validator_index,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Implements `get_execution_proof`:
+    /// <https://github.com/ethereum/consensus-specs/blob/6946894b02f6e95bf5b1daf4ce39a3c3244a1e41/specs/_features/eip8025/beacon-chain.md#new-get_execution_proof>.
+    /// The caller supplies the proven block's post-state and its accepted
+    /// payload envelope.
+    pub fn get_execution_proof(
+        &self,
+        state: &BeaconState<P>,
+        envelope: &ExecutionProofEnvelope,
+        payload_envelope: &ExecutionPayloadEnvelope<P>,
+    ) -> Result<ExecutionProof> {
+        let post_gloas_state = state
+            .post_gloas()
+            .ok_or_else(|| anyhow!("execution proof binding requires a Gloas state"))?;
+        let versioned_hashes = post_gloas_state
+            .latest_execution_payload_bid()
+            .blob_kzg_commitments
+            .iter()
+            .copied()
+            .map(misc::kzg_commitment_to_versioned_hash)
+            .collect();
+        let payload = types::combined::ExecutionPayload::Gloas(payload_envelope.payload.clone());
+        let params = ExecutionPayloadParams::Gloas {
+            versioned_hashes,
+            parent_beacon_block_root: payload_envelope.parent_beacon_block_root,
+            execution_requests: payload_envelope.execution_requests.clone(),
+        };
+        let new_payload_request = SszNewPayloadRequest::new(&payload, &params)?;
+
+        Ok(ExecutionProof {
+            proof_data: envelope.proof_data.clone(),
+            proof_type: envelope.proof_type,
+            public_input: PublicInput {
+                new_payload_request_root: new_payload_request.hash_tree_root(),
+                successful_validation: true,
+                chain_id: self.chain_config.deposit_chain_id,
+                schema_id: STATELESS_INPUT_SCHEMA_ID,
+            },
+        })
+    }
+
     pub fn validate_payload_attestation(
         &self,
         payload_attestation: PayloadAttestationItem<P>,
@@ -6867,11 +6994,17 @@ mod tests {
     use super::*;
     use ssz::Hc;
     use types::{
+        eip8025::containers::ProofData,
+        gloas::{
+            beacon_state::BeaconState as GloasBeaconState,
+            containers::{ExecutionPayload as GloasExecutionPayload, ExecutionRequests},
+        },
         phase0::{
             beacon_state::BeaconState as Phase0BeaconState,
+            consts::FAR_FUTURE_EPOCH,
             containers::{
                 BeaconBlock as Phase0BeaconBlock, BeaconBlockBody as Phase0BeaconBlockBody,
-                BeaconBlockHeader, SignedBeaconBlock as Phase0SignedBeaconBlock,
+                BeaconBlockHeader, SignedBeaconBlock as Phase0SignedBeaconBlock, Validator,
             },
         },
         preset::Minimal,
@@ -6938,5 +7071,260 @@ mod tests {
         assert!(store.execution_proofs().is_empty());
         assert!(store.execution_proof_roots().is_empty());
         assert!(store.execution_proof_provers().is_empty());
+    }
+
+    // Frozen from the former test-only BLS signing fixture (default chain
+    // config, Gloas state at slot 8) to avoid a `bls` dev-dependency here.
+    const PROOF_PUBLIC_KEY: [u8; 48] = [
+        0xb9, 0x13, 0x29, 0xca, 0xd9, 0xce, 0xef, 0x8d, 0x8c, 0x28, 0x04, 0x63, 0x7b, 0x8f, 0xba,
+        0x33, 0x47, 0x18, 0xf9, 0xb2, 0x19, 0x7f, 0x8a, 0xaa, 0x24, 0x21, 0xdf, 0xcf, 0x56, 0xe8,
+        0x4e, 0x9c, 0x09, 0x91, 0x7d, 0x39, 0x4e, 0xe0, 0x97, 0x29, 0xd8, 0xe7, 0x3b, 0x35, 0x19,
+        0xb3, 0x3f, 0x6f,
+    ];
+    const PROOF_SIGNATURE: [u8; 96] = [
+        0x97, 0x0b, 0x19, 0x2a, 0x57, 0x8a, 0xe6, 0xb1, 0xc8, 0x77, 0x59, 0xf4, 0x5d, 0xf6, 0xf2,
+        0x8e, 0x52, 0x44, 0x80, 0x2d, 0xc4, 0xd5, 0xc2, 0x4d, 0x31, 0xd3, 0x25, 0x2f, 0xe6, 0xbf,
+        0x0d, 0x70, 0xe7, 0xa8, 0x2e, 0x6d, 0x79, 0xe6, 0x68, 0x0f, 0x60, 0x39, 0x97, 0xab, 0xc8,
+        0x14, 0xc5, 0xaa, 0x00, 0xfb, 0xc7, 0x69, 0x81, 0x43, 0x91, 0x5e, 0x87, 0xc2, 0xef, 0x2e,
+        0x05, 0xf4, 0xea, 0xb6, 0x43, 0x14, 0x55, 0x6f, 0x3f, 0x43, 0xc3, 0x94, 0x92, 0x07, 0x97,
+        0xd5, 0xbb, 0xd5, 0x92, 0x7d, 0x4e, 0x0a, 0x53, 0x88, 0x56, 0x4e, 0xd4, 0xfe, 0x8c, 0x68,
+        0x35, 0x2c, 0x1d, 0xfe, 0x83, 0xe7,
+    ];
+
+    fn proof_fixture(
+        validator_exit_epoch: Epoch,
+    ) -> (
+        Store<Minimal, NoopStorage>,
+        BeaconState<Minimal>,
+        SignedExecutionProofEnvelope,
+        ExecutionPayloadEnvelope<Minimal>,
+    ) {
+        let gloas_state = GloasBeaconState::<Minimal> {
+            slot: 8, // Minimal: first slot of epoch 1.
+            validators: core::iter::once(Validator {
+                pubkey: ssz::SszReadDefault::from_ssz_default(PROOF_PUBLIC_KEY)
+                    .expect("fixture public key bytes should decode"),
+                activation_epoch: 0,
+                exit_epoch: validator_exit_epoch,
+                ..Validator::default()
+            })
+            .collect(),
+            ..GloasBeaconState::default()
+        };
+        let state = BeaconState::from(gloas_state);
+        let envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("one byte is within the proof-data bound"),
+            proof_type: 1,
+            beacon_block_root: H256::zero(),
+        };
+        let signed_proof = SignedExecutionProofEnvelope {
+            message: Hc::from(envelope),
+            validator_index: 0,
+            signature: ssz::SszReadDefault::from_ssz_default(PROOF_SIGNATURE)
+                .expect("fixture signature bytes should decode"),
+        };
+
+        (
+            genesis_store(),
+            state,
+            signed_proof,
+            ExecutionPayloadEnvelope::default(),
+        )
+    }
+
+    fn assert_execution_proof_rejected(
+        store: &Store<Minimal, NoopStorage>,
+        state: &BeaconState<Minimal>,
+        signed_proof: &SignedExecutionProofEnvelope,
+        payload_envelope: &ExecutionPayloadEnvelope<Minimal>,
+        expected: impl FnOnce(&Error<Minimal>) -> bool,
+    ) {
+        let error = store
+            .verify_execution_proof_envelope(state, signed_proof, payload_envelope)
+            .expect_err("invalid execution proof envelope should be rejected");
+        let store_error = error
+            .downcast_ref::<Error<Minimal>>()
+            .expect("validation should preserve the typed store error");
+        assert!(
+            expected(store_error),
+            "unexpected validation error: {store_error:?}"
+        );
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_accepts_valid_signature() {
+        let (store, state, signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+
+        store
+            .verify_execution_proof_envelope(&state, &signed_proof, &payload_envelope)
+            .expect("valid signed envelope should authenticate");
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_rejects_mismatched_block_root() {
+        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        signed_proof.message.beacon_block_root = H256::repeat_byte(1);
+
+        assert_execution_proof_rejected(
+            &store,
+            &state,
+            &signed_proof,
+            &payload_envelope,
+            |error| matches!(error, Error::ExecutionProofEnvelopeBlockRootMismatch),
+        );
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_rejects_invalid_validator_index() {
+        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        signed_proof.validator_index = 1;
+
+        assert_execution_proof_rejected(
+            &store,
+            &state,
+            &signed_proof,
+            &payload_envelope,
+            |error| {
+                matches!(
+                    error,
+                    Error::ExecutionProofEnvelopeInvalidValidatorIndex { .. }
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_rejects_empty_proof() {
+        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        signed_proof.message.proof_data = ProofData::default();
+
+        assert_execution_proof_rejected(
+            &store,
+            &state,
+            &signed_proof,
+            &payload_envelope,
+            |error| matches!(error, Error::ExecutionProofEnvelopeEmptyProof),
+        );
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_rejects_unsupported_type() {
+        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        signed_proof.message.proof_type = 0;
+
+        assert_execution_proof_rejected(
+            &store,
+            &state,
+            &signed_proof,
+            &payload_envelope,
+            |error| {
+                matches!(
+                    error,
+                    Error::ExecutionProofEnvelopeUnsupportedProofType { .. }
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_rejects_inactive_validator() {
+        let (store, state, signed_proof, payload_envelope) = proof_fixture(0);
+
+        assert_execution_proof_rejected(
+            &store,
+            &state,
+            &signed_proof,
+            &payload_envelope,
+            |error| matches!(error, Error::ExecutionProofEnvelopeInactiveValidator { .. }),
+        );
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_rejects_invalid_signature() {
+        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        signed_proof.signature = SignedExecutionProofEnvelope::default().signature;
+
+        assert_execution_proof_rejected(
+            &store,
+            &state,
+            &signed_proof,
+            &payload_envelope,
+            |error| matches!(error, Error::ExecutionProofEnvelopeInvalidSignature { .. }),
+        );
+    }
+
+    #[test]
+    fn get_execution_proof_rejects_pre_gloas_state() {
+        let store = genesis_store();
+        let state = BeaconState::from(Phase0BeaconState::<Minimal>::default());
+
+        store
+            .get_execution_proof(
+                &state,
+                &ExecutionProofEnvelope::default(),
+                &ExecutionPayloadEnvelope::default(),
+            )
+            .expect_err("a pre-Gloas state has no latest execution payload bid");
+    }
+
+    #[test]
+    fn get_execution_proof_binds_the_payload_request_root() {
+        let store = genesis_store();
+        let commitments = [
+            KzgCommitment::repeat_byte(0x11),
+            KzgCommitment::repeat_byte(0x22),
+        ];
+        let mut gloas_state = GloasBeaconState::<Minimal>::default();
+        gloas_state
+            .latest_execution_payload_bid
+            .blob_kzg_commitments = ProgressiveList::try_from(commitments.to_vec())
+            .expect("fixture commitments should fit in the progressive list");
+        let state = BeaconState::from(gloas_state);
+        let payload_envelope = ExecutionPayloadEnvelope {
+            payload: GloasExecutionPayload {
+                block_number: 42,
+                ..Default::default()
+            },
+            parent_beacon_block_root: H256::repeat_byte(3),
+            execution_requests: ExecutionRequests::default(),
+            ..Default::default()
+        };
+        let envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("one byte is within the proof-data bound"),
+            proof_type: 1,
+            beacon_block_root: payload_envelope.beacon_block_root,
+        };
+        // Build the spec's four fields directly, independently of the service's
+        // SszNewPayloadRequest::new call, to catch a binding-field mix-up.
+        let expected_request = SszNewPayloadRequest {
+            execution_payload: payload_envelope.payload.clone(),
+            versioned_hashes: commitments
+                .into_iter()
+                .map(misc::kzg_commitment_to_versioned_hash)
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("fixture hashes should fit in VersionedHashes"),
+            parent_beacon_block_root: payload_envelope.parent_beacon_block_root,
+            execution_requests: payload_envelope.execution_requests.clone(),
+        };
+
+        let proof = store
+            .get_execution_proof(&state, &envelope, &payload_envelope)
+            .expect("accepted payload should bind to an execution proof");
+
+        assert_eq!(
+            proof.public_input.new_payload_request_root,
+            expected_request.hash_tree_root(),
+        );
+        assert_eq!(proof.proof_data, envelope.proof_data);
+        assert_eq!(proof.proof_type, envelope.proof_type);
+        assert!(proof.public_input.successful_validation);
+        assert_eq!(
+            proof.public_input.chain_id,
+            store.chain_config().deposit_chain_id,
+        );
+        assert_eq!(proof.public_input.schema_id, STATELESS_INPUT_SCHEMA_ID);
     }
 }
