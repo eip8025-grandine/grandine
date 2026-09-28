@@ -20,7 +20,7 @@ use crate::{
             SignedExecutionProofEnvelope, SszNewPayloadRequest,
         },
         error::PayloadBindingError,
-        primitives::ProofType,
+        primitives::{ProofType, get_supported_proof_types},
     },
     gloas::containers::{ExecutionPayload, ExecutionRequests},
     phase0::primitives::ValidatorIndex,
@@ -37,6 +37,12 @@ const BEACON_BLOCK_ROOT: H256 = H256(hex!(
 const PROOF_TYPE: ProofType = 7;
 const VALIDATOR_INDEX: ValidatorIndex = 12345;
 const CHAIN_ID: u64 = 11_155_111;
+
+#[test]
+fn supported_proof_types_match_spec() {
+    assert_eq!(get_supported_proof_types(), [1, 2, 3]);
+    assert!(!get_supported_proof_types().contains(&PROOF_TYPE));
+}
 
 // The fixed part of `ExecutionProofEnvelope`: an offset, a
 // `ProofType` and a `Root`.
