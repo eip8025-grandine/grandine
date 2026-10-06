@@ -5344,6 +5344,8 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
     }
 
     fn prune_after_finalization(&mut self) {
+        // TODO(eip8025-grandine): Prune execution_proof_roots, execution_proof_provers,
+        // and execution_proofs after finalization.
         if let Some(partially_finalized_location) = self.finalize_blocks() {
             self.prune_orphans(partially_finalized_location);
         }
