@@ -1216,5 +1216,3 @@ impl<P: Preset> Run for StateAtSlotCacheFlushTask<P> {
         }
     }
 }
-
-
