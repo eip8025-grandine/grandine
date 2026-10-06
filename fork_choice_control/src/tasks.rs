@@ -723,10 +723,6 @@ impl<P: Preset, W> Run for ExecutionPayloadBidTask<P, W> {
     }
 }
 
-// Engine wiring intentionally absent on this branch: the `ProofVerifier`
-// facade vs `fn is_null()` decision lives on child branches. This keeps a
-// compilable end-to-end stub so queue, message, and mutator plumbing stay
-// exercised while the engine debate is open.
 pub struct ProcessExecutionProofTask<P: Preset, W> {
     pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
