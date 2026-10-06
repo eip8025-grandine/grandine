@@ -1225,7 +1225,7 @@ mod tests {
     use std::sync::{Arc, mpsc::channel};
 
     use eth2_libp2p::GossipId;
-    use fork_choice_store::ExecutionProofOrigin;
+    use fork_choice_store::{ExecutionProofAction, ExecutionProofOrigin};
     use proof_engine::{MockProofEngine, NullProofEngine, ProofVerifier};
     use pubkey_cache::PubkeyCache;
     use ssz::Hc;
@@ -1310,7 +1310,10 @@ mod tests {
         assert!(
             matches!(
                 message,
-                MutatorMessage::ExecutionProof { result: Ok(_), .. }
+                MutatorMessage::ExecutionProof {
+                    result: Ok(ExecutionProofAction::Ignore(_)),
+                    ..
+                }
             ),
             "null engine should short-circuit to `Ignore`",
         );
