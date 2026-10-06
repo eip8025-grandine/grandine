@@ -25,6 +25,7 @@ use types::{
     },
     config::Config as ChainConfig,
     deneb::containers::BlobSidecar,
+    eip8025::containers::SignedExecutionProofEnvelope,
     gloas::{
         consts::{PAYLOAD_STATUS_EMPTY, PAYLOAD_STATUS_FULL},
         containers::{
@@ -491,6 +492,80 @@ impl Serialize for ExecutionPayloadBidOrigin {
 }
 
 impl ExecutionPayloadBidOrigin {
+    #[must_use]
+    pub fn split(
+        self,
+    ) -> (
+        Option<GossipId>,
+        Option<OneshotSender<Result<ValidationOutcomeWithReason>>>,
+    ) {
+        match self {
+            Self::Gossip(gossip_id) => (Some(gossip_id), None),
+            Self::Api(sender) => (None, Some(sender)),
+        }
+    }
+
+    #[must_use]
+    pub fn gossip_id(self) -> Option<GossipId> {
+        match self {
+            Self::Gossip(gossip_id) => Some(gossip_id),
+            Self::Api(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn gossip_id_ref(&self) -> Option<&GossipId> {
+        match self {
+            Self::Gossip(gossip_id) => Some(gossip_id),
+            Self::Api(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_from_gossip(&self) -> bool {
+        matches!(self, Self::Gossip(_))
+    }
+
+    #[must_use]
+    pub const fn verify_signatures(&self) -> bool {
+        match self {
+            Self::Gossip(_) | Self::Api(_) => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn send_to_validator(&self) -> bool {
+        match self {
+            Self::Gossip(_) | Self::Api(_) => true,
+        }
+    }
+
+    // TODO: use Debug instead
+    #[must_use]
+    pub const fn metrics_label(&self) -> &str {
+        match self {
+            Self::Gossip(_) => "Gossip",
+            Self::Api(_) => "Api",
+        }
+    }
+}
+
+#[derive(Debug, AsRefStr)]
+pub enum ExecutionProofOrigin {
+    Gossip(GossipId),
+    Api(OneshotSender<Result<ValidationOutcomeWithReason>>),
+}
+
+impl Serialize for ExecutionProofOrigin {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_ref())
+    }
+}
+
+impl ExecutionProofOrigin {
     #[must_use]
     pub fn split(
         self,
@@ -1214,6 +1289,11 @@ impl<P: Preset> DataColumnSidecarAction<P> {
 
 pub enum ExecutionPayloadBidAction<P: Preset> {
     Accept(Arc<SignedExecutionPayloadBid<P>>),
+    Ignore(&'static str),
+}
+
+pub enum ExecutionProofAction {
+    Accept(Arc<SignedExecutionProofEnvelope>),
     Ignore(&'static str),
 }
 
