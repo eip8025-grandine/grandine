@@ -6860,7 +6860,6 @@ fn is_builder_exiting<P: Preset>(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6896,9 +6895,11 @@ mod tests {
         let body = Phase0BeaconBlockBody::<Minimal>::default();
         let body_root = body.hash_tree_root();
 
-        let mut phase0_state = Phase0BeaconState::<Minimal>::default();
-        phase0_state.latest_block_header = BeaconBlockHeader {
-            body_root,
+        let phase0_state = Phase0BeaconState::<Minimal> {
+            latest_block_header: BeaconBlockHeader {
+                body_root,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
