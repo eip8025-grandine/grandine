@@ -13,7 +13,8 @@ use fork_choice_store::{
     AttesterSlashingOrigin, BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockOrigin,
     ChainLink, DataColumnSidecarAction, DataColumnSidecarOrigin, ExecutionPayloadBidAction,
     ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-    ProposerPreferencesAction, ProposerPreferencesOrigin,
+    ExecutionProofAction, ExecutionProofOrigin, ProposerPreferencesAction,
+    ProposerPreferencesOrigin,
 };
 use logging::debug_with_peers;
 use serde::Serialize;
@@ -172,6 +173,10 @@ pub enum MutatorMessage<P: Preset, W> {
     PayloadBid {
         result: Result<ExecutionPayloadBidAction<P>>,
         origin: ExecutionPayloadBidOrigin,
+    },
+    ExecutionProof {
+        result: Result<ExecutionProofAction>,
+        origin: ExecutionProofOrigin,
     },
     PayloadAttestation {
         wait_group: W,
