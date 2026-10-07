@@ -2,6 +2,13 @@
 /// produced an execution proof.
 pub type ProofType = u8;
 
+/// The supported execution proof types in the pinned EIP-8025 spec.
+/// These assignments are provisional and must not be reused.
+#[must_use]
+pub const fn get_supported_proof_types() -> [ProofType; 3] {
+    [1, 2, 3]
+}
+
 /// The type-level bound on
 /// [`ProofData`](crate::eip8025::containers::ProofData).
 ///
