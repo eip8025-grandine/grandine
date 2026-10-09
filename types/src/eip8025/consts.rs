@@ -4,7 +4,7 @@
 //! consensus-specs. In particular, `MAX_PROOF_SIZE` is 4 MiB rather
 //! than 400 KiB.
 //!
-//! [EIP-8025 consensus spec]: https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/beacon-chain.md
+//! [EIP-8025 consensus spec]: https://github.com/ethereum/consensus-specs/blob/aa16bb4c156184e9548a997d53efaf2a228a6304/specs/_features/eip8025/beacon-chain.md
 
 use hex_literal::hex;
 use typenum::Unsigned as _;
@@ -15,9 +15,9 @@ use crate::phase0::primitives::{DomainType, H32};
 /// The maximum length of
 /// [`ProofData`](crate::eip8025::containers::ProofData): 4 MiB.
 ///
-/// The spec type is unbounded, so this limit is not part of SSZ
-/// merkleization. `ProofData` enforces it during construction and
-/// decoding.
+/// This is the `ByteList` limit of `ProofData`, so it is enforced
+/// during construction and decoding and is part of SSZ
+/// merkleization.
 pub const MAX_PROOF_SIZE: usize = MaxProofSize::USIZE;
 
 /// The schema identifier of the stateless guest input, `0x1501`.
@@ -31,8 +31,8 @@ pub const STATELESS_INPUT_SCHEMA_ID: u16 = 0x1501;
 /// [`SignedExecutionProofEnvelope`](crate::eip8025::containers::SignedExecutionProofEnvelope).
 ///
 /// Incoming messages must be bounded by this value before decoding,
-/// because decoding a progressive list allocates in proportion to its
-/// input. This crate does not enforce that bound.
+/// because decoding `ProofData` allocates in proportion to its input.
+/// This crate does not enforce that bound.
 ///
 /// This is the fixed-size portion of the outer
 /// `SignedExecutionProofEnvelope`, plus the fixed-size portion of its
