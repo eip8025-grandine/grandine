@@ -1,22 +1,23 @@
-use ssz::ContiguousList;
+use ssz::ProgressiveList;
 use static_assertions::const_assert_eq;
 use try_from_iterator::TryFromIterator as _;
 use typenum::Unsigned as _;
 
 use crate::{
     combined::{ExecutionPayload as CombinedExecutionPayload, ExecutionPayloadParams},
-    eip8025::{containers::SszNewPayloadRequest, error::PayloadBindingError},
+    eip8025::{containers::NewPayloadRequest, error::PayloadBindingError},
     preset::{Mainnet, Minimal, Preset},
 };
 
 // Payload binding is preset-independent under Gloas.
 //
-// Most variable-size collections in `SSZNewPayloadRequest` use
+// Most variable-size collections in `NewPayloadRequest` use
 // progressive lists or progressive byte lists, whose roots do not
-// depend on their bounds. Three preset-derived bounds still affect
-// the root: `BytesPerLogsBloom` and `MaxExtraDataBytes` through
-// `ExecutionPayload`, and `MaxBlobCommitmentsPerBlock` through
-// `versioned_hashes`. `MaxBytesPerTransaction` affects decoding.
+// depend on their bounds. Two preset-derived bounds still affect the
+// root, both through `ExecutionPayload`: `BytesPerLogsBloom` and
+// `MaxExtraDataBytes`. `MaxBlobCommitmentsPerBlock` (through
+// `versioned_hashes`) and `MaxBytesPerTransaction` affect decoding
+// only.
 //
 // All four bounds are equal across presets today. These assertions
 // make any divergence explicit at compile time.
@@ -49,8 +50,8 @@ const_assert_eq!(
     0x4000_0000
 );
 
-impl<P: Preset> SszNewPayloadRequest<P> {
-    /// Reconstructs the spec's `SSZNewPayloadRequest` from the pair
+impl<P: Preset> NewPayloadRequest<P> {
+    /// Reconstructs the spec's `NewPayloadRequest` from the pair
     /// Grandine already holds at the `notify_new_payload` boundary.
     ///
     /// That pair is assembled from the same sources the spec's
@@ -81,7 +82,7 @@ impl<P: Preset> SszNewPayloadRequest<P> {
             return Err(PayloadBindingError::ExecutionRequestsNotGloas);
         };
 
-        let versioned_hashes = ContiguousList::try_from_iter(versioned_hashes.iter().copied())
+        let versioned_hashes = ProgressiveList::try_from_iter(versioned_hashes.iter().copied())
             .map_err(PayloadBindingError::VersionedHashesTooLong)?;
 
         Ok(Self {

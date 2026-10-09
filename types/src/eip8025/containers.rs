@@ -1,17 +1,11 @@
 use bls::SignatureBytes;
 use ethereum_types::H256;
-use serde::{Deserialize, Deserializer, Serialize};
-use ssz::{
-    ContiguousList, Hc, ProgressiveByteList, ReadError, Size, Ssz, SszHash, SszRead, SszSize,
-    SszWrite, WriteError,
-};
+use serde::{Deserialize, Serialize};
+use ssz::{ByteList, Hc, ProgressiveList, Ssz};
 
 use crate::{
     deneb::primitives::VersionedHash,
-    eip8025::{
-        consts::MAX_PROOF_SIZE,
-        primitives::{MaxProofSize, ProofType},
-    },
+    eip8025::primitives::{MaxProofSize, ProofType},
     gloas::containers::{ExecutionPayload, ExecutionRequests},
     phase0::primitives::ValidatorIndex,
     preset::Preset,
@@ -19,85 +13,12 @@ use crate::{
 
 /// The opaque proof bytes of an execution proof.
 ///
-/// The spec defines this as an unbounded `ProgressiveList[Byte]`.
-/// `MAX_PROOF_SIZE` is enforced during construction and decoding, but
-/// does not affect SSZ merkleization.
+/// The spec defines this as a `ByteList` with `LIMIT = MAX_PROOF_SIZE`,
+/// following consensus-specs#5593. The limit is enforced during
+/// construction and decoding, and affects SSZ merkleization.
 ///
 /// Construct from proof bytes with `TryFrom<Vec<u8>>`.
-#[derive(Clone, PartialEq, Eq, Default, Debug, Serialize)]
-#[serde(transparent)]
-pub struct ProofData {
-    bytes: ProgressiveByteList<MaxProofSize>,
-}
-
-impl ProofData {
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.bytes.as_bytes()
-    }
-
-    const fn validate_length(length: usize) -> Result<(), ReadError> {
-        if length > MAX_PROOF_SIZE {
-            return Err(ReadError::ListTooLong {
-                maximum: MAX_PROOF_SIZE,
-                actual: length,
-            });
-        }
-
-        Ok(())
-    }
-}
-
-impl TryFrom<Vec<u8>> for ProofData {
-    type Error = ReadError;
-
-    fn try_from(bytes: Vec<u8>) -> Result<Self, ReadError> {
-        Self::validate_length(bytes.len())?;
-
-        Ok(Self {
-            bytes: bytes.try_into()?,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for ProofData {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
-
-        let bytes = ProgressiveByteList::<MaxProofSize>::deserialize(deserializer)?;
-
-        Self::validate_length(bytes.as_bytes().len()).map_err(D::Error::custom)?;
-
-        Ok(Self { bytes })
-    }
-}
-
-impl SszSize for ProofData {
-    const SIZE: Size = ProgressiveByteList::<MaxProofSize>::SIZE;
-}
-
-impl<C> SszRead<C> for ProofData {
-    fn from_ssz_unchecked(context: &C, bytes: &[u8]) -> Result<Self, ReadError> {
-        Self::validate_length(bytes.len())?;
-
-        ProgressiveByteList::<MaxProofSize>::from_ssz_unchecked(context, bytes)
-            .map(|bytes| Self { bytes })
-    }
-}
-
-impl SszWrite for ProofData {
-    fn write_variable(&self, bytes: &mut Vec<u8>) -> Result<(), WriteError> {
-        self.bytes.write_variable(bytes)
-    }
-}
-
-impl SszHash for ProofData {
-    type PackingFactor = <ProgressiveByteList<MaxProofSize> as SszHash>::PackingFactor;
-
-    fn hash_tree_root(&self) -> H256 {
-        self.bytes.hash_tree_root()
-    }
-}
+pub type ProofData = ByteList<MaxProofSize>;
 
 /// The public input a verifier reconstructs and checks an
 /// [`ExecutionProof`] against.
@@ -168,9 +89,9 @@ pub struct SignedExecutionProofEnvelope {
 /// a sequence of requested [`ProofType`]s.
 ///
 /// The spec sequence is unbounded, so this is a plain [`Vec`], not an SSZ
-/// list: like the [`ProofData`] bound story, any limit belongs to the
-/// validation bodies, not the shape. Nothing reads this yet — Grandine is
-/// verifier-only, so the prover-role stubs reject without looking at it.
+/// list: any limit belongs to the validation bodies, not the shape. Nothing
+/// reads this yet — Grandine is verifier-only, so the prover-role stubs
+/// reject without looking at it.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProofAttributes {
@@ -178,26 +99,30 @@ pub struct ProofAttributes {
     pub proof_types: Vec<ProofType>,
 }
 
-/// The `SSZNewPayloadRequest` whose execution a proof certifies.
+/// The Gloas `NewPayloadRequest` whose execution a proof certifies.
 ///
 /// The `hash_tree_root` of this container is
 /// `public_input.new_payload_request_root`, which binds the proof to
 /// the payload it certifies.
 ///
-/// Defined as a `ProgressiveContainer` in consensus-specs and built
-/// from the Gloas `ExecutionPayload` and `ExecutionRequests`.
+/// Defined as a `ProgressiveContainer` in the Gloas consensus specs
+/// and built from the Gloas `ExecutionPayload` and
+/// `ExecutionRequests`.
 ///
-/// The `SSZ` prefix distinguishes this type from the Engine API
-/// request of the same name, which is not an SSZ container.
+/// `versioned_hashes` follows consensus-specs#5643 rather than
+/// `master`: it is a `ProgressiveList` with
+/// `LIMIT = MAX_BLOB_COMMITMENTS_PER_BLOCK`, so its root differs from
+/// `master`'s `List` root until that change merges.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize, Ssz)]
 #[serde(bound = "", deny_unknown_fields)]
 #[ssz(stable(active = [1; 4]))]
-pub struct SszNewPayloadRequest<P: Preset> {
+pub struct NewPayloadRequest<P: Preset> {
     pub execution_payload: ExecutionPayload<P>,
-    // consensus-specs bounds this by
+    // consensus-specs#5643 limits this to
     // `MAX_BLOB_COMMITMENTS_PER_BLOCK`, represented here by
-    // `MaxBlobCommitmentsPerBlock`.
-    pub versioned_hashes: ContiguousList<VersionedHash, P::MaxBlobCommitmentsPerBlock>,
+    // `MaxBlobCommitmentsPerBlock`. The limit applies on construction
+    // and decoding but not to merkleization.
+    pub versioned_hashes: ProgressiveList<VersionedHash, P::MaxBlobCommitmentsPerBlock>,
     pub parent_beacon_block_root: H256,
     pub execution_requests: ExecutionRequests<P>,
 }
