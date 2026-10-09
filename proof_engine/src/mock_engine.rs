@@ -1,6 +1,6 @@
 use types::{
     eip8025::{
-        containers::{ExecutionProof, ProofAttributes, SszNewPayloadRequest},
+        containers::{ExecutionProof, NewPayloadRequest, ProofAttributes},
         primitives::ProofType,
     },
     phase0::primitives::H256,
@@ -53,7 +53,7 @@ impl ProofVerifier for MockProofEngine {
 impl<P: Preset> ProofProver<P> for MockProofEngine {
     fn request_proofs(
         &self,
-        _new_payload_request: SszNewPayloadRequest<P>,
+        _new_payload_request: NewPayloadRequest<P>,
         _chain_id: u64,
         _schema_id: u16,
         _proof_attributes: ProofAttributes,
@@ -110,7 +110,7 @@ mod tests {
     fn request_proofs_rejects() {
         let error = <MockProofEngine as ProofProver<Minimal>>::request_proofs(
             &MockProofEngine::new(true),
-            SszNewPayloadRequest::default(),
+            NewPayloadRequest::default(),
             5,
             0x1501,
             ProofAttributes {
