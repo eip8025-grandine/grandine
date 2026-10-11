@@ -188,6 +188,9 @@ fn signing_root_uses_supplied_slot_over_state_slot() {
 }
 
 // (b) Pins from container suite + out-of-band script; not pyspec-checked.
+// UNVERIFIED: the envelope root is produced by this implementation (see
+// `types/src/eip8025/tests.rs`). Design 0005 requires it to be replaced by
+// a root from an implementation independent of Grandine.
 #[test]
 fn signing_root_matches_pinned_vector() {
     let config = Config::minimal();
@@ -197,14 +200,14 @@ fn signing_root_matches_pinned_vector() {
     assert_eq!(
         envelope.hash_tree_root(),
         H256(hex!(
-            "024c73d1626ebced9a5e284ec4bd9d4f893e36609dd302c6e0a3b41d84ba396d"
+            "89051e2b8d74d9aae15a4946d7500d7dfaee3da70b1de00c21a426898a8bbf62"
         )),
     );
 
     assert_eq!(
         envelope.signing_root(&config, &state, 0),
         H256(hex!(
-            "cde2fa0216202a493abf3206102c5367ed597806a7387cef9dc8e21e341fbc18"
+            "b49a780c4133a5c750415486abce7fc6944478be42d463777b772f91fa4feb50"
         )),
     );
 }

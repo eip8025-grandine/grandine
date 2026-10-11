@@ -1,6 +1,6 @@
 use types::{
     eip8025::{
-        containers::{ExecutionProof, ProofAttributes, SszNewPayloadRequest},
+        containers::{ExecutionProof, NewPayloadRequest, ProofAttributes},
         primitives::ProofType,
     },
     phase0::primitives::H256,
@@ -22,12 +22,12 @@ pub trait ProofVerifier: Send + Sync + 'static {
 /// Generation half of the EIP-8025 `ProofEngine` protocol.
 ///
 /// Generic over `P` because `request_proofs` takes the full
-/// `SszNewPayloadRequest<P>`. Unwired for now: Grandine is verifier-only.
+/// `NewPayloadRequest<P>`. Unwired for now: Grandine is verifier-only.
 pub trait ProofProver<P: Preset>: Send + Sync + 'static {
     /// [`request_proofs`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-request_proofs)
     fn request_proofs(
         &self,
-        new_payload_request: SszNewPayloadRequest<P>,
+        new_payload_request: NewPayloadRequest<P>,
         chain_id: u64,
         schema_id: u16,
         proof_attributes: ProofAttributes,
