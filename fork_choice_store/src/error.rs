@@ -296,14 +296,10 @@ pub enum Error<P: Preset> {
     },
     #[error("block has invalid execution payload")]
     InvalidExecutionPayload,
-    #[error("execution proof envelope block root does not match the payload")]
-    ExecutionProofEnvelopeBlockRootMismatch,
     #[error("execution proof envelope has an invalid validator index: {validator_index}")]
     ExecutionProofEnvelopeInvalidValidatorIndex { validator_index: ValidatorIndex },
     #[error("execution proof data is empty")]
     ExecutionProofEnvelopeEmptyProof,
-    #[error("execution proof data exceeds the maximum size (maximum: {maximum}, actual: {actual})")]
-    ExecutionProofEnvelopeProofTooLarge { maximum: usize, actual: usize },
     #[error("unsupported execution proof type: {proof_type}")]
     ExecutionProofEnvelopeUnsupportedProofType { proof_type: u8 },
     #[error(

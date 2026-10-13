@@ -61,10 +61,10 @@ use types::{
         error::AttestationConversionError,
     },
     eip8025::{
-        consts::{MAX_PROOF_SIZE, STATELESS_INPUT_SCHEMA_ID},
+        consts::STATELESS_INPUT_SCHEMA_ID,
         containers::{
-            ExecutionProof, ExecutionProofEnvelope, PublicInput, SignedExecutionProofEnvelope,
-            SszNewPayloadRequest,
+            ExecutionProof, ExecutionProofEnvelope, NewPayloadRequest, PublicInput,
+            SignedExecutionProofEnvelope,
         },
         primitives::{ProofType, get_supported_proof_types},
     },
@@ -4283,22 +4283,15 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
     }
 
     /// Implements `verify_execution_proof_envelope`:
-    /// <https://github.com/ethereum/consensus-specs/blob/6946894b02f6e95bf5b1daf4ce39a3c3244a1e41/specs/_features/eip8025/beacon-chain.md#new-verify_execution_proof_envelope>.
-    /// The caller supplies the proven block's post-state and its accepted
-    /// payload envelope.
+    /// <https://github.com/ethereum/consensus-specs/blob/12c8b24bc09b12f62688d439ba20ef00b1fdfe1f/specs/_features/eip8025/beacon-chain.md#new-verify_execution_proof_envelope>.
+    /// The caller supplies the proven block's validated post-state.
+    /// Payload context selection and execution-proof binding are separate.
     pub fn verify_execution_proof_envelope(
         &self,
         state: &BeaconState<P>,
         signed_proof: &SignedExecutionProofEnvelope,
-        payload_envelope: &ExecutionPayloadEnvelope<P>,
     ) -> Result<()> {
         let envelope = &signed_proof.message;
-        let actual_block_root = payload_envelope.beacon_block_root;
-
-        ensure!(
-            envelope.beacon_block_root == actual_block_root,
-            Error::<P>::ExecutionProofEnvelopeBlockRootMismatch
-        );
 
         let validator = state
             .validators()
@@ -4313,13 +4306,6 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         ensure!(
             proof_length > 0,
             Error::<P>::ExecutionProofEnvelopeEmptyProof
-        );
-        ensure!(
-            proof_length <= MAX_PROOF_SIZE,
-            Error::<P>::ExecutionProofEnvelopeProofTooLarge {
-                maximum: MAX_PROOF_SIZE,
-                actual: proof_length,
-            }
         );
         ensure!(
             get_supported_proof_types().contains(&envelope.proof_type),
@@ -4362,7 +4348,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
     }
 
     /// Implements `get_execution_proof`:
-    /// <https://github.com/ethereum/consensus-specs/blob/6946894b02f6e95bf5b1daf4ce39a3c3244a1e41/specs/_features/eip8025/beacon-chain.md#new-get_execution_proof>.
+    /// <https://github.com/ethereum/consensus-specs/blob/12c8b24bc09b12f62688d439ba20ef00b1fdfe1f/specs/_features/eip8025/beacon-chain.md#new-get_execution_proof>.
     /// The caller supplies the proven block's post-state and its accepted
     /// payload envelope.
     pub fn get_execution_proof(
@@ -4387,7 +4373,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             parent_beacon_block_root: payload_envelope.parent_beacon_block_root,
             execution_requests: payload_envelope.execution_requests.clone(),
         };
-        let new_payload_request = SszNewPayloadRequest::new(&payload, &params)?;
+        let new_payload_request = NewPayloadRequest::new(&payload, &params)?;
 
         Ok(ExecutionProof {
             proof_data: envelope.proof_data.clone(),
@@ -7632,13 +7618,13 @@ mod tests {
         0x22, 0xc6, 0xbb,
     ];
     const PROOF_SIGNATURE: [u8; 96] = [
-        0x97, 0x84, 0x6b, 0x23, 0xa0, 0x01, 0x98, 0x58, 0x9b, 0xda, 0x79, 0x6d, 0xab, 0xfe, 0x7d,
-        0x6e, 0xd2, 0x0d, 0xb0, 0x3e, 0xea, 0x2b, 0x2c, 0x62, 0xe5, 0xd6, 0xcf, 0x9f, 0xa3, 0x7b,
-        0xf8, 0x62, 0xd1, 0x10, 0xd3, 0xdc, 0x80, 0x97, 0xa6, 0xb9, 0x8c, 0x28, 0xeb, 0xca, 0x7e,
-        0x69, 0x87, 0xd0, 0x01, 0x91, 0xc9, 0x92, 0x44, 0x05, 0xa6, 0xc2, 0x76, 0xd4, 0xda, 0xb9,
-        0x7a, 0x5f, 0x3c, 0x45, 0x19, 0xf2, 0x6f, 0xb5, 0x34, 0x76, 0x82, 0xc3, 0xea, 0x41, 0x5b,
-        0x29, 0x19, 0x24, 0x36, 0x55, 0x0e, 0x3b, 0xb4, 0x1f, 0x64, 0x5a, 0x28, 0xb2, 0xe9, 0x29,
-        0x76, 0x75, 0xc7, 0x2e, 0xc1, 0x44,
+        0x8f, 0xce, 0x12, 0xfb, 0x9d, 0x32, 0x5b, 0x05, 0xc8, 0xd6, 0x42, 0x67, 0xb1, 0x4a, 0x89,
+        0xe1, 0x8a, 0xb1, 0x3d, 0x0f, 0xbf, 0xaa, 0xdf, 0x6c, 0x3f, 0x6d, 0x7c, 0x6b, 0x1a, 0xe8,
+        0xce, 0xc9, 0x49, 0xe8, 0xf9, 0x93, 0x6f, 0xa3, 0x1f, 0x03, 0x54, 0x98, 0x2d, 0x0e, 0x52,
+        0xe8, 0x39, 0x5b, 0x05, 0x1e, 0x9c, 0x97, 0xb6, 0x68, 0x3b, 0x32, 0x7e, 0xdc, 0x51, 0x78,
+        0x6e, 0x8b, 0x1b, 0x04, 0x1a, 0x04, 0x3f, 0xa4, 0xca, 0x23, 0x31, 0x20, 0xdf, 0x68, 0x96,
+        0x0d, 0x2f, 0x83, 0x49, 0x0a, 0x4a, 0x0e, 0xa4, 0x65, 0x04, 0x31, 0x7c, 0x37, 0x64, 0xbb,
+        0x9f, 0x99, 0x1b, 0x68, 0x46, 0x0d,
     ];
 
     fn proof_fixture(
@@ -7647,7 +7633,6 @@ mod tests {
         Store<Minimal, NoopStorage>,
         BeaconState<Minimal>,
         SignedExecutionProofEnvelope,
-        ExecutionPayloadEnvelope<Minimal>,
     ) {
         let gloas_state = GloasBeaconState::<Minimal> {
             slot: 8, // Minimal: first slot of epoch 1.
@@ -7675,23 +7660,17 @@ mod tests {
                 .expect("fixture signature bytes should decode"),
         };
 
-        (
-            genesis_store(),
-            state,
-            signed_proof,
-            ExecutionPayloadEnvelope::default(),
-        )
+        (genesis_store(), state, signed_proof)
     }
 
     fn assert_execution_proof_rejected(
         store: &Store<Minimal, NoopStorage>,
         state: &BeaconState<Minimal>,
         signed_proof: &SignedExecutionProofEnvelope,
-        payload_envelope: &ExecutionPayloadEnvelope<Minimal>,
         expected: impl FnOnce(&Error<Minimal>) -> bool,
     ) {
         let error = store
-            .verify_execution_proof_envelope(state, signed_proof, payload_envelope)
+            .verify_execution_proof_envelope(state, signed_proof)
             .expect_err("invalid execution proof envelope should be rejected");
         let store_error = error
             .downcast_ref::<Error<Minimal>>()
@@ -7704,104 +7683,109 @@ mod tests {
 
     #[test]
     fn execution_proof_envelope_authentication_accepts_valid_signature() {
-        let (store, state, signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        let (store, state, signed_proof) = proof_fixture(FAR_FUTURE_EPOCH);
 
         store
-            .verify_execution_proof_envelope(&state, &signed_proof, &payload_envelope)
+            .verify_execution_proof_envelope(&state, &signed_proof)
             .expect("valid signed envelope should authenticate");
     }
 
     #[test]
-    fn execution_proof_envelope_authentication_rejects_mismatched_block_root() {
-        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+    fn execution_proof_envelope_authentication_rejects_tampered_block_root() {
+        let (store, state, mut signed_proof) = proof_fixture(FAR_FUTURE_EPOCH);
         signed_proof.message.beacon_block_root = H256::repeat_byte(1);
 
-        assert_execution_proof_rejected(
-            &store,
-            &state,
-            &signed_proof,
-            &payload_envelope,
-            |error| matches!(error, Error::ExecutionProofEnvelopeBlockRootMismatch),
-        );
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeInvalidSignature { .. })
+        });
     }
 
     #[test]
     fn execution_proof_envelope_authentication_rejects_invalid_validator_index() {
-        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        let (store, state, mut signed_proof) = proof_fixture(FAR_FUTURE_EPOCH);
         signed_proof.validator_index = 1;
 
-        assert_execution_proof_rejected(
-            &store,
-            &state,
-            &signed_proof,
-            &payload_envelope,
-            |error| {
-                matches!(
-                    error,
-                    Error::ExecutionProofEnvelopeInvalidValidatorIndex { .. }
-                )
-            },
-        );
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(
+                error,
+                Error::ExecutionProofEnvelopeInvalidValidatorIndex { .. }
+            )
+        });
     }
 
     #[test]
     fn execution_proof_envelope_authentication_rejects_empty_proof() {
-        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        let (store, state, mut signed_proof) = proof_fixture(FAR_FUTURE_EPOCH);
         signed_proof.message.proof_data = ProofData::default();
 
-        assert_execution_proof_rejected(
-            &store,
-            &state,
-            &signed_proof,
-            &payload_envelope,
-            |error| matches!(error, Error::ExecutionProofEnvelopeEmptyProof),
-        );
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeEmptyProof)
+        });
     }
 
     #[test]
     fn execution_proof_envelope_authentication_rejects_unsupported_type() {
-        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
-        signed_proof.message.proof_type = 0;
+        let (store, state, mut signed_proof) = proof_fixture(FAR_FUTURE_EPOCH);
 
-        assert_execution_proof_rejected(
-            &store,
-            &state,
-            &signed_proof,
-            &payload_envelope,
-            |error| {
+        for proof_type in [0, 4, u8::MAX] {
+            signed_proof.message.proof_type = proof_type;
+
+            assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
                 matches!(
                     error,
-                    Error::ExecutionProofEnvelopeUnsupportedProofType { .. }
+                    Error::ExecutionProofEnvelopeUnsupportedProofType { proof_type: actual }
+                        if *actual == proof_type
                 )
-            },
-        );
+            });
+        }
+    }
+
+    #[test]
+    fn execution_proof_envelope_authentication_preserves_check_order() {
+        let (store, state, mut signed_proof) = proof_fixture(0);
+        signed_proof.validator_index = 1;
+        signed_proof.message.proof_data = ProofData::default();
+        signed_proof.message.proof_type = 0;
+
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(
+                error,
+                Error::ExecutionProofEnvelopeInvalidValidatorIndex { .. }
+            )
+        });
+
+        signed_proof.validator_index = 0;
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeEmptyProof)
+        });
+
+        signed_proof.message.proof_data =
+            ProofData::try_from(vec![0x42]).expect("one byte is within the proof-data bound");
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(
+                error,
+                Error::ExecutionProofEnvelopeUnsupportedProofType { .. }
+            )
+        });
     }
 
     #[test]
     fn execution_proof_envelope_authentication_rejects_inactive_validator() {
-        let (store, state, signed_proof, payload_envelope) = proof_fixture(0);
+        let (store, state, signed_proof) = proof_fixture(0);
 
-        assert_execution_proof_rejected(
-            &store,
-            &state,
-            &signed_proof,
-            &payload_envelope,
-            |error| matches!(error, Error::ExecutionProofEnvelopeInactiveValidator { .. }),
-        );
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeInactiveValidator { .. })
+        });
     }
 
     #[test]
     fn execution_proof_envelope_authentication_rejects_invalid_signature() {
-        let (store, state, mut signed_proof, payload_envelope) = proof_fixture(FAR_FUTURE_EPOCH);
+        let (store, state, mut signed_proof) = proof_fixture(FAR_FUTURE_EPOCH);
         signed_proof.signature = SignedExecutionProofEnvelope::default().signature;
 
-        assert_execution_proof_rejected(
-            &store,
-            &state,
-            &signed_proof,
-            &payload_envelope,
-            |error| matches!(error, Error::ExecutionProofEnvelopeInvalidSignature { .. }),
-        );
+        assert_execution_proof_rejected(&store, &state, &signed_proof, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeInvalidSignature { .. })
+        });
     }
 
     #[test]
@@ -7847,8 +7831,8 @@ mod tests {
             beacon_block_root: payload_envelope.beacon_block_root,
         };
         // Build the spec's four fields directly, independently of the service's
-        // SszNewPayloadRequest::new call, to catch a binding-field mix-up.
-        let expected_request = SszNewPayloadRequest {
+        // NewPayloadRequest::new call, to catch a binding-field mix-up.
+        let expected_request = NewPayloadRequest {
             execution_payload: payload_envelope.payload.clone(),
             versioned_hashes: commitments
                 .into_iter()
