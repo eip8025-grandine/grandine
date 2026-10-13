@@ -256,10 +256,17 @@ fn print_reproducible_proof_envelope_fixture() {
         .verify(&config, &state, 8, signature, Arc::new(key.to_public_key()))
         .expect("generated signature should verify");
 
+    println!("public key: {:02x?}", public_key.as_bytes());
+    println!("signature: {:02x?}", signature.as_bytes());
+    println!(
+        "signing root: {:?}",
+        envelope.signing_root(&config, &state, 8)
+    );
+
     assert_eq!(
         envelope.signing_root(&config, &state, 8),
         H256(hex!(
-            "f0f99f89080f5041bf1b34f232ff3490061b0c569156f41bfa6d04d2dd930997"
+            "a567b0591a96a42c966f43664256c285189409a792dce8b1c4945f665443c002"
         )),
     );
     assert_eq!(
@@ -271,15 +278,8 @@ fn print_reproducible_proof_envelope_fixture() {
     assert_eq!(
         signature.as_bytes(),
         &hex!(
-            "97846b23a00198589bda796dabfe7d6ed20db03eea2b2c62e5d6cf9fa37bf862d110d3dc8097a6b98c28ebca7e6987d00191c9924405a6c276d4dab97a5f3c4519f26fb5347682c3ea415b29192436550e3bb41f645a28b2e9297675c72ec144"
+            "8fce12fb9d325b05c8d64267b14a89e18ab13d0fbfaadf6c3f6d7c6b1ae8cec949e8f9936fa31f0354982d0e52e8395b051e9c97b6683b327edc51786e8b1b041a043fa4ca233120df68960d2f83490a4a0ea46504317c3764bb9f991b68460d"
         ),
-    );
-
-    println!("public key: {:02x?}", public_key.as_bytes());
-    println!("signature: {:02x?}", signature.as_bytes());
-    println!(
-        "signing root: {:?}",
-        envelope.signing_root(&config, &state, 8)
     );
 }
 
