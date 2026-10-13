@@ -1294,9 +1294,12 @@ mod tests {
             assert!(
                 matches!(
                     message,
-                    MutatorMessage::ExecutionProof { result: Ok(_), .. }
+                    MutatorMessage::ExecutionProof {
+                        result: Ok(ExecutionProofAction::Ignore(_)),
+                        ..
+                    }
                 ),
-                "stub pipeline should emit an outcome message",
+                "stub pipeline should ignore proofs regardless of the mock engine result",
             );
         }
     }
