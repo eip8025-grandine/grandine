@@ -7066,6 +7066,366 @@ mod tests {
         assert!(store.execution_proof_provers().is_empty());
     }
 
+    fn precheck_fixture(
+        beacon_block_root: H256,
+        proof_type: u8,
+        validator_index: ValidatorIndex,
+        proof_data: Vec<u8>,
+    ) -> SignedExecutionProofEnvelope {
+        SignedExecutionProofEnvelope {
+            message: Hc::from(ExecutionProofEnvelope {
+                proof_data: ProofData::try_from(proof_data)
+                    .expect("test proof bytes should be within the proof-data bound"),
+                proof_type,
+                beacon_block_root,
+            }),
+            validator_index,
+            ..SignedExecutionProofEnvelope::default()
+        }
+    }
+
+    fn assert_precheck_bookkeeping_unchanged(
+        store: &Store<Minimal, NoopStorage>,
+        execution_proofs: &HashMap<H256, HashMap<ProofType, ExecutionProofEnvelope>>,
+        execution_proof_roots: &HashMap<H256, HashSet<H256>>,
+        execution_proof_provers: &HashSet<(H256, ProofType, ValidatorIndex)>,
+    ) {
+        assert_eq!(store.execution_proofs(), execution_proofs);
+        assert_eq!(store.execution_proof_roots(), execution_proof_roots);
+        assert_eq!(store.execution_proof_provers(), execution_proof_provers);
+    }
+
+    #[test]
+    fn execution_proof_precheck_rejects_empty_and_unsupported_before_store_ignores() {
+        use crate::prepared_execution_proof::precheck_execution_proof;
+
+        let mut store = genesis_store();
+        let known_root = store.head().block_root;
+        let duplicate = precheck_fixture(known_root, 1, 7, vec![0x42]);
+        store
+            .execution_proofs
+            .entry(known_root)
+            .or_default()
+            .insert(1, duplicate.message.as_ref().clone());
+        store
+            .execution_proof_roots
+            .entry(known_root)
+            .or_default()
+            .insert(duplicate.message.hash_tree_root());
+        store.execution_proof_provers.insert((known_root, 1, 7));
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+
+        let cases = [
+            (
+                precheck_fixture(H256::repeat_byte(0xee), 1, 7, vec![]),
+                false,
+            ),
+            (precheck_fixture(known_root, 1, 7, vec![]), false),
+            (precheck_fixture(known_root, 0, 7, vec![]), false),
+            (
+                precheck_fixture(H256::repeat_byte(0xee), 0, 7, vec![0x42]),
+                true,
+            ),
+            (precheck_fixture(known_root, 0, 7, vec![0x42]), true),
+        ];
+        for (envelope, unsupported) in cases {
+            let error = precheck_execution_proof(&store, &envelope)
+                .err()
+                .expect("empty/type rejection must precede block and duplicate checks");
+            match error.downcast_ref::<Error<Minimal>>() {
+                Some(Error::ExecutionProofEnvelopeEmptyProof) if !unsupported => {}
+                Some(Error::ExecutionProofEnvelopeUnsupportedProofType { proof_type: 0 })
+                    if unsupported => {}
+                _ => panic!("empty/type rejection must precede block and duplicate checks"),
+            }
+        }
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
+    #[test]
+    fn execution_proof_precheck_ignores_valid_supported_unknown_block() {
+        use crate::prepared_execution_proof::{ExecutionProofPrecheck, precheck_execution_proof};
+
+        let mut store = genesis_store();
+        let unknown_root = H256::repeat_byte(0xee);
+        let envelope = precheck_fixture(unknown_root, 1, 7, vec![0x42]);
+        store
+            .execution_proof_roots
+            .entry(unknown_root)
+            .or_default()
+            .insert(envelope.message.hash_tree_root());
+        store.execution_proof_provers.insert((unknown_root, 1, 7));
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+        assert!(matches!(
+            precheck_execution_proof(&store, &envelope),
+            Ok(ExecutionProofPrecheck::Ignore(
+                "execution proof's beacon block has not been seen"
+            ))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
+    #[test]
+    fn execution_proof_precheck_same_root_different_validator_uses_root_seen_key() {
+        use crate::prepared_execution_proof::{ExecutionProofPrecheck, precheck_execution_proof};
+
+        let mut store = genesis_store();
+        let block_root = store.head().block_root;
+        let first_validator = precheck_fixture(block_root, 1, 7, vec![0x42]);
+        let different_validator = precheck_fixture(block_root, 1, 8, vec![0x42]);
+        assert_eq!(
+            first_validator.message.hash_tree_root(),
+            different_validator.message.hash_tree_root()
+        );
+        store
+            .execution_proof_roots
+            .entry(block_root)
+            .or_default()
+            .insert(first_validator.message.hash_tree_root());
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+
+        assert!(matches!(
+            precheck_execution_proof(&store, &different_validator),
+            Ok(ExecutionProofPrecheck::Ignore(
+                "execution proof has already been processed"
+            ))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
+    #[test]
+    fn execution_proof_precheck_verified_proof_is_scoped_by_type() {
+        use crate::prepared_execution_proof::{ExecutionProofPrecheck, precheck_execution_proof};
+
+        let mut store = genesis_store();
+        let block_root = store.head().block_root;
+        let verified_type_one = precheck_fixture(block_root, 1, 7, vec![0x42]);
+        store
+            .execution_proofs
+            .entry(block_root)
+            .or_default()
+            .insert(1, verified_type_one.message.as_ref().clone());
+        let type_two = precheck_fixture(block_root, 2, 7, vec![0x43]);
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+
+        assert!(matches!(
+            precheck_execution_proof(&store, &type_two),
+            Ok(ExecutionProofPrecheck::Continue(_))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
+    #[test]
+    fn execution_proof_precheck_seen_bookkeeping_is_scoped_by_block_root() {
+        use crate::prepared_execution_proof::{ExecutionProofPrecheck, precheck_execution_proof};
+
+        let mut store = genesis_store();
+        let first_root = store.head().block_root;
+        let second_root = H256::repeat_byte(0xee);
+
+        // Give the second synthetic root an actual block lookup entry. This fixture
+        // isolates root-key scoping; it does not model block import or consensus validity.
+        let mut second_link = store.finalized[0].clone();
+        second_link.block_root = second_root;
+        store.finalized.push_back(second_link);
+        store.finalized_indices.insert(second_root, 1);
+
+        let first_attempt = precheck_fixture(first_root, 1, 7, vec![0x42]);
+        store
+            .execution_proofs
+            .entry(first_root)
+            .or_default()
+            .insert(1, first_attempt.message.as_ref().clone());
+        store
+            .execution_proof_roots
+            .entry(first_root)
+            .or_default()
+            .insert(first_attempt.message.hash_tree_root());
+        store.execution_proof_provers.insert((first_root, 1, 7));
+
+        let second_attempt = precheck_fixture(second_root, 1, 7, vec![0x42]);
+        assert_ne!(
+            first_attempt.message.hash_tree_root(),
+            second_attempt.message.hash_tree_root()
+        );
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+
+        assert!(matches!(
+            precheck_execution_proof(&store, &second_attempt),
+            Ok(ExecutionProofPrecheck::Continue(_))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
+    #[test]
+    fn execution_proof_precheck_candidate_root_under_wrong_block_root_does_not_mask_continue() {
+        use crate::prepared_execution_proof::{ExecutionProofPrecheck, precheck_execution_proof};
+
+        let mut store = genesis_store();
+        let wrong_block_root = store.head().block_root;
+        let candidate_block_root = H256::repeat_byte(0xee);
+
+        // This synthetic cross-key placement isolates the collection lookup contract.
+        // A proof root normally binds its beacon block root; this is not a protocol-valid
+        // root collision or a claim about network-reachable state.
+        let mut candidate_link = store.finalized[0].clone();
+        candidate_link.block_root = candidate_block_root;
+        store.finalized.push_back(candidate_link);
+        store.finalized_indices.insert(candidate_block_root, 1);
+
+        let candidate = precheck_fixture(candidate_block_root, 1, 7, vec![0x42]);
+        let candidate_root = candidate.message.hash_tree_root();
+        store
+            .execution_proofs
+            .entry(wrong_block_root)
+            .or_default()
+            .insert(1, candidate.message.as_ref().clone());
+        store
+            .execution_proof_roots
+            .entry(wrong_block_root)
+            .or_default()
+            .insert(candidate_root);
+        store
+            .execution_proof_provers
+            .insert((wrong_block_root, 1, 7));
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+
+        assert!(matches!(
+            precheck_execution_proof(&store, &candidate),
+            Ok(ExecutionProofPrecheck::Continue(_))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
+    #[test]
+    fn execution_proof_precheck_duplicate_order_and_seen_keys_are_read_only() {
+        use crate::prepared_execution_proof::{ExecutionProofPrecheck, precheck_execution_proof};
+
+        let mut store = genesis_store();
+        let block_root = store.head().block_root;
+        let envelope = precheck_fixture(block_root, 1, 7, vec![0x42]);
+        let envelope_root = envelope.message.hash_tree_root();
+        store
+            .execution_proofs
+            .entry(block_root)
+            .or_default()
+            .insert(1, envelope.message.as_ref().clone());
+        store
+            .execution_proof_roots
+            .entry(block_root)
+            .or_default()
+            .insert(envelope_root);
+        store.execution_proof_provers.insert((block_root, 1, 7));
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+        assert!(matches!(
+            precheck_execution_proof(&store, &envelope),
+            Ok(ExecutionProofPrecheck::Ignore(
+                "verified proof already known for this beacon block and proof type"
+            ))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+
+        store.execution_proofs.clear();
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+        assert!(matches!(
+            precheck_execution_proof(&store, &envelope),
+            Ok(ExecutionProofPrecheck::Ignore(
+                "execution proof has already been processed"
+            ))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+
+        store.execution_proof_roots.clear();
+        let different_bytes = precheck_fixture(block_root, 1, 7, vec![0x43]);
+        assert_ne!(envelope_root, different_bytes.message.hash_tree_root());
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+        assert!(matches!(
+            precheck_execution_proof(&store, &different_bytes),
+            Ok(ExecutionProofPrecheck::Ignore(
+                "proof already seen from this prover for this beacon block and proof type"
+            ))
+        ));
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+
+        let different_type = precheck_fixture(block_root, 2, 7, vec![0x43]);
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+        match precheck_execution_proof(&store, &different_type) {
+            Ok(ExecutionProofPrecheck::Continue(prechecked)) => {
+                assert_eq!(prechecked.proof_type, 2);
+                assert_eq!(prechecked.validator_index, 7);
+            }
+            _ => panic!("prover duplicate key must be scoped by proof type"),
+        }
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
+    #[test]
+    fn execution_proof_precheck_continues_with_bare_root_without_mutation_or_context() {
+        use crate::prepared_execution_proof::{ExecutionProofPrecheck, precheck_execution_proof};
+
+        let store = genesis_store();
+        let block_root = store.head().block_root;
+        let envelope = precheck_fixture(block_root, 1, 7, vec![0x42]);
+        assert!(!store.payloads.contains(&block_root));
+        let bare_root = envelope.message.hash_tree_root();
+        assert_ne!(bare_root, envelope.hash_tree_root());
+        let snapshots = (
+            store.execution_proofs.clone(),
+            store.execution_proof_roots.clone(),
+            store.execution_proof_provers.clone(),
+        );
+        match precheck_execution_proof(&store, &envelope) {
+            Ok(ExecutionProofPrecheck::Continue(prechecked)) => {
+                assert_eq!(prechecked.beacon_block_root, block_root);
+                assert_eq!(prechecked.proof_type, 1);
+                assert_eq!(prechecked.validator_index, 7);
+                assert_eq!(prechecked.envelope_root, bare_root);
+            }
+            _ => panic!("known supported envelope with no payload must reach continuation"),
+        }
+        assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
+    }
+
     // Generated from the scalar-one test key in
     // `helper_functions/src/signing/tests.rs::print_reproducible_proof_envelope_fixture`
     // (default chain config, Gloas state at slot 8). Keep these bytes frozen

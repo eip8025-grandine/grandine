@@ -1,9 +1,112 @@
+use anyhow::Result;
+use ssz::SszHash as _;
 use types::{
-    eip8025::containers::{
-        ExecutionProof, ExecutionProofEnvelope, PublicInput, SignedExecutionProofEnvelope,
+    eip8025::{
+        containers::{
+            ExecutionProof, ExecutionProofEnvelope, PublicInput, SignedExecutionProofEnvelope,
+        },
+        primitives::get_supported_proof_types,
     },
     phase0::primitives::{H256, ValidatorIndex},
+    preset::Preset,
 };
+
+use crate::{Error, Store, misc::Storage};
+
+/// Result of the read-only, spec-ordered checks before payload/context preparation.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Consumed by the future execution-proof preparation path"
+    )
+)]
+pub enum ExecutionProofPrecheck {
+    Ignore(&'static str),
+    Continue(PrecheckedExecutionProof),
+}
+
+/// The early-checked identity carried forward; this is not authenticated or prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrecheckedExecutionProof {
+    pub(crate) beacon_block_root: H256,
+    pub(crate) proof_type: u8,
+    pub(crate) validator_index: ValidatorIndex,
+    pub(crate) envelope_root: H256,
+}
+
+/// Applies only the early gossip checks. It is deliberately read-only and does not
+/// load payload/state context, authenticate the signature, or construct a prepared proof.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Consumed by the future execution-proof preparation path"
+    )
+)]
+pub fn precheck_execution_proof<P: Preset, S: Storage<P>>(
+    store: &Store<P, S>,
+    signed_envelope: &SignedExecutionProofEnvelope,
+) -> Result<ExecutionProofPrecheck> {
+    let envelope = signed_envelope.message.as_ref();
+
+    if envelope.proof_data.as_bytes().is_empty() {
+        return Err(Error::<P>::ExecutionProofEnvelopeEmptyProof.into());
+    }
+    if !get_supported_proof_types().contains(&envelope.proof_type) {
+        return Err(Error::<P>::ExecutionProofEnvelopeUnsupportedProofType {
+            proof_type: envelope.proof_type,
+        }
+        .into());
+    }
+
+    let beacon_block_root = envelope.beacon_block_root;
+    if store.block(beacon_block_root).is_none() {
+        return Ok(ExecutionProofPrecheck::Ignore(
+            "execution proof's beacon block has not been seen",
+        ));
+    }
+    if store
+        .execution_proofs()
+        .get(&beacon_block_root)
+        .is_some_and(|proofs| proofs.contains_key(&envelope.proof_type))
+    {
+        return Ok(ExecutionProofPrecheck::Ignore(
+            "verified proof already known for this beacon block and proof type",
+        ));
+    }
+
+    // This is the bare ExecutionProofEnvelope root, not its signed wrapper or
+    // the reconstructed proof/public-input root.
+    let envelope_root = envelope.hash_tree_root();
+    if store
+        .execution_proof_roots()
+        .get(&beacon_block_root)
+        .is_some_and(|roots| roots.contains(&envelope_root))
+    {
+        return Ok(ExecutionProofPrecheck::Ignore(
+            "execution proof has already been processed",
+        ));
+    }
+
+    let validator_index = signed_envelope.validator_index;
+    if store.execution_proof_provers().contains(&(
+        beacon_block_root,
+        envelope.proof_type,
+        validator_index,
+    )) {
+        return Ok(ExecutionProofPrecheck::Ignore(
+            "proof already seen from this prover for this beacon block and proof type",
+        ));
+    }
+
+    Ok(ExecutionProofPrecheck::Continue(PrecheckedExecutionProof {
+        beacon_block_root,
+        proof_type: envelope.proof_type,
+        validator_index,
+        envelope_root,
+    }))
+}
 
 /// Content identity of the trusted context used to reconstruct an execution proof.
 ///
@@ -161,7 +264,7 @@ mod tests {
         )
         .expect("consistent carrier parts should refer to the same statement");
 
-        let signed_message: &ExecutionProofEnvelope = prepared.signed_message();
+        let signed_message = prepared.signed_message();
         assert_eq!(signed_message, &expected_message);
         assert_eq!(prepared.validator_index(), signed_envelope.validator_index);
         assert_eq!(prepared.execution_proof(), &execution_proof);
