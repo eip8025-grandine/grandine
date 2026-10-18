@@ -6658,9 +6658,28 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
     }
 
     fn load_beacon_state_by_state_transition(&self, block_root: H256) -> Arc<BeaconState<P>> {
+        // Preserve the legacy replay-only invariant; proof-context loading may accept an exact
+        // target state seed without replaying the target block.
+        let (state, replayed) = self
+            .try_load_beacon_state_by_state_transition(block_root, false)
+            .expect("state transition should succeed because block is already in store");
+        assert!(
+            replayed,
+            "legacy state loading requires replaying at least one block"
+        );
+        state
+    }
+
+    /// Makes ancestry replay failures recoverable for proof validation; the legacy
+    /// wrapper retains its panic contract without duplicating the replay algorithm.
+    fn try_load_beacon_state_by_state_transition(
+        &self,
+        block_root: H256,
+        verify_seed_association: bool,
+    ) -> Result<(Arc<BeaconState<P>>, bool)> {
         let mut blocks_to_process = vec![];
 
-        let mut state = self
+        let state = self
             .chain_ending_with(block_root)
             .find_map(|chain_link| {
                 let state = chain_link.state.clone().or_else(|| {
@@ -6677,23 +6696,54 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
                     blocks_to_process.push(&chain_link.block);
                 }
 
-                state
+                state.map(|state| (state, chain_link))
             })
-            .expect("at least one ancestor should have a state in memory or persisted");
+            .ok_or_else(|| {
+                anyhow!("at least one ancestor should have a state in memory or persisted")
+            })?;
 
-        assert!(!blocks_to_process.is_empty());
+        let (mut state, seed_chain_link) = state;
+        if verify_seed_association {
+            Self::ensure_state_matches_chain_link(&state, seed_chain_link)
+                .map_err(|error| anyhow!("selected ancestry seed is inconsistent: {error:#}"))?;
+        }
 
+        let replayed = !blocks_to_process.is_empty();
         for block in blocks_to_process.into_iter().rev() {
             combined::trusted_state_transition(
                 self.chain_config(),
                 &self.pubkey_cache,
                 state.make_mut(),
                 block,
-            )
-            .expect("state transition should succeed because block is already in store");
+            )?;
         }
 
-        state
+        Ok((state, replayed))
+    }
+
+    fn ensure_state_matches_chain_link(
+        state: &BeaconState<P>,
+        chain_link: &ChainLink<P>,
+    ) -> Result<()> {
+        // Trusted replay installs the declared root in Hc; invalidate only the clone's outer
+        // cached root so this check hashes the state contents without mutating the shared state.
+        let mut content_state = state.clone();
+        let _ = content_state.cache_mut();
+
+        ensure!(
+            content_state.slot() == chain_link.slot(),
+            "reconstructed state slot does not match its block"
+        );
+        ensure!(
+            content_state.hash_tree_root() == chain_link.block.message().state_root(),
+            "reconstructed state root does not match its block's declared state root"
+        );
+        ensure!(
+            accessors::latest_block_root(&content_state) == chain_link.block_root,
+            "reconstructed state header does not match its block root"
+        );
+
+        Ok(())
     }
 
     pub fn state_before_or_at_slot(
