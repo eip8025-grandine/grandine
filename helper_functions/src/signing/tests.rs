@@ -225,14 +225,9 @@ fn sign_and_verify_round_trip() {
         .expect("signature should verify");
 }
 
-// Regenerates the frozen store fixture from a known test-only key and signing context.
-// The pinned bytes also catch drift in the envelope root or domain.
+// The pinned bytes independently catch drift in the envelope root, domain, or signature.
 #[test]
-#[expect(
-    clippy::print_stdout,
-    reason = "prints reproducible test-only fixture bytes"
-)]
-fn print_reproducible_proof_envelope_fixture() {
+fn execution_proof_envelope_signature_matches_pinned_vector() {
     let mut bytes = SecretKeyBytes::default();
     bytes.as_mut()[31] = 1; // Deterministic test scalar, never a real validator key.
     let key: SecretKey = bytes.try_into().expect("scalar one is a valid secret key");
@@ -253,13 +248,6 @@ fn print_reproducible_proof_envelope_fixture() {
     envelope
         .verify(&config, &state, 8, signature, Arc::new(key.to_public_key()))
         .expect("generated signature should verify");
-
-    println!("public key: {:02x?}", public_key.as_bytes());
-    println!("signature: {:02x?}", signature.as_bytes());
-    println!(
-        "signing root: {:?}",
-        envelope.signing_root(&config, &state, 8)
-    );
 
     assert_eq!(
         envelope.signing_root(&config, &state, 8),
