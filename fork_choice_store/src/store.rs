@@ -7607,6 +7607,7 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
 
     use super::*;
+    use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
     use spec_test_utils::Case;
     use ssz::{Hc, SszRead as _, SszWrite as _};
     use types::{
@@ -8213,25 +8214,11 @@ mod tests {
         assert_precheck_bookkeeping_unchanged(&store, &snapshots.0, &snapshots.1, &snapshots.2);
     }
 
-    // Generated from the scalar-one test key in
-    // `helper_functions/src/signing/tests.rs::print_reproducible_proof_envelope_fixture`
-    // (default chain config, Gloas state at slot 8). Keep these bytes frozen
-    // to avoid a `bls` dev-dependency here.
-    const PROOF_PUBLIC_KEY: [u8; 48] = [
-        0x97, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9, 0xac,
-        0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f, 0x17, 0x1b,
-        0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a, 0xf0, 0x0a, 0xdb,
-        0x22, 0xc6, 0xbb,
-    ];
-    const PROOF_SIGNATURE: [u8; 96] = [
-        0x8f, 0xce, 0x12, 0xfb, 0x9d, 0x32, 0x5b, 0x05, 0xc8, 0xd6, 0x42, 0x67, 0xb1, 0x4a, 0x89,
-        0xe1, 0x8a, 0xb1, 0x3d, 0x0f, 0xbf, 0xaa, 0xdf, 0x6c, 0x3f, 0x6d, 0x7c, 0x6b, 0x1a, 0xe8,
-        0xce, 0xc9, 0x49, 0xe8, 0xf9, 0x93, 0x6f, 0xa3, 0x1f, 0x03, 0x54, 0x98, 0x2d, 0x0e, 0x52,
-        0xe8, 0x39, 0x5b, 0x05, 0x1e, 0x9c, 0x97, 0xb6, 0x68, 0x3b, 0x32, 0x7e, 0xdc, 0x51, 0x78,
-        0x6e, 0x8b, 0x1b, 0x04, 0x1a, 0x04, 0x3f, 0xa4, 0xca, 0x23, 0x31, 0x20, 0xdf, 0x68, 0x96,
-        0x0d, 0x2f, 0x83, 0x49, 0x0a, 0x4a, 0x0e, 0xa4, 0x65, 0x04, 0x31, 0x7c, 0x37, 0x64, 0xbb,
-        0x9f, 0x99, 0x1b, 0x68, 0x46, 0x0d,
-    ];
+    fn proof_signing_key() -> SecretKey {
+        let mut bytes = SecretKeyBytes::default();
+        bytes.as_mut()[31] = 1; // Deterministic scalar-one test key.
+        bytes.try_into().expect("scalar one is a valid secret key")
+    }
 
     fn proof_fixture(
         validator_exit_epoch: Epoch,
@@ -8240,11 +8227,12 @@ mod tests {
         BeaconState<Minimal>,
         SignedExecutionProofEnvelope,
     ) {
+        let store = genesis_store();
+        let key = proof_signing_key();
         let gloas_state = GloasBeaconState::<Minimal> {
             slot: 8, // Minimal: first slot of epoch 1.
             validators: core::iter::once(Validator {
-                pubkey: ssz::SszReadDefault::from_ssz_default(PROOF_PUBLIC_KEY)
-                    .expect("fixture public key bytes should decode"),
+                pubkey: key.to_public_key().into(),
                 activation_epoch: 0,
                 exit_epoch: validator_exit_epoch,
                 ..Validator::default()
@@ -8259,14 +8247,16 @@ mod tests {
             proof_type: 1,
             beacon_block_root: H256::zero(),
         };
+        let signature = envelope
+            .sign(&store.chain_config, &state, state.slot(), &key)
+            .into();
         let signed_proof = SignedExecutionProofEnvelope {
             message: Hc::from(envelope),
             validator_index: 0,
-            signature: ssz::SszReadDefault::from_ssz_default(PROOF_SIGNATURE)
-                .expect("fixture signature bytes should decode"),
+            signature,
         };
 
-        (genesis_store(), state, signed_proof)
+        (store, state, signed_proof)
     }
 
     fn assert_execution_proof_rejected(
