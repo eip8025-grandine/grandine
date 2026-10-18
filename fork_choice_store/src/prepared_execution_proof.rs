@@ -1,12 +1,17 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use ssz::SszHash as _;
+use std_ext::ArcExt as _;
 use types::{
+    combined::BeaconState,
     eip8025::{
         containers::{
             ExecutionProof, ExecutionProofEnvelope, PublicInput, SignedExecutionProofEnvelope,
         },
         primitives::get_supported_proof_types,
     },
+    gloas::containers::SignedExecutionPayloadEnvelope,
     phase0::primitives::{H256, ValidatorIndex},
     preset::Preset,
 };
@@ -106,6 +111,72 @@ pub fn precheck_execution_proof<P: Preset, S: Storage<P>>(
         validator_index,
         envelope_root,
     }))
+}
+
+/// Result of loading the exact accepted payload and validated post-state for a proof target.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Consumed by the future execution-proof preparation path"
+    )
+)]
+pub enum ExecutionProofContextLoad<P: Preset> {
+    Ignore(&'static str),
+    Continue {
+        state: Arc<BeaconState<P>>,
+        payload_envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
+    },
+}
+
+/// Loads the accepted payload and exact validated post-state for the prechecked block.
+/// Missing or inconsistent local context is an IGNORE, not a peer-invalid proof verdict.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Consumed by the future execution-proof preparation path"
+    )
+)]
+pub fn load_execution_proof_context<P: Preset, S: Storage<P>>(
+    store: &Store<P, S>,
+    prechecked: &PrecheckedExecutionProof,
+) -> ExecutionProofContextLoad<P> {
+    let block_root = prechecked.beacon_block_root;
+
+    // This marker records Store acceptance; it is not an EL VALID verdict.
+    if !store.is_payload_verified(block_root) {
+        return ExecutionProofContextLoad::Ignore(
+            "execution proof's payload has not been accepted",
+        );
+    }
+
+    let Some(payload_envelope) = store.cached_execution_payload_envelope_by_root(block_root) else {
+        return ExecutionProofContextLoad::Ignore(
+            "execution proof's accepted payload envelope is unavailable",
+        );
+    };
+    let Some(chain_link) = store.chain_link(block_root) else {
+        return ExecutionProofContextLoad::Ignore(
+            "execution proof's beacon block is no longer available",
+        );
+    };
+    if payload_envelope.block_root() != block_root || payload_envelope.slot() != chain_link.slot() {
+        return ExecutionProofContextLoad::Ignore(
+            "execution proof's accepted payload envelope does not match its beacon block",
+        );
+    }
+
+    let Ok(Some(state)) = store.try_state_by_block_root(block_root) else {
+        return ExecutionProofContextLoad::Ignore(
+            "execution proof's validated post-state is unavailable",
+        );
+    };
+
+    ExecutionProofContextLoad::Continue {
+        state,
+        payload_envelope: payload_envelope.clone_arc(),
+    }
 }
 
 /// Content identity of the trusted context used to reconstruct an execution proof.

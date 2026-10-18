@@ -770,6 +770,35 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             .map(|chain_link| chain_link.state(self))
     }
 
+    /// Fallible exact-state lookup for proof validation: the existing getter can panic
+    /// during reconstruction, whereas unavailable local context should yield IGNORE.
+    pub(crate) fn try_state_by_block_root(
+        &self,
+        block_root: H256,
+    ) -> Result<Option<Arc<BeaconState<P>>>> {
+        let Some(chain_link) = self.chain_link(block_root) else {
+            return Ok(None);
+        };
+
+        let state = if let Some(state) = &chain_link.state {
+            state.clone_arc()
+        } else {
+            self.state_cache
+                .get_or_insert_with(block_root, chain_link.slot(), true, || {
+                    let (state, _) =
+                        self.try_load_beacon_state_by_state_transition(block_root, true)?;
+                    // StateCache publishes an Ok fill immediately, so reject a bad target here.
+                    Self::ensure_state_matches_chain_link(&state, chain_link)?;
+                    Ok((state, None))
+                })?
+                .0
+        };
+
+        // Resident states and cache hits bypass the fill closure and share this same check.
+        Self::ensure_state_matches_chain_link(&state, chain_link)?;
+        Ok(Some(state))
+    }
+
     #[must_use]
     pub fn anchor(&self) -> &ChainLink<P> {
         self.finalized
