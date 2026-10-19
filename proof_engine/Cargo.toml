@@ -7,5 +7,4 @@ authors = ["Grandine <info@grandine.io>"]
 workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
 types = { workspace = true }

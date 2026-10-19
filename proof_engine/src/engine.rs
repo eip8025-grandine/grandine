@@ -1,48 +1,18 @@
-use types::{
-    eip8025::{
-        containers::{ExecutionProof, NewPayloadRequest, ProofAttributes},
-        primitives::ProofType,
-    },
-    phase0::primitives::H256,
-    preset::Preset,
-};
+use types::eip8025::containers::ExecutionProof;
 
-/// Verification half of the EIP-8025 `ProofEngine` protocol.
+/// The EIP-8025 [`ProofEngine`](https://github.com/ethereum/consensus-specs/blob/d9663f85be248c4fd0ae95806da6070e17c2442b/specs/_features/eip8025/proof-engine.md#proof-engine)
+/// protocol.
+///
+/// The spec protocol is validation-only, so
+/// [`verify_execution_proof`](Self::verify_execution_proof) is all of it.
+/// [`is_null`](Self::is_null) is a Grandine extension the spec does not have.
 ///
 /// Non-generic and object-safe: `verify_execution_proof` receives an already
 /// reconstructed `ExecutionProof`, so it needs no `P: Preset`.
-pub trait ProofVerifier: Send + Sync + 'static {
-    /// Whether this verifier opts out of execution-proof verification.
+pub trait ProofEngine: Send + Sync + 'static {
+    /// Whether this engine opts out of execution-proof verification.
     fn is_null(&self) -> bool;
 
-    /// [`verify_execution_proof`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-verify_execution_proof)
+    /// [`verify_execution_proof`](https://github.com/ethereum/consensus-specs/blob/d9663f85be248c4fd0ae95806da6070e17c2442b/specs/_features/eip8025/proof-engine.md#new-verify_execution_proof)
     fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool;
-}
-
-/// Generation half of the EIP-8025 `ProofEngine` protocol.
-///
-/// Generic over `P` because `request_proofs` takes the full
-/// `NewPayloadRequest<P>`. Unwired for now: Grandine is verifier-only.
-pub trait ProofProver<P: Preset>: Send + Sync + 'static {
-    /// [`request_proofs`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-request_proofs)
-    fn request_proofs(
-        &self,
-        new_payload_request: NewPayloadRequest<P>,
-        chain_id: u64,
-        schema_id: u16,
-        proof_attributes: ProofAttributes,
-    ) -> Result<H256, ProofEngineError>;
-
-    /// [`get_proof`](https://github.com/ethereum/consensus-specs/blob/7fa044833194cbea2908f76c0de102d168d88fb0/specs/_features/eip8025/proof-engine.md#new-get_proof)
-    fn get_proof(
-        &self,
-        new_payload_request_root: H256,
-        proof_type: ProofType,
-    ) -> Result<ExecutionProof, ProofEngineError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ProofEngineError {
-    #[error("proof engine method not supported")]
-    Unsupported,
 }
