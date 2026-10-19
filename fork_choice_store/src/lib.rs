@@ -90,7 +90,10 @@ pub use crate::{
         PayloadPresence, ProposerPreferencesAction, ProposerPreferencesOrigin, Storage,
         ValidAttestation, ValidPayloadAttestation,
     },
-    prepared_execution_proof::{ExecutionProofContextIdentity, PreparedExecutionProof},
+    prepared_execution_proof::{
+        ExecutionProofContextIdentity, ExecutionProofPreparation, PreparedExecutionProof,
+        prepare_execution_proof,
+    },
     segment::Segment,
     state_cache_processor::{Error as StateCacheError, StateCacheProcessor},
     store::Store,
