@@ -2625,7 +2625,12 @@ where
     ) {
         match result {
             Ok(ExecutionProofAction::Accept(signed_proof)) => {
-                trace_with_peers!("execution proof accepted (signed_proof: {signed_proof:?})");
+                trace_with_peers!(
+                    "execution proof accepted (block_root: {:?}, proof_type: {}, validator_index: {})",
+                    signed_proof.message.beacon_block_root,
+                    signed_proof.message.proof_type,
+                    signed_proof.validator_index,
+                );
 
                 let (gossip_id, sender) = origin.split();
 
