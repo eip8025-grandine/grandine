@@ -193,6 +193,13 @@ pub struct Store<P: Preset, S: Storage<P>> {
     // implementing the spec rule:
     // [IGNORE] This is the first valid aggregate for this aggregator in this epoch.
     seen_gossip_attestations: Arc<Mutex<SeenGossipAttestations>>,
+    // TODO(eip8025-grandine): PR2 adds live-store admission after PR1 authentication and
+    // binding; PR3 wires it through the mutator before scheduling engine verification.
+    // Snapshot checks alone let concurrent tasks both reach the verifier. Admission must
+    // recheck retention, trusted context, verified-proof storage and both Seen keys, then
+    // atomically insert (block root, bare-envelope root) and (block root, proof type, validator).
+    // Decline duplicates without inserting either key. Keep admitted keys until pruning, even
+    // on engine rejection or local/scheduling failure; Seen tracks attempts, not verified proofs.
     // [New in EIP8025]
     execution_proof_roots: HashMap<H256, HashSet<H256>>,
     // [New in EIP8025]
