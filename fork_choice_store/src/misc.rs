@@ -550,6 +550,9 @@ impl ExecutionPayloadBidOrigin {
     }
 }
 
+// TODO(eip8025-grandine): Reassess whether execution proofs need a separate origin type.
+// Gossip is the only specified ingress; if no API path is needed, use GossipId directly and
+// remove the unused API variant and reply handling.
 #[derive(Debug, AsRefStr)]
 pub enum ExecutionProofOrigin {
     Gossip(GossipId),
