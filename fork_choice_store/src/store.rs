@@ -7744,14 +7744,22 @@ mod tests {
         envelope
     }
 
-    fn context_prechecked(
-        block_root: H256,
-    ) -> crate::prepared_execution_proof::PrecheckedExecutionProof {
-        crate::prepared_execution_proof::PrecheckedExecutionProof {
-            beacon_block_root: block_root,
-            proof_type: 1,
-            validator_index: 0,
-            envelope_root: H256::zero(),
+    fn context_signed_envelope(block_root: H256) -> SignedExecutionProofEnvelope {
+        precheck_fixture(block_root, 1, 0, vec![0x42])
+    }
+
+    fn context_prechecked<'a, S: Storage<Minimal>>(
+        store: &Store<Minimal, S>,
+        signed_envelope: &'a SignedExecutionProofEnvelope,
+    ) -> crate::prepared_execution_proof::PrecheckedExecutionProof<'a> {
+        match crate::prepared_execution_proof::precheck_execution_proof(store, signed_envelope) {
+            Ok(crate::prepared_execution_proof::ExecutionProofPrecheck::Continue(prechecked)) => {
+                prechecked
+            }
+            Ok(crate::prepared_execution_proof::ExecutionProofPrecheck::Ignore(reason)) => {
+                panic!("fixture envelope should pass ordered precheck: {reason}")
+            }
+            Err(error) => panic!("fixture envelope should pass ordered precheck: {error:#}"),
         }
     }
 
@@ -8179,8 +8187,8 @@ mod tests {
         );
         match precheck_execution_proof(&store, &different_type) {
             Ok(ExecutionProofPrecheck::Continue(prechecked)) => {
-                assert_eq!(prechecked.proof_type, 2);
-                assert_eq!(prechecked.validator_index, 7);
+                assert_eq!(prechecked.proof_type(), 2);
+                assert_eq!(prechecked.validator_index(), 7);
             }
             _ => panic!("prover duplicate key must be scoped by proof type"),
         }
@@ -8204,10 +8212,10 @@ mod tests {
         );
         match precheck_execution_proof(&store, &envelope) {
             Ok(ExecutionProofPrecheck::Continue(prechecked)) => {
-                assert_eq!(prechecked.beacon_block_root, block_root);
-                assert_eq!(prechecked.proof_type, 1);
-                assert_eq!(prechecked.validator_index, 7);
-                assert_eq!(prechecked.envelope_root, bare_root);
+                assert_eq!(prechecked.beacon_block_root(), block_root);
+                assert_eq!(prechecked.proof_type(), 1);
+                assert_eq!(prechecked.validator_index(), 7);
+                assert_eq!(prechecked.envelope_root(), bare_root);
             }
             _ => panic!("known supported envelope with no payload must reach continuation"),
         }
@@ -8259,6 +8267,142 @@ mod tests {
         (store, state, signed_proof)
     }
 
+    fn proof_preparation_fixture(
+        validator_exit_epoch: Epoch,
+        accepted_payload: bool,
+    ) -> (
+        Store<Minimal, ContextStorage>,
+        Arc<BeaconState<Minimal>>,
+        SignedExecutionProofEnvelope,
+    ) {
+        let storage = Arc::new(ContextStorage::default());
+        let key = proof_signing_key();
+        let body = GloasBeaconBlockBody::<Minimal>::default();
+        let state = Arc::new(BeaconState::from(GloasBeaconState::<Minimal> {
+            validators: core::iter::once(Validator {
+                pubkey: key.to_public_key().into(),
+                activation_epoch: 0,
+                exit_epoch: validator_exit_epoch,
+                ..Validator::default()
+            })
+            .collect(),
+            latest_block_header: BeaconBlockHeader {
+                body_root: body.hash_tree_root(),
+                ..Default::default()
+            },
+            ..GloasBeaconState::default()
+        }));
+        let block = GloasSignedBeaconBlock {
+            message: Hc::from(GloasBeaconBlock {
+                state_root: state.hash_tree_root(),
+                body,
+                ..Default::default()
+            }),
+            signature: <_>::default(),
+        };
+        let block_root = block.message.hash_tree_root();
+        assert_eq!(accessors::latest_block_root(&state), block_root);
+
+        let mut store = Store::new(
+            Arc::new(ChainConfig::default()),
+            Arc::new(PubkeyCache::default()),
+            StoreConfig::default(),
+            Arc::new(SignedBeaconBlock::<Minimal>::from(block)),
+            state.clone_arc(),
+            storage,
+            false,
+            false,
+            StdHashSet::default(),
+            Arc::new(SccHashMap::new()),
+        );
+        if accepted_payload {
+            cache_accepted_test_payload(&mut store, block_root, state.slot());
+        }
+
+        let envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("one byte is within the proof-data bound"),
+            proof_type: 1,
+            beacon_block_root: block_root,
+        };
+        // Sign only after the trusted state and its block root are fixed.
+        let signature = envelope
+            .sign(&store.chain_config, &state, state.slot(), &key)
+            .into();
+        let signed_proof = SignedExecutionProofEnvelope {
+            message: Hc::from(envelope),
+            validator_index: 0,
+            signature,
+        };
+
+        (store, state, signed_proof)
+    }
+
+    fn pre_gloas_proof_preparation_fixture() -> (
+        Store<Minimal, ContextStorage>,
+        Arc<BeaconState<Minimal>>,
+        SignedExecutionProofEnvelope,
+    ) {
+        let storage = Arc::new(ContextStorage::default());
+        let key = proof_signing_key();
+        let body = Phase0BeaconBlockBody::<Minimal>::default();
+        let state = Arc::new(BeaconState::from(Phase0BeaconState::<Minimal> {
+            validators: types::Validators::<Minimal>::try_from([Validator {
+                pubkey: key.to_public_key().into(),
+                activation_epoch: 0,
+                exit_epoch: FAR_FUTURE_EPOCH,
+                ..Validator::default()
+            }])
+            .expect("one validator fits in the validator registry"),
+            latest_block_header: BeaconBlockHeader {
+                body_root: body.hash_tree_root(),
+                ..Default::default()
+            },
+            ..Phase0BeaconState::default()
+        }));
+        let block = Phase0SignedBeaconBlock {
+            message: Hc::from(Phase0BeaconBlock {
+                state_root: state.hash_tree_root(),
+                body,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let block_root = block.message.hash_tree_root();
+        assert_eq!(accessors::latest_block_root(&state), block_root);
+
+        let mut store = Store::new(
+            Arc::new(ChainConfig::default()),
+            Arc::new(PubkeyCache::default()),
+            StoreConfig::default(),
+            Arc::new(SignedBeaconBlock::<Minimal>::from(block)),
+            state.clone_arc(),
+            storage,
+            false,
+            false,
+            StdHashSet::default(),
+            Arc::new(SccHashMap::new()),
+        );
+        cache_accepted_test_payload(&mut store, block_root, state.slot());
+
+        let envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("one byte is within the proof-data bound"),
+            proof_type: 1,
+            beacon_block_root: block_root,
+        };
+        let signature = envelope
+            .sign(&store.chain_config, &state, state.slot(), &key)
+            .into();
+        let signed_proof = SignedExecutionProofEnvelope {
+            message: Hc::from(envelope),
+            validator_index: 0,
+            signature,
+        };
+
+        (store, state, signed_proof)
+    }
+
     fn assert_execution_proof_rejected(
         store: &Store<Minimal, NoopStorage>,
         state: &BeaconState<Minimal>,
@@ -8274,6 +8418,23 @@ mod tests {
         assert!(
             expected(store_error),
             "unexpected validation error: {store_error:?}"
+        );
+    }
+
+    fn assert_preparation_rejected<S: Storage<Minimal>>(
+        store: &Store<Minimal, S>,
+        signed_proof: &SignedExecutionProofEnvelope,
+        expected: impl FnOnce(&Error<Minimal>) -> bool,
+    ) {
+        let Err(error) = crate::prepare_execution_proof(store, signed_proof) else {
+            panic!("invalid execution proof should be rejected");
+        };
+        let store_error = error
+            .downcast_ref::<Error<Minimal>>()
+            .expect("protocol rejection should preserve its typed Store error");
+        assert!(
+            expected(store_error),
+            "unexpected preparation rejection: {store_error:?}"
         );
     }
 
@@ -8470,7 +8631,9 @@ mod tests {
         seed_execution_proof_bookkeeping(&mut store, block_root);
         let bookkeeping = execution_proof_bookkeeping(&store);
 
-        match load_execution_proof_context(&store, &context_prechecked(block_root)) {
+        let block_context_envelope = context_signed_envelope(block_root);
+        let block_prechecked = context_prechecked(&store, &block_context_envelope);
+        match load_execution_proof_context(&store, &block_prechecked) {
             ExecutionProofContextLoad::Continue {
                 state: loaded_state,
                 payload_envelope,
@@ -8502,8 +8665,10 @@ mod tests {
         marker_only.payloads.insert(marker_root);
         seed_execution_proof_bookkeeping(&mut marker_only, marker_root);
         let marker_bookkeeping = execution_proof_bookkeeping(&marker_only);
+        let marker_context_envelope = context_signed_envelope(marker_root);
+        let marker_prechecked = context_prechecked(&marker_only, &marker_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&marker_only, &context_prechecked(marker_root)),
+            load_execution_proof_context(&marker_only, &marker_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's accepted payload envelope is unavailable"
             )
@@ -8522,8 +8687,10 @@ mod tests {
         cache_only.payloads.remove(&cache_root);
         seed_execution_proof_bookkeeping(&mut cache_only, cache_root);
         let cache_bookkeeping = execution_proof_bookkeeping(&cache_only);
+        let cache_context_envelope = context_signed_envelope(cache_root);
+        let cache_prechecked = context_prechecked(&cache_only, &cache_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&cache_only, &context_prechecked(cache_root)),
+            load_execution_proof_context(&cache_only, &cache_prechecked),
             ExecutionProofContextLoad::Ignore("execution proof's payload has not been accepted")
         ));
         assert!(storage.requested_roots.lock().is_empty());
@@ -8554,8 +8721,10 @@ mod tests {
             .expect("preloading the exact post-state into the state cache should succeed");
         seed_execution_proof_bookkeeping(&mut cached, cached_root);
         let cached_bookkeeping = execution_proof_bookkeeping(&cached);
+        let cached_context_envelope = context_signed_envelope(cached_root);
+        let cached_prechecked = context_prechecked(&cached, &cached_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&cached, &context_prechecked(cached_root)),
+            load_execution_proof_context(&cached, &cached_prechecked),
             ExecutionProofContextLoad::Continue { .. }
         ));
         assert!(cache_storage.requested_roots.lock().is_empty());
@@ -8577,8 +8746,10 @@ mod tests {
         cache_accepted_test_payload(&mut persisted, persisted_root, persisted_state.slot());
         seed_execution_proof_bookkeeping(&mut persisted, persisted_root);
         let persisted_bookkeeping = execution_proof_bookkeeping(&persisted);
+        let persisted_context_envelope = context_signed_envelope(persisted_root);
+        let persisted_prechecked = context_prechecked(&persisted, &persisted_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&persisted, &context_prechecked(persisted_root)),
+            load_execution_proof_context(&persisted, &persisted_prechecked),
             ExecutionProofContextLoad::Continue { .. }
         ));
         assert_eq!(*persisted_storage.requested_roots.lock(), [persisted_root]);
@@ -8602,8 +8773,10 @@ mod tests {
         cache_accepted_test_payload(&mut missing, missing_root, 0);
         seed_execution_proof_bookkeeping(&mut missing, missing_root);
         let missing_bookkeeping = execution_proof_bookkeeping(&missing);
+        let missing_context_envelope = context_signed_envelope(missing_root);
+        let missing_prechecked = context_prechecked(&missing, &missing_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&missing, &context_prechecked(missing_root)),
+            load_execution_proof_context(&missing, &missing_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -8631,8 +8804,10 @@ mod tests {
         cache_accepted_test_payload(&mut failed, failed_root, 0);
         seed_execution_proof_bookkeeping(&mut failed, failed_root);
         let failed_bookkeeping = execution_proof_bookkeeping(&failed);
+        let failed_context_envelope = context_signed_envelope(failed_root);
+        let failed_prechecked = context_prechecked(&failed, &failed_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&failed, &context_prechecked(failed_root)),
+            load_execution_proof_context(&failed, &failed_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -8693,8 +8868,10 @@ mod tests {
 
         seed_execution_proof_bookkeeping(&mut store, block_root);
         let bookkeeping = execution_proof_bookkeeping(&store);
+        let block_context_envelope = context_signed_envelope(block_root);
+        let block_prechecked = context_prechecked(&store, &block_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&store, &context_prechecked(block_root)),
+            load_execution_proof_context(&store, &block_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -8730,8 +8907,10 @@ mod tests {
             .expect("adding a next-slot-only cached state should succeed");
         seed_execution_proof_bookkeeping(&mut next_only, next_root);
         let next_bookkeeping = execution_proof_bookkeeping(&next_only);
+        let next_context_envelope = context_signed_envelope(next_root);
+        let next_prechecked = context_prechecked(&next_only, &next_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&next_only, &context_prechecked(next_root)),
+            load_execution_proof_context(&next_only, &next_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -8769,8 +8948,10 @@ mod tests {
             .state = Some(Arc::new(BeaconState::from(altered_gloas_state)));
         seed_execution_proof_bookkeeping(&mut root_mismatch, root);
         let root_bookkeeping = execution_proof_bookkeeping(&root_mismatch);
+        let root_context_envelope = context_signed_envelope(root);
+        let root_prechecked = context_prechecked(&root_mismatch, &root_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&root_mismatch, &context_prechecked(root)),
+            load_execution_proof_context(&root_mismatch, &root_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -8792,8 +8973,10 @@ mod tests {
             .state = Some(wrong_slot_state);
         seed_execution_proof_bookkeeping(&mut slot_mismatch, slot_root);
         let slot_bookkeeping = execution_proof_bookkeeping(&slot_mismatch);
+        let slot_context_envelope = context_signed_envelope(slot_root);
+        let slot_prechecked = context_prechecked(&slot_mismatch, &slot_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&slot_mismatch, &context_prechecked(slot_root)),
+            load_execution_proof_context(&slot_mismatch, &slot_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -8805,8 +8988,10 @@ mod tests {
         cache_accepted_test_payload(&mut payload_mismatch, payload_root, 1);
         seed_execution_proof_bookkeeping(&mut payload_mismatch, payload_root);
         let payload_bookkeeping = execution_proof_bookkeeping(&payload_mismatch);
+        let payload_context_envelope = context_signed_envelope(payload_root);
+        let payload_prechecked = context_prechecked(&payload_mismatch, &payload_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&payload_mismatch, &context_prechecked(payload_root)),
+            load_execution_proof_context(&payload_mismatch, &payload_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's accepted payload envelope does not match its beacon block"
             )
@@ -8859,8 +9044,10 @@ mod tests {
         seed_execution_proof_bookkeeping(&mut store, block_root);
         let bookkeeping = execution_proof_bookkeeping(&store);
 
+        let block_context_envelope = context_signed_envelope(block_root);
+        let block_prechecked = context_prechecked(&store, &block_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&store, &context_prechecked(block_root)),
+            load_execution_proof_context(&store, &block_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -9069,27 +9256,28 @@ mod tests {
                 .before_or_at_slot_in_cache_only(target_root, target_slot)
                 .is_none()
         );
-        let loaded_state =
-            match load_execution_proof_context(&store, &context_prechecked(target_root)) {
-                ExecutionProofContextLoad::Continue {
-                    state,
-                    payload_envelope: _,
-                } => {
-                    assert_eq!(state.slot(), target_slot);
+        let target_context_envelope = context_signed_envelope(target_root);
+        let target_prechecked = context_prechecked(&store, &target_context_envelope);
+        let loaded_state = match load_execution_proof_context(&store, &target_prechecked) {
+            ExecutionProofContextLoad::Continue {
+                state,
+                payload_envelope: _,
+            } => {
+                assert_eq!(state.slot(), target_slot);
 
-                    // Round-trip before hashing so the assertion is over fixture state contents,
-                    // not the root installed by trusted replay's Hc cache.
-                    let actual_post = decode_fixture_state(config.as_ref(), &state);
-                    assert_eq!(actual_post, post_state);
-                    assert_eq!(actual_post.hash_tree_root(), target_declared_state_root);
-                    assert_eq!(accessors::latest_block_root(&actual_post), target_root);
-                    assert_ne!(actual_post.slot(), intermediate_slot);
-                    state
-                }
-                ExecutionProofContextLoad::Ignore(reason) => {
-                    panic!("coherent two-block fixture should load: {reason}")
-                }
-            };
+                // Round-trip before hashing so the assertion is over fixture state contents,
+                // not the root installed by trusted replay's Hc cache.
+                let actual_post = decode_fixture_state(config.as_ref(), &state);
+                assert_eq!(actual_post, post_state);
+                assert_eq!(actual_post.hash_tree_root(), target_declared_state_root);
+                assert_eq!(accessors::latest_block_root(&actual_post), target_root);
+                assert_ne!(actual_post.slot(), intermediate_slot);
+                state
+            }
+            ExecutionProofContextLoad::Ignore(reason) => {
+                panic!("coherent two-block fixture should load: {reason}")
+            }
+        };
         let reads_after_fill = [target_root, intermediate_root, anchor_root];
         assert_eq!(
             storage.requested_roots.lock().as_slice(),
@@ -9104,7 +9292,7 @@ mod tests {
         assert_eq!(cached_post, post_state);
 
         assert!(matches!(
-            load_execution_proof_context(&store, &context_prechecked(target_root)),
+            load_execution_proof_context(&store, &target_prechecked),
             ExecutionProofContextLoad::Continue { .. }
         ));
         assert_eq!(
@@ -9171,8 +9359,10 @@ mod tests {
         );
 
         let cache_observer = store.clone();
+        let target_context_envelope = context_signed_envelope(target_root);
+        let target_prechecked = context_prechecked(&store, &target_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&store, &context_prechecked(target_root)),
+            load_execution_proof_context(&store, &target_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -9278,8 +9468,10 @@ mod tests {
             "failed seed association must not publish a target state"
         );
         storage.requested_roots.lock().clear();
+        let target_context_envelope = context_signed_envelope(target_root);
+        let target_prechecked = context_prechecked(&store, &target_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&store, &context_prechecked(target_root)),
+            load_execution_proof_context(&store, &target_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -9357,8 +9549,10 @@ mod tests {
         );
 
         storage.requested_roots.lock().clear();
+        let target_context_envelope = context_signed_envelope(target_root);
+        let target_prechecked = context_prechecked(&store, &target_context_envelope);
         assert!(matches!(
-            load_execution_proof_context(&store, &context_prechecked(target_root)),
+            load_execution_proof_context(&store, &target_prechecked),
             ExecutionProofContextLoad::Ignore(
                 "execution proof's validated post-state is unavailable"
             )
@@ -9369,6 +9563,252 @@ mod tests {
                 .before_or_at_slot_in_cache_only(target_root, target_slot)
                 .is_none(),
             "a failed trusted transition must not publish a target state"
+        );
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+    }
+
+    #[test]
+    fn execution_proof_preparation_authenticates_and_binds_exact_accepted_context() {
+        let (store, state, signed_proof) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        let block_root = signed_proof.message.beacon_block_root;
+        let accepted_payload = store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .expect("fixture accepted payload should be cached");
+        assert_eq!(accepted_payload.block_root(), block_root);
+        assert_eq!(
+            accepted_payload.slot(),
+            store
+                .chain_link(block_root)
+                .expect("fixture target block should remain in Store")
+                .slot()
+        );
+        let expected = store
+            .get_execution_proof(
+                &state,
+                signed_proof.message.as_ref(),
+                &accepted_payload.message,
+            )
+            .expect("fixture Gloas context should reconstruct the statement");
+        let bookkeeping = execution_proof_bookkeeping(&store);
+
+        match crate::prepare_execution_proof(&store, &signed_proof) {
+            Ok(crate::ExecutionProofPreparation::Prepared(prepared)) => {
+                assert_eq!(prepared.signed_message(), signed_proof.message.as_ref());
+                assert_eq!(prepared.validator_index(), 0);
+                assert_eq!(prepared.execution_proof(), &expected);
+                assert_eq!(prepared.signed_message().beacon_block_root, block_root);
+                assert_eq!(prepared.signed_message().proof_type, 1);
+                assert_eq!(prepared.signed_message().proof_data, expected.proof_data);
+                assert_eq!(
+                    prepared.envelope_root(),
+                    signed_proof.message.as_ref().hash_tree_root(),
+                    "prepared carrier preserves the bare envelope root from ordered precheck"
+                );
+                assert_eq!(prepared.context_identity().beacon_block_root(), block_root);
+                assert_eq!(
+                    prepared.context_identity().public_input(),
+                    &expected.public_input,
+                    "context identity retains the complete reconstructed public input"
+                );
+                assert!(
+                    prepared
+                        .execution_proof()
+                        .public_input
+                        .successful_validation
+                );
+                assert_eq!(
+                    prepared.execution_proof().public_input.chain_id,
+                    store.chain_config().deposit_chain_id
+                );
+                assert_eq!(
+                    prepared.execution_proof().public_input.schema_id,
+                    STATELESS_INPUT_SCHEMA_ID
+                );
+            }
+            Ok(crate::ExecutionProofPreparation::Ignore(reason)) => {
+                panic!("coherent authenticated fixture should prepare: {reason}")
+            }
+            Err(error) => panic!("coherent authenticated fixture failed: {error:#}"),
+        }
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+    }
+
+    #[test]
+    fn execution_proof_preparation_rejects_authentication_failures_without_bookkeeping() {
+        let (store, _, mut invalid_index) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        invalid_index.validator_index = 1;
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        assert_preparation_rejected(&store, &invalid_index, |error| {
+            matches!(
+                error,
+                Error::ExecutionProofEnvelopeInvalidValidatorIndex { .. }
+            )
+        });
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+        let (inactive_store, _, inactive) = proof_preparation_fixture(0, true);
+        let bookkeeping = execution_proof_bookkeeping(&inactive_store);
+        assert_preparation_rejected(&inactive_store, &inactive, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeInactiveValidator { .. })
+        });
+        assert_execution_proof_bookkeeping_unchanged(&inactive_store, &bookkeeping);
+
+        let (bad_signature_store, _, mut bad_signature) =
+            proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        // Tamper only after the fixture has signed the correct target and state.
+        bad_signature.signature = SignedExecutionProofEnvelope::default().signature;
+        let bookkeeping = execution_proof_bookkeeping(&bad_signature_store);
+        assert_preparation_rejected(&bad_signature_store, &bad_signature, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeInvalidSignature { .. })
+        });
+        assert_execution_proof_bookkeeping_unchanged(&bad_signature_store, &bookkeeping);
+    }
+
+    #[test]
+    fn execution_proof_preparation_ignores_unavailable_context_before_authentication() {
+        let (no_payload, _, mut signed_proof) = proof_preparation_fixture(FAR_FUTURE_EPOCH, false);
+        signed_proof.signature = SignedExecutionProofEnvelope::default().signature;
+        let bookkeeping = execution_proof_bookkeeping(&no_payload);
+        assert!(matches!(
+            crate::prepare_execution_proof(&no_payload, &signed_proof),
+            Ok(crate::ExecutionProofPreparation::Ignore(
+                "execution proof's payload has not been accepted"
+            ))
+        ));
+        assert_execution_proof_bookkeeping_unchanged(&no_payload, &bookkeeping);
+
+        let (mut marker_only, _, mut signed_proof) =
+            proof_preparation_fixture(FAR_FUTURE_EPOCH, false);
+        marker_only
+            .payloads
+            .insert(signed_proof.message.beacon_block_root);
+        signed_proof.signature = SignedExecutionProofEnvelope::default().signature;
+        let bookkeeping = execution_proof_bookkeeping(&marker_only);
+        assert!(matches!(
+            crate::prepare_execution_proof(&marker_only, &signed_proof),
+            Ok(crate::ExecutionProofPreparation::Ignore(
+                "execution proof's accepted payload envelope is unavailable"
+            ))
+        ));
+        assert_execution_proof_bookkeeping_unchanged(&marker_only, &bookkeeping);
+
+        let (mut missing_state, _, mut signed_proof) =
+            proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        missing_state
+            .finalized
+            .iter_mut()
+            .next()
+            .expect("fixture anchor must remain in the finalized chain")
+            .state = None;
+        signed_proof.signature = SignedExecutionProofEnvelope::default().signature;
+        let bookkeeping = execution_proof_bookkeeping(&missing_state);
+        assert!(matches!(
+            crate::prepare_execution_proof(&missing_state, &signed_proof),
+            Ok(crate::ExecutionProofPreparation::Ignore(
+                "execution proof's validated post-state is unavailable"
+            ))
+        ));
+        assert_execution_proof_bookkeeping_unchanged(&missing_state, &bookkeeping);
+    }
+
+    #[test]
+    fn execution_proof_preparation_preserves_spec_precheck_precedence() {
+        let (mut store, _, signed_proof) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        let block_root = signed_proof.message.beacon_block_root;
+        let unknown_root = H256::repeat_byte(0xee);
+
+        let mut empty_unknown = signed_proof.clone();
+        empty_unknown.message.proof_data = ProofData::default();
+        empty_unknown.message.beacon_block_root = unknown_root;
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        assert_preparation_rejected(&store, &empty_unknown, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeEmptyProof)
+        });
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+        let mut unsupported_unknown = signed_proof.clone();
+        unsupported_unknown.message.proof_type = 0;
+        unsupported_unknown.message.beacon_block_root = unknown_root;
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        assert_preparation_rejected(&store, &unsupported_unknown, |error| {
+            matches!(
+                error,
+                Error::ExecutionProofEnvelopeUnsupportedProofType { proof_type: 0 }
+            )
+        });
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+        let mut unknown = signed_proof.clone();
+        unknown.message.beacon_block_root = unknown_root;
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        assert!(matches!(
+            crate::prepare_execution_proof(&store, &unknown),
+            Ok(crate::ExecutionProofPreparation::Ignore(
+                "execution proof's beacon block has not been seen"
+            ))
+        ));
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+        store
+            .execution_proofs
+            .entry(block_root)
+            .or_default()
+            .insert(1, signed_proof.message.as_ref().clone());
+        store
+            .execution_proof_roots
+            .entry(block_root)
+            .or_default()
+            .insert(signed_proof.message.hash_tree_root());
+        store.execution_proof_provers.insert((block_root, 1, 0));
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        assert!(matches!(
+            crate::prepare_execution_proof(&store, &signed_proof),
+            Ok(crate::ExecutionProofPreparation::Ignore(
+                "verified proof already known for this beacon block and proof type"
+            ))
+        ));
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+        store.execution_proofs.remove(&block_root);
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        assert!(matches!(
+            crate::prepare_execution_proof(&store, &signed_proof),
+            Ok(crate::ExecutionProofPreparation::Ignore(
+                "execution proof has already been processed"
+            ))
+        ));
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+        store.execution_proof_roots.remove(&block_root);
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        assert!(matches!(
+            crate::prepare_execution_proof(&store, &signed_proof),
+            Ok(crate::ExecutionProofPreparation::Ignore(
+                "proof already seen from this prover for this beacon block and proof type"
+            ))
+        ));
+        assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+    }
+
+    #[test]
+    fn execution_proof_preparation_propagates_binding_failures_as_local_errors() {
+        let (store, state, signed_proof) = pre_gloas_proof_preparation_fixture();
+        store
+            .verify_execution_proof_envelope(&state, &signed_proof)
+            .expect("the binding-failure fixture must authenticate successfully first");
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        let Err(error) = crate::prepare_execution_proof(&store, &signed_proof) else {
+            panic!("pre-Gloas trusted context cannot reconstruct an execution proof");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("execution proof binding requires a Gloas state"),
+            "binding failure should remain diagnosable as a local error: {error:#}"
+        );
+        assert!(
+            error.downcast_ref::<Error<Minimal>>().is_none(),
+            "binding failure must not be turned into a peer-invalid Store rejection"
         );
         assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
     }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use ssz::SszHash as _;
 use std_ext::ArcExt as _;
 use types::{
@@ -19,40 +19,51 @@ use types::{
 use crate::{Error, Store, misc::Storage};
 
 /// Result of the read-only, spec-ordered checks before payload/context preparation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Consumed by the future execution-proof preparation path"
-    )
-)]
-pub enum ExecutionProofPrecheck {
+pub enum ExecutionProofPrecheck<'a> {
     Ignore(&'static str),
-    Continue(PrecheckedExecutionProof),
+    Continue(PrecheckedExecutionProof<'a>),
 }
 
 /// The early-checked identity carried forward; this is not authenticated or prepared.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PrecheckedExecutionProof {
-    pub(crate) beacon_block_root: H256,
-    pub(crate) proof_type: u8,
-    pub(crate) validator_index: ValidatorIndex,
-    pub(crate) envelope_root: H256,
+/// Its private borrow ties the cached bare-envelope root to the exact signed input.
+#[derive(Clone, Copy)]
+pub struct PrecheckedExecutionProof<'a> {
+    signed_envelope: &'a SignedExecutionProofEnvelope,
+    beacon_block_root: H256,
+    proof_type: u8,
+    validator_index: ValidatorIndex,
+    envelope_root: H256,
+}
+
+#[cfg(test)]
+impl PrecheckedExecutionProof<'_> {
+    #[must_use]
+    pub const fn beacon_block_root(&self) -> H256 {
+        self.beacon_block_root
+    }
+
+    #[must_use]
+    pub const fn proof_type(&self) -> u8 {
+        self.proof_type
+    }
+
+    #[must_use]
+    pub const fn validator_index(&self) -> ValidatorIndex {
+        self.validator_index
+    }
+
+    #[must_use]
+    pub const fn envelope_root(&self) -> H256 {
+        self.envelope_root
+    }
 }
 
 /// Applies only the early gossip checks. It is deliberately read-only and does not
 /// load payload/state context, authenticate the signature, or construct a prepared proof.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Consumed by the future execution-proof preparation path"
-    )
-)]
-pub fn precheck_execution_proof<P: Preset, S: Storage<P>>(
+pub fn precheck_execution_proof<'a, P: Preset, S: Storage<P>>(
     store: &Store<P, S>,
-    signed_envelope: &SignedExecutionProofEnvelope,
-) -> Result<ExecutionProofPrecheck> {
+    signed_envelope: &'a SignedExecutionProofEnvelope,
+) -> Result<ExecutionProofPrecheck<'a>> {
     let envelope = signed_envelope.message.as_ref();
 
     if envelope.proof_data.as_bytes().is_empty() {
@@ -106,6 +117,7 @@ pub fn precheck_execution_proof<P: Preset, S: Storage<P>>(
     }
 
     Ok(ExecutionProofPrecheck::Continue(PrecheckedExecutionProof {
+        signed_envelope,
         beacon_block_root,
         proof_type: envelope.proof_type,
         validator_index,
@@ -114,13 +126,6 @@ pub fn precheck_execution_proof<P: Preset, S: Storage<P>>(
 }
 
 /// Result of loading the exact accepted payload and validated post-state for a proof target.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Consumed by the future execution-proof preparation path"
-    )
-)]
 pub enum ExecutionProofContextLoad<P: Preset> {
     Ignore(&'static str),
     Continue {
@@ -131,16 +136,9 @@ pub enum ExecutionProofContextLoad<P: Preset> {
 
 /// Loads the accepted payload and exact validated post-state for the prechecked block.
 /// Missing or inconsistent local context is an IGNORE, not a peer-invalid proof verdict.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Consumed by the future execution-proof preparation path"
-    )
-)]
 pub fn load_execution_proof_context<P: Preset, S: Storage<P>>(
     store: &Store<P, S>,
-    prechecked: &PrecheckedExecutionProof,
+    prechecked: &PrecheckedExecutionProof<'_>,
 ) -> ExecutionProofContextLoad<P> {
     let block_root = prechecked.beacon_block_root;
 
@@ -179,6 +177,69 @@ pub fn load_execution_proof_context<P: Preset, S: Storage<P>>(
     }
 }
 
+/// Result of assembling authentication and binding after the ordered prechecks.
+///
+/// `Ignore` is a local decline, not protocol rejection or final gossip ACCEPT. Errors retain
+/// the existing typed Store rejection for invalid precheck/auth input; binding and private
+/// consistency errors remain local errors.
+pub enum ExecutionProofPreparation {
+    Ignore(&'static str),
+    Prepared(Box<PreparedExecutionProof>),
+}
+
+/// Runs the spec-ordered preparation path without consuming Seen keys or storing a proof.
+///
+/// The returned carrier can only be constructed after the signed envelope authenticates
+/// against the exact target post-state and its engine input is reconstructed from the
+/// accepted payload in that same context.
+///
+/// # Errors
+///
+/// Envelope-related typed [`Error`] values indicate protocol rejection. Arbitrary
+/// [`anyhow::Error`] values, including binding and internal consistency failures, are local
+/// failures and must not be classified as peer rejection. Missing or unavailable local context
+/// is returned as [`ExecutionProofPreparation::Ignore`].
+pub fn prepare_execution_proof<P: Preset, S: Storage<P>>(
+    store: &Store<P, S>,
+    signed_envelope: &SignedExecutionProofEnvelope,
+) -> Result<ExecutionProofPreparation> {
+    let prechecked = match precheck_execution_proof(store, signed_envelope)? {
+        ExecutionProofPrecheck::Ignore(reason) => {
+            return Ok(ExecutionProofPreparation::Ignore(reason));
+        }
+        ExecutionProofPrecheck::Continue(prechecked) => prechecked,
+    };
+
+    let (state, payload_envelope) = match load_execution_proof_context(store, &prechecked) {
+        ExecutionProofContextLoad::Ignore(reason) => {
+            return Ok(ExecutionProofPreparation::Ignore(reason));
+        }
+        ExecutionProofContextLoad::Continue {
+            state,
+            payload_envelope,
+        } => (state, payload_envelope),
+    };
+
+    store.verify_execution_proof_envelope(&state, signed_envelope)?;
+    let execution_proof = store.get_execution_proof(
+        &state,
+        signed_envelope.message.as_ref(),
+        &payload_envelope.message,
+    )?;
+    let context_identity = ExecutionProofContextIdentity::new(
+        prechecked.beacon_block_root,
+        execution_proof.public_input,
+    );
+    let prepared = PreparedExecutionProof::from_validated_context(
+        execution_proof,
+        context_identity,
+        prechecked,
+    )
+    .ok_or_else(|| anyhow!("execution proof preparation produced inconsistent bound data"))?;
+
+    Ok(ExecutionProofPreparation::Prepared(Box::new(prepared)))
+}
+
 /// Content identity of the trusted context used to reconstruct an execution proof.
 ///
 /// The beacon root scopes the accepted context; the complete public input captures
@@ -195,13 +256,6 @@ impl ExecutionProofContextIdentity {
     ///
     /// The preparation path in this module must supply values derived from the
     /// target's trusted context.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Used by the future execution-proof preparation path"
-        )
-    )]
     #[must_use]
     const fn new(beacon_block_root: H256, public_input: PublicInput) -> Self {
         Self {
@@ -231,25 +285,23 @@ pub struct PreparedExecutionProof {
     signed_envelope: SignedExecutionProofEnvelope,
     execution_proof: ExecutionProof,
     context_identity: ExecutionProofContextIdentity,
+    envelope_root: H256,
 }
 
 impl PreparedExecutionProof {
     // Keep construction private to the preparation implementation. This checks consistency
     // only; its preparation path must authenticate and establish trusted context first.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Used by the future execution-proof preparation path"
-        )
-    )]
     fn from_validated_context(
-        signed_envelope: SignedExecutionProofEnvelope,
         execution_proof: ExecutionProof,
         context_identity: ExecutionProofContextIdentity,
+        prechecked: PrecheckedExecutionProof<'_>,
     ) -> Option<Self> {
+        let signed_envelope = prechecked.signed_envelope.clone();
         let envelope = &signed_envelope.message;
-        (envelope.beacon_block_root == context_identity.beacon_block_root
+        (prechecked.beacon_block_root == envelope.beacon_block_root
+            && prechecked.proof_type == envelope.proof_type
+            && prechecked.validator_index == signed_envelope.validator_index
+            && envelope.beacon_block_root == context_identity.beacon_block_root
             && envelope.proof_type == execution_proof.proof_type
             && envelope.proof_data == execution_proof.proof_data
             && context_identity.public_input == execution_proof.public_input)
@@ -257,6 +309,9 @@ impl PreparedExecutionProof {
                 signed_envelope,
                 execution_proof,
                 context_identity,
+                // The ordered precheck already hashed the bare envelope. Carry that R
+                // forward; do not hash potentially multi-MiB proof bytes again.
+                envelope_root: prechecked.envelope_root,
             })
     }
 
@@ -280,6 +335,12 @@ impl PreparedExecutionProof {
     pub const fn context_identity(&self) -> &ExecutionProofContextIdentity {
         &self.context_identity
     }
+
+    /// Returns the already-computed root of the bare `ExecutionProofEnvelope`, not its signed wrapper.
+    #[must_use]
+    pub const fn envelope_root(&self) -> H256 {
+        self.envelope_root
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +348,18 @@ mod tests {
     use super::*;
     use ssz::Hc;
     use types::eip8025::{consts::STATELESS_INPUT_SCHEMA_ID, containers::ProofData};
+
+    fn prechecked_execution_proof(
+        signed_envelope: &SignedExecutionProofEnvelope,
+    ) -> PrecheckedExecutionProof<'_> {
+        PrecheckedExecutionProof {
+            signed_envelope,
+            beacon_block_root: signed_envelope.message.beacon_block_root,
+            proof_type: signed_envelope.message.proof_type,
+            validator_index: signed_envelope.validator_index,
+            envelope_root: signed_envelope.message.as_ref().hash_tree_root(),
+        }
+    }
 
     fn prepared_execution_proof_fixture() -> (
         SignedExecutionProofEnvelope,
@@ -328,10 +401,11 @@ mod tests {
         let (signed_envelope, execution_proof, context_identity) =
             prepared_execution_proof_fixture();
         let expected_message = signed_envelope.message.as_ref().clone();
+        let prechecked = prechecked_execution_proof(&signed_envelope);
         let prepared = PreparedExecutionProof::from_validated_context(
-            signed_envelope.clone(),
             execution_proof.clone(),
             context_identity,
+            prechecked,
         )
         .expect("consistent carrier parts should refer to the same statement");
 
@@ -339,6 +413,11 @@ mod tests {
         assert_eq!(signed_message, &expected_message);
         assert_eq!(prepared.validator_index(), signed_envelope.validator_index);
         assert_eq!(prepared.execution_proof(), &execution_proof);
+        assert_eq!(
+            prepared.envelope_root(),
+            signed_envelope.message.as_ref().hash_tree_root(),
+            "prepared provenance carries the bare-envelope root computed by precheck"
+        );
         assert_eq!(
             prepared.context_identity().beacon_block_root(),
             context_identity.beacon_block_root()
@@ -354,12 +433,13 @@ mod tests {
         let (signed_envelope, execution_proof, mut context_identity) =
             prepared_execution_proof_fixture();
         context_identity.beacon_block_root = H256::repeat_byte(0x11);
+        let prechecked = prechecked_execution_proof(&signed_envelope);
 
         assert!(
             PreparedExecutionProof::from_validated_context(
-                signed_envelope,
                 execution_proof,
                 context_identity,
+                prechecked,
             )
             .is_none()
         );
@@ -370,12 +450,13 @@ mod tests {
         let (signed_envelope, mut execution_proof, context_identity) =
             prepared_execution_proof_fixture();
         execution_proof.proof_type = 2;
+        let prechecked = prechecked_execution_proof(&signed_envelope);
 
         assert!(
             PreparedExecutionProof::from_validated_context(
-                signed_envelope,
                 execution_proof,
                 context_identity,
+                prechecked,
             )
             .is_none()
         );
@@ -387,12 +468,13 @@ mod tests {
             prepared_execution_proof_fixture();
         execution_proof.proof_data =
             ProofData::try_from(vec![0x43]).expect("one byte is within the proof-data bound");
+        let prechecked = prechecked_execution_proof(&signed_envelope);
 
         assert!(
             PreparedExecutionProof::from_validated_context(
-                signed_envelope,
                 execution_proof,
                 context_identity,
+                prechecked,
             )
             .is_none()
         );
@@ -402,14 +484,15 @@ mod tests {
     fn prepared_execution_proof_rejects_each_public_input_field_mismatch() {
         let (signed_envelope, execution_proof, context_identity) =
             prepared_execution_proof_fixture();
+        let prechecked = prechecked_execution_proof(&signed_envelope);
 
         let mut mismatched_proof = execution_proof.clone();
         mismatched_proof.public_input.new_payload_request_root = H256::repeat_byte(0x23);
         assert!(
             PreparedExecutionProof::from_validated_context(
-                signed_envelope.clone(),
                 mismatched_proof,
                 context_identity,
+                prechecked,
             )
             .is_none(),
             "new_payload_request_root mismatch must be rejected"
@@ -419,9 +502,9 @@ mod tests {
         mismatched_proof.public_input.successful_validation = false;
         assert!(
             PreparedExecutionProof::from_validated_context(
-                signed_envelope.clone(),
                 mismatched_proof,
                 context_identity,
+                prechecked,
             )
             .is_none(),
             "successful_validation mismatch must be rejected"
@@ -431,9 +514,9 @@ mod tests {
         mismatched_proof.public_input.chain_id = 2;
         assert!(
             PreparedExecutionProof::from_validated_context(
-                signed_envelope.clone(),
                 mismatched_proof,
                 context_identity,
+                prechecked,
             )
             .is_none(),
             "chain_id mismatch must be rejected"
@@ -443,12 +526,54 @@ mod tests {
         mismatched_proof.public_input.schema_id = STATELESS_INPUT_SCHEMA_ID + 1;
         assert!(
             PreparedExecutionProof::from_validated_context(
-                signed_envelope,
                 mismatched_proof,
                 context_identity,
+                prechecked,
             )
             .is_none(),
             "schema_id mismatch must be rejected"
+        );
+    }
+
+    #[test]
+    fn prepared_execution_proof_rejects_precheck_identity_mismatch() {
+        let (signed_envelope, execution_proof, context_identity) =
+            prepared_execution_proof_fixture();
+
+        let mut prechecked = prechecked_execution_proof(&signed_envelope);
+        prechecked.beacon_block_root = H256::repeat_byte(0x11);
+        assert!(
+            PreparedExecutionProof::from_validated_context(
+                execution_proof.clone(),
+                context_identity,
+                prechecked,
+            )
+            .is_none(),
+            "precheck block root must match the signed envelope"
+        );
+
+        let mut prechecked = prechecked_execution_proof(&signed_envelope);
+        prechecked.proof_type = 2;
+        assert!(
+            PreparedExecutionProof::from_validated_context(
+                execution_proof.clone(),
+                context_identity,
+                prechecked,
+            )
+            .is_none(),
+            "precheck proof type must match the signed envelope"
+        );
+
+        let mut prechecked = prechecked_execution_proof(&signed_envelope);
+        prechecked.validator_index += 1;
+        assert!(
+            PreparedExecutionProof::from_validated_context(
+                execution_proof,
+                context_identity,
+                prechecked,
+            )
+            .is_none(),
+            "precheck validator index must match the signed envelope"
         );
     }
 
