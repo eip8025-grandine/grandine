@@ -1298,7 +1298,7 @@ mod tests {
                 matches!(
                     message,
                     MutatorMessage::ExecutionProof {
-                        result: Ok(ExecutionProofAction::Ignore(_)),
+                        result: Ok(ExecutionProofAction::Ignore("stub pipeline")),
                         ..
                     }
                 ),
@@ -1317,7 +1317,7 @@ mod tests {
             matches!(
                 message,
                 MutatorMessage::ExecutionProof {
-                    result: Ok(ExecutionProofAction::Ignore(_)),
+                    result: Ok(ExecutionProofAction::Ignore("proof engine not enabled")),
                     ..
                 }
             ),
