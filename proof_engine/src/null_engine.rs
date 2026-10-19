@@ -1,24 +1,17 @@
-use types::{
-    eip8025::{
-        containers::{ExecutionProof, NewPayloadRequest, ProofAttributes},
-        primitives::ProofType,
-    },
-    phase0::primitives::H256,
-    preset::Preset,
-};
+use types::eip8025::containers::ExecutionProof;
 
-use crate::engine::{ProofEngineError, ProofProver, ProofVerifier};
+use crate::engine::ProofEngine;
 
-/// The opt-out [`ProofVerifier`].
+/// The opt-out [`ProofEngine`].
 ///
-/// The task short-circuits on [`is_null`](ProofVerifier::is_null) before any
+/// The task short-circuits on [`is_null`](ProofEngine::is_null) before any
 /// pipeline work, so the fail-closed
-/// [`verify_execution_proof`](ProofVerifier::verify_execution_proof) is
+/// [`verify_execution_proof`](ProofEngine::verify_execution_proof) is
 /// unreachable in practice.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct NullProofEngine;
 
-impl ProofVerifier for NullProofEngine {
+impl ProofEngine for NullProofEngine {
     fn is_null(&self) -> bool {
         true
     }
@@ -28,48 +21,11 @@ impl ProofVerifier for NullProofEngine {
     }
 }
 
-impl<P: Preset> ProofProver<P> for NullProofEngine {
-    fn request_proofs(
-        &self,
-        _new_payload_request: NewPayloadRequest<P>,
-        _chain_id: u64,
-        _schema_id: u16,
-        _proof_attributes: ProofAttributes,
-    ) -> Result<H256, ProofEngineError> {
-        Err(ProofEngineError::Unsupported)
-    }
-
-    fn get_proof(
-        &self,
-        _new_payload_request_root: H256,
-        _proof_type: ProofType,
-    ) -> Result<ExecutionProof, ProofEngineError> {
-        Err(ProofEngineError::Unsupported)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use types::{
-        eip8025::containers::{ProofData, PublicInput},
-        preset::Minimal,
-    };
+    use crate::tests::test_proof;
 
     use super::*;
-
-    fn test_proof() -> ExecutionProof {
-        ExecutionProof {
-            proof_data: ProofData::try_from(vec![1, 2, 3])
-                .expect("small proof data should be within bounds"),
-            proof_type: 1,
-            public_input: PublicInput {
-                new_payload_request_root: H256::default(),
-                successful_validation: true,
-                chain_id: 5,
-                schema_id: 0x1501,
-            },
-        }
-    }
 
     #[test]
     fn null_engine_reports_itself_as_null() {
@@ -79,28 +35,5 @@ mod tests {
     #[test]
     fn verify_is_fail_closed() {
         assert!(!NullProofEngine.verify_execution_proof(test_proof()));
-    }
-
-    #[test]
-    fn prover_methods_reject() {
-        let error = <NullProofEngine as ProofProver<Minimal>>::request_proofs(
-            &NullProofEngine,
-            NewPayloadRequest::default(),
-            5,
-            0x1501,
-            ProofAttributes::default(),
-        )
-        .expect_err("null engine should reject proof generation");
-
-        assert!(matches!(error, ProofEngineError::Unsupported));
-
-        let error = <NullProofEngine as ProofProver<Minimal>>::get_proof(
-            &NullProofEngine,
-            H256::default(),
-            1,
-        )
-        .expect_err("null engine should reject proof retrieval");
-
-        assert!(matches!(error, ProofEngineError::Unsupported));
     }
 }
