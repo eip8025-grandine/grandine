@@ -6043,6 +6043,7 @@ dependencies = [
  "panics",
  "parking_lot",
  "prometheus_metrics",
+ "proof_engine",
  "pubkey_cache",
  "reqwest 0.13.2",
  "scc 3.7.0",
