@@ -23,7 +23,7 @@ use helper_functions::{
 };
 use logging::{debug_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
-use proof_engine::ProofVerifier;
+use proof_engine::ProofEngine;
 use pubkey_cache::PubkeyCache;
 use spec_test_utils::BlsSetting;
 use ssz::SszHash as _;
@@ -726,7 +726,7 @@ impl<P: Preset, W> Run for ExecutionPayloadBidTask<P, W> {
 
 pub struct ProcessExecutionProofTask<P: Preset, W> {
     pub store_snapshot: Arc<Store<P, Storage<P>>>,
-    pub proof_verifier: Arc<dyn ProofVerifier>,
+    pub proof_engine: Arc<dyn ProofEngine>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub signed_proof: Arc<SignedExecutionProofEnvelope>,
     pub origin: ExecutionProofOrigin,
@@ -737,7 +737,7 @@ impl<P: Preset, W> Run for ProcessExecutionProofTask<P, W> {
     fn run(self) {
         let Self {
             store_snapshot,
-            proof_verifier,
+            proof_engine,
             mutator_tx,
             signed_proof,
             origin,
@@ -746,7 +746,7 @@ impl<P: Preset, W> Run for ProcessExecutionProofTask<P, W> {
         // Reserved for the spec-ordered pipeline follow-up.
         let _ = (&store_snapshot, &signed_proof);
 
-        let result = if proof_verifier.is_null() {
+        let result = if proof_engine.is_null() {
             Ok(ExecutionProofAction::Ignore("proof engine not enabled"))
         } else {
             // TODO(eip8025-grandine): spec-ordered pipeline
@@ -1226,7 +1226,7 @@ mod tests {
 
     use eth2_libp2p::GossipId;
     use fork_choice_store::{ExecutionProofAction, ExecutionProofOrigin};
-    use proof_engine::{MockProofEngine, NullProofEngine, ProofVerifier};
+    use proof_engine::{MockProofEngine, NullProofEngine, ProofEngine};
     use pubkey_cache::PubkeyCache;
     use ssz::Hc;
     use types::{
@@ -1258,7 +1258,7 @@ mod tests {
         })
     }
 
-    fn run_stub_task(proof_verifier: Arc<dyn ProofVerifier>) -> MutatorMessage<Minimal, ()> {
+    fn run_stub_task(proof_engine: Arc<dyn ProofEngine>) -> MutatorMessage<Minimal, ()> {
         let config = Arc::new(Config::minimal());
         let genesis_state = factory::min_genesis_state::<Minimal>(&config, &PubkeyCache::default())
             .expect("should build beacon state")
@@ -1271,7 +1271,7 @@ mod tests {
 
         ProcessExecutionProofTask {
             store_snapshot: controller.owned_store_snapshot(),
-            proof_verifier,
+            proof_engine,
             mutator_tx,
             signed_proof: test_signed_proof(),
             origin: ExecutionProofOrigin::Gossip(GossipId::default()),
@@ -1286,10 +1286,10 @@ mod tests {
     #[test]
     fn stub_pipeline_ignores_against_mock_engine() {
         for execution_proof_valid in [true, false] {
-            let proof_verifier: Arc<dyn ProofVerifier> =
+            let proof_engine: Arc<dyn ProofEngine> =
                 Arc::new(MockProofEngine::new(execution_proof_valid));
 
-            let message = run_stub_task(proof_verifier);
+            let message = run_stub_task(proof_engine);
 
             assert!(
                 matches!(
@@ -1306,9 +1306,9 @@ mod tests {
 
     #[test]
     fn null_proof_engine_short_circuits_to_ignore() {
-        let proof_verifier: Arc<dyn ProofVerifier> = Arc::new(NullProofEngine);
+        let proof_engine: Arc<dyn ProofEngine> = Arc::new(NullProofEngine);
 
-        let message = run_stub_task(proof_verifier);
+        let message = run_stub_task(proof_engine);
 
         assert!(
             matches!(
