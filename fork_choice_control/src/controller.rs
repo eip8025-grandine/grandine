@@ -31,7 +31,7 @@ use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSe
 use genesis::AnchorCheckpointProvider;
 use logging::debug_with_peers;
 use prometheus_metrics::Metrics;
-use proof_engine::ProofVerifier;
+use proof_engine::ProofEngine;
 use pubkey_cache::PubkeyCache;
 use scc::HashMap as SccHashMap;
 use spec_test_utils::BlsSetting;
@@ -1006,11 +1006,11 @@ where
         &self,
         signed_proof: Arc<SignedExecutionProofEnvelope>,
         origin: ExecutionProofOrigin,
-        proof_verifier: Arc<dyn ProofVerifier>,
+        proof_engine: Arc<dyn ProofEngine>,
     ) {
         self.spawn(ProcessExecutionProofTask {
             store_snapshot: self.owned_store_snapshot(),
-            proof_verifier,
+            proof_engine,
             mutator_tx: self.owned_mutator_tx(),
             signed_proof,
             origin,
