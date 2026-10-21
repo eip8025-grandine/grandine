@@ -13,7 +13,12 @@ use types::{
     phase0::primitives::ChainId,
 };
 
+#[cfg(feature = "sp1")]
+use ere_verifier_sp1::{SP1ProgramVk, SP1Verifier, codec::Decode as _};
+
 use crate::{backend::Backend, engine::ProofEngine, zkboost_mock::ZkboostMockBackend};
+#[cfg(feature = "sp1")]
+use crate::{backend::Binding, ere_backend::EreBackend};
 
 // Also covers mainnet shadow forks, which keep the mainnet chain ID.
 const MAINNET_CHAIN_ID: ChainId = 1;
@@ -26,6 +31,13 @@ pub enum BackendSpec {
     /// Only the public values a mock proof claims are checked.
     /// [`ZkvmProofEngine::new`] refuses it on mainnet.
     ZkboostMock,
+    /// Real verification of ere SP1 proofs against one guest's verifying
+    /// key.
+    ///
+    /// `program_vk` is the `bytes32` digest of the guest ELF, as
+    /// `cargo prove vkey` prints it. It is the trust root.
+    #[cfg(feature = "sp1")]
+    Sp1 { program_vk: [u8; 32] },
 }
 
 #[derive(Debug, Error)]
@@ -36,6 +48,12 @@ pub enum ConstructionError {
     DuplicateProofType { proof_type: ProofType },
     #[error("proof type {proof_type} uses mock verification, which is refused on mainnet")]
     MockOnMainnet { proof_type: ProofType },
+    #[cfg(feature = "sp1")]
+    #[error("proof type {proof_type} has an SP1 verifying key that does not decode")]
+    InvalidVerifyingKey {
+        proof_type: ProofType,
+        source: ere_verifier_sp1::Error,
+    },
 }
 
 /// Why [`ZkvmProofEngine::check`] rejected a proof.
@@ -100,6 +118,24 @@ impl ZkvmProofEngine {
                     Entry {
                         backend: Box::new(ZkboostMockBackend),
                         mock: true,
+                    }
+                }
+                #[cfg(feature = "sp1")]
+                BackendSpec::Sp1 { program_vk } => {
+                    let program_vk =
+                        SP1ProgramVk::decode_from_slice(&program_vk).map_err(|source| {
+                            ConstructionError::InvalidVerifyingKey { proof_type, source }
+                        })?;
+
+                    // This initializes ere's process-wide SP1 verifier, so its
+                    // one-time setup cost falls on construction rather than on
+                    // the first proof. Every SP1 backend shares it.
+                    let verifier = SP1Verifier::new(program_vk);
+
+                    // SP1 commits the public values unpadded.
+                    Entry {
+                        backend: Box::new(EreBackend::new(verifier, Binding::Exact)),
+                        mock: false,
                     }
                 }
             };
@@ -638,5 +674,282 @@ mod tests {
         public_input
             .to_ssz()
             .expect("public input should be serializable")
+    }
+
+    // Real verification. These cases use `Config::mainnet()`, which shows
+    // the mainnet guard does not affect real verification.
+    #[cfg(feature = "sp1")]
+    mod sp1 {
+        use hex_literal::hex;
+
+        use super::*;
+
+        // ethrex on SP1 in zkboost's provisional numbering.
+        const SP1_PROOF_TYPE: ProofType = 2;
+
+        // A genuine zkboost execution proof and the public values its guest
+        // commits, from zkboost `b83a23f9`
+        // `crates/mock-beacon-node/tests/fixture/`. The blobs equal
+        // Lighthouse `274af519`'s copies. sha256:
+        // - `stateless-validator-ethrex-sp1-v6.4.0.proof`:
+        //   `bc57e1a62930472a8a45d0b0490105deb3c10e4c9eedeca0f226a6409c4e8237`
+        // - `public_values.bin`:
+        //   `2bb490a0d717c8b53c9001b112a523bbaf58348f27a9d75d979e5d3aa66ae0e8`
+        const ETHREX_SP1_PROOF: &[u8] =
+            include_bytes!("fixtures/stateless-validator-ethrex-sp1-v6.4.0.proof");
+        const COMMITTED_PUBLIC_VALUES: &[u8] = include_bytes!("fixtures/public_values.bin");
+
+        // The proof embeds its public values here, after an 8-byte length.
+        const EMBEDDED_PUBLIC_VALUES_OFFSET: usize = 1_272_554;
+
+        // Guest VKs, as `cargo prove vkey` prints them. Each matches its
+        // guest's GitHub release, ere-guests v0.17.0's `vk_sha256` and
+        // Lighthouse's hex.
+        // ethrex v26.0.0, sha256
+        // `5e614b666d4f9a60a68d826833b94e2c5afa029b2dc501a45f3656059811a4d7`.
+        const ETHREX_VK: [u8; 32] =
+            hex!("00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b");
+        // reth v0.1.0-rc.3, sha256
+        // `420933f79a82fcb40880a97f0efb7780e6f939cbf6a0bbec716de24b8033df28`.
+        const RETH_VK: [u8; 32] =
+            hex!("00a03cbfa95559cfee3b45ef925f3f7a631181e35e774e92b040277d893511dd");
+
+        #[test]
+        fn fixture_embeds_committed_public_values() {
+            let end = EMBEDDED_PUBLIC_VALUES_OFFSET + COMMITTED_PUBLIC_VALUES.len();
+
+            assert_eq!(
+                &ETHREX_SP1_PROOF[EMBEDDED_PUBLIC_VALUES_OFFSET - 8..EMBEDDED_PUBLIC_VALUES_OFFSET],
+                43_u64.to_le_bytes(),
+            );
+            assert_eq!(
+                &ETHREX_SP1_PROOF[EMBEDDED_PUBLIC_VALUES_OFFSET..end],
+                COMMITTED_PUBLIC_VALUES,
+            );
+            assert_eq!(
+                committed_public_input(),
+                PublicInput {
+                    new_payload_request_root: H256(hex!(
+                        "68e2250786a622ab175a8149c63d220704e7ed9610a12b7864047510235e7bb7"
+                    )),
+                    successful_validation: true,
+                    chain_id: MAINNET_CHAIN_ID,
+                    schema_id: STATELESS_INPUT_SCHEMA_ID,
+                },
+            );
+        }
+
+        #[test]
+        fn primary_proof_verifies() {
+            check(
+                &sp1_engine(ETHREX_VK),
+                sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
+            )
+            .expect("genuine proof should verify under its guest's VK");
+        }
+
+        #[test]
+        fn primary_proof_fails_under_other_vk() {
+            assert_rejection(
+                &sp1_engine(RETH_VK),
+                sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
+                |rejection| matches!(rejection, Rejection::Verify(_)),
+            );
+        }
+
+        // The input matches the tampered values, so only the proof can
+        // reject them.
+        #[test]
+        fn tampered_public_values_fail_verification() {
+            let mut proof_data = ETHREX_SP1_PROOF.to_vec();
+            proof_data[EMBEDDED_PUBLIC_VALUES_OFFSET] ^= 1;
+
+            let mut root = committed_public_input().new_payload_request_root;
+            root.as_bytes_mut()[0] ^= 1;
+
+            let public_input = PublicInput {
+                new_payload_request_root: root,
+                ..committed_public_input()
+            };
+
+            assert_rejection(
+                &sp1_engine(ETHREX_VK),
+                sp1_proof(&proof_data, public_input),
+                |rejection| matches!(rejection, Rejection::Verify(_)),
+            );
+        }
+
+        #[test]
+        fn rejects_undecodable_proof_data() {
+            let undecodable = [
+                // Empty.
+                &[][..],
+                // Truncated.
+                &ETHREX_SP1_PROOF[..ETHREX_SP1_PROOF.len() - 1],
+                // Garbage.
+                &[0xff; 1024][..],
+            ];
+
+            for proof_data in undecodable {
+                assert_rejection(
+                    &sp1_engine(ETHREX_VK),
+                    sp1_proof(proof_data, committed_public_input()),
+                    |rejection| matches!(rejection, Rejection::Decode(_)),
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_trailing_bytes() {
+            let mut proof_data = ETHREX_SP1_PROOF.to_vec();
+            proof_data.push(0);
+
+            assert_rejection(
+                &sp1_engine(ETHREX_VK),
+                sp1_proof(&proof_data, committed_public_input()),
+                |rejection| matches!(rejection, Rejection::Decode(_)),
+            );
+        }
+
+        #[test]
+        fn rejects_changed_public_input() {
+            let committed = committed_public_input();
+
+            let changed_inputs = [
+                PublicInput {
+                    new_payload_request_root: H256::repeat_byte(0x22),
+                    ..committed
+                },
+                PublicInput {
+                    chain_id: DEVNET_CHAIN_ID,
+                    ..committed
+                },
+                PublicInput {
+                    schema_id: STATELESS_INPUT_SCHEMA_ID + 1,
+                    ..committed
+                },
+            ];
+
+            for public_input in changed_inputs {
+                assert_rejection(
+                    &sp1_engine(ETHREX_VK),
+                    sp1_proof(ETHREX_SP1_PROOF, public_input),
+                    |rejection| matches!(rejection, Rejection::PublicValuesMismatch),
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_unsuccessful_validation() {
+            let public_input = PublicInput {
+                successful_validation: false,
+                ..committed_public_input()
+            };
+
+            assert_rejection(
+                &sp1_engine(ETHREX_VK),
+                sp1_proof(ETHREX_SP1_PROOF, public_input),
+                |rejection| matches!(rejection, Rejection::UnsuccessfulValidation),
+            );
+        }
+
+        #[test]
+        fn rejects_unsupported_proof_types() {
+            for proof_type in [0, 255, MOCK_PROOF_TYPE] {
+                let proof = ExecutionProof {
+                    proof_type,
+                    ..sp1_proof(ETHREX_SP1_PROOF, committed_public_input())
+                };
+
+                assert_rejection(&sp1_engine(ETHREX_VK), proof, |rejection| {
+                    matches!(
+                        rejection,
+                        Rejection::UnsupportedProofType { proof_type: rejected }
+                            if *rejected == proof_type
+                    )
+                });
+            }
+        }
+
+        // A real type never falls back to mock verification, even when the
+        // engine also has a mock type.
+        #[test]
+        fn mock_proof_under_sp1_type_fails_to_decode() {
+            let engine = ZkvmProofEngine::new(
+                &Config::minimal(),
+                [
+                    (
+                        SP1_PROOF_TYPE,
+                        BackendSpec::Sp1 {
+                            program_vk: ETHREX_VK,
+                        },
+                    ),
+                    (MOCK_PROOF_TYPE, BackendSpec::ZkboostMock),
+                ],
+            )
+            .expect("SP1 and mock backends should be accepted off mainnet");
+
+            let engine = Arc::new(engine);
+            let mock_proof = mock_proof(test_public_input());
+
+            check(&engine, mock_proof.clone()).expect("mock proof should pass under its mock type");
+
+            let under_sp1 = ExecutionProof {
+                proof_type: SP1_PROOF_TYPE,
+                ..mock_proof
+            };
+
+            assert_rejection(&engine, under_sp1, |rejection| {
+                matches!(rejection, Rejection::Decode(_))
+            });
+        }
+
+        #[test]
+        fn construction_rejects_undecodable_vk() {
+            // Not a canonical packing of KoalaBear field elements.
+            let result = ZkvmProofEngine::new(
+                &Config::mainnet(),
+                [(
+                    SP1_PROOF_TYPE,
+                    BackendSpec::Sp1 {
+                        program_vk: [0xff; 32],
+                    },
+                )],
+            );
+
+            assert!(
+                matches!(
+                    result,
+                    Err(ConstructionError::InvalidVerifyingKey {
+                        proof_type: SP1_PROOF_TYPE,
+                        ..
+                    }),
+                ),
+                "{:?}",
+                result.err(),
+            );
+        }
+
+        fn sp1_engine(program_vk: [u8; 32]) -> Arc<ZkvmProofEngine> {
+            let engine = ZkvmProofEngine::new(
+                &Config::mainnet(),
+                [(SP1_PROOF_TYPE, BackendSpec::Sp1 { program_vk })],
+            )
+            .expect("SP1 backends should be accepted on mainnet");
+
+            Arc::new(engine)
+        }
+
+        fn sp1_proof(proof_data: &[u8], public_input: PublicInput) -> ExecutionProof {
+            ExecutionProof {
+                proof_type: SP1_PROOF_TYPE,
+                ..proof_with_data(proof_data, public_input)
+            }
+        }
+
+        fn committed_public_input() -> PublicInput {
+            PublicInput::from_ssz_default(COMMITTED_PUBLIC_VALUES)
+                .expect("committed public values should decode")
+        }
     }
 }
