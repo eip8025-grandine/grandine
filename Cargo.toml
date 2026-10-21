@@ -327,6 +327,8 @@ enum-iterator = '2'
 enum-map = '2'
 enumset = '1'
 env_logger = '0.11'
+ere-verifier-core = { git = 'https://github.com/eth-act/ere.git', tag = 'v0.19.2' }
+ere-verifier-sp1 = { git = 'https://github.com/eth-act/ere.git', tag = 'v0.19.2' }
 ethereum-types = '0.14'
 ff = '0.13'
 fixed-hash = '0.8'
