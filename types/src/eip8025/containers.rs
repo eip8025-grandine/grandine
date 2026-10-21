@@ -85,7 +85,7 @@ pub struct SignedExecutionProofEnvelope {
 /// The Gloas `NewPayloadRequest` whose execution a proof certifies.
 ///
 /// The `new_payload_request_root` in `PublicInput` binds the proof to
-/// the payload it certifies. zkBoost proofs use
+/// the payload it certifies. zkboost proofs use
 /// `zkboost_compatible_root()` rather than `hash_tree_root()`.
 ///
 /// Defined as a `ProgressiveContainer` in the Gloas consensus specs
