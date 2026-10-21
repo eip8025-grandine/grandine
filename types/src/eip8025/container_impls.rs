@@ -1,4 +1,4 @@
-use ssz::ProgressiveList;
+use ssz::{H256, ProgressiveList, SszHash as _, hashing::hash_256_256};
 use static_assertions::const_assert_eq;
 use try_from_iterator::TryFromIterator as _;
 use typenum::Unsigned as _;
@@ -91,5 +91,40 @@ impl<P: Preset> NewPayloadRequest<P> {
             parent_beacon_block_root: *parent_beacon_block_root,
             execution_requests: execution_requests.clone(),
         })
+    }
+
+    /// The `new_payload_request_root` zkBoost and its guests commit to.
+    ///
+    /// This deliberately deviates from consensus-specs, which defines
+    /// the root as [`hash_tree_root`](ssz::SszHash::hash_tree_root) of
+    /// this progressive container. zkBoost, ere-guests and
+    /// execution-specs `tests-zkevm@v21.0.6` declare `NewPayloadRequest`
+    /// as an ordinary container instead, so no proof they produce
+    /// verifies against the canonical root.
+    ///
+    /// The field roots agree in both shapes. Only the final combination
+    /// differs: an ordinary container pads the four field roots to a
+    /// power of two, here exactly four, and hashes them pairwise to
+    /// depth 2, with no active-field mix-in. The canonical type, its SSZ
+    /// encoding and its `hash_tree_root` are unchanged.
+    #[must_use]
+    pub fn zkboost_compatible_root(&self) -> H256 {
+        let Self {
+            execution_payload,
+            versioned_hashes,
+            parent_beacon_block_root,
+            execution_requests,
+        } = self;
+
+        hash_256_256(
+            hash_256_256(
+                execution_payload.hash_tree_root(),
+                versioned_hashes.hash_tree_root(),
+            ),
+            hash_256_256(
+                parent_beacon_block_root.hash_tree_root(),
+                execution_requests.hash_tree_root(),
+            ),
+        )
     }
 }
