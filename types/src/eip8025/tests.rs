@@ -1,12 +1,13 @@
 use bls::SignatureBytes;
 use hex_literal::hex;
 use ssz::{
-    ContiguousList, H256, Hc, ProgressiveByteList, ProgressiveList, ProgressiveMerkleTree,
-    ReadError, SszHash as _, SszReadDefault as _, SszWrite as _, mix_in_active_fields,
+    ContiguousList, H256, Hc, MerkleTree, ProgressiveByteList, ProgressiveList,
+    ProgressiveMerkleTree, ReadError, SszHash as _, SszReadDefault as _, SszWrite as _,
+    mix_in_active_fields,
 };
 use test_case::test_case;
 use try_from_iterator::TryFromIterator as _;
-use typenum::Unsigned as _;
+use typenum::{U2, Unsigned as _};
 
 use crate::{
     bellatrix::containers::ExecutionPayload as BellatrixExecutionPayload,
@@ -69,10 +70,13 @@ const MAX_VERSIONED_HASHES: usize = <Mainnet as Preset>::MaxBlobCommitmentsPerBl
 // `PublicInput` and `ExecutionProof` roots given Grandine's
 // `NewPayloadRequest` root, agree with an out-of-band script written
 // from the same reading of the spec. That is a consistency check, not
-// a cross-check, and the `NewPayloadRequest` root itself is not checked
-// at all. Design 0005 requires independent verification of these roots.
+// a cross-check, and the payload-derived request root itself is not
+// checked at all. Design 0005 requires independent verification of
+// these roots.
 //
-// No root here is pyspec-checked, and no `ssz_static` vectors exist
+// The only pyspec-checked roots here are the two zkboost fixture
+// roots, `ZKBOOST_NEW_PAYLOAD_REQUEST_ROOT` and
+// `CANONICAL_NEW_PAYLOAD_REQUEST_ROOT`. No `ssz_static` vectors exist
 // for EIP-8025.
 
 // `PublicInput` is a progressive container, so its root is not simply
@@ -595,6 +599,95 @@ fn new_accepts_max_versioned_hashes() {
         request.versioned_hashes.as_ref().len(),
         MAX_VERSIONED_HASHES
     );
+}
+
+// devnet-8 block 93354 (chain 7091047534, six versioned hashes), as
+// zkboost sends it to its guests. Extracted from zkboost `b83a23f9`
+// `crates/server/tests/fixture/stateless_input_amsterdam.ssz` (blob
+// `5c0a53f9`): after the 2-byte big-endian schema ID `0x1501`, the
+// body's first two offsets (20 and 125,425) delimit the request.
+// 125,405 bytes, sha256
+// `e405a037fbc4878d4378025bdeb592678c3186c9d4c4bf6e8a0044ce11321e0a`,
+// identical to Prysm #17690's `zkboost_new_payload_request.ssz`.
+const ZKBOOST_NEW_PAYLOAD_REQUEST: &[u8] =
+    include_bytes!("fixtures/zkboost_new_payload_request.ssz");
+
+// Independently verified. Prysm #17690 pins this root, and the
+// ssz-specs Python reference reproduces it: an ordinary `Container` of
+// pyspec Gloas `ExecutionPayload`, `ProgressiveList[VersionedHash]`,
+// `Root` and `ExecutionRequests` decodes the fixture and hashes to it.
+// consensus-specs `aa16bb4c` with #5643 (`b9130f1c`) applied, ssz-specs
+// `b42af0a2`; Gloas is unchanged from `aa16bb4c` to `d9663f85`.
+const ZKBOOST_NEW_PAYLOAD_REQUEST_ROOT: H256 = H256(hex!(
+    "8c3a890206a189727e151767653f846ccddbd269eb29fb0a2f97371f23a481c6"
+));
+
+// The canonical progressive root of the same request, from the same
+// oracle run decoding into pyspec `NewPayloadRequest` with #5643.
+const CANONICAL_NEW_PAYLOAD_REQUEST_ROOT: H256 = H256(hex!(
+    "b3adcfb6aa4abf4e506e493899221d629a190019950047c93b4d95abd924deb3"
+));
+
+#[test]
+fn zkboost_fixture_ssz_round_trip() {
+    assert_fixture_round_trips::<Mainnet>();
+    assert_fixture_round_trips::<Minimal>();
+}
+
+#[test]
+fn zkboost_compatible_root_matches_reference() {
+    assert_fixture_roots::<Mainnet>();
+    assert_fixture_roots::<Minimal>();
+}
+
+// With no versioned hashes, the root is still the ordinary depth-2
+// merkleization of all four field roots, not a shorter tree.
+#[test]
+fn zkboost_compatible_root_is_depth_2_merkleization_of_field_roots() {
+    let request = NewPayloadRequest::<Mainnet>::new(
+        &test_combined_payload(),
+        &test_params_with_versioned_hashes(0),
+    )
+    .expect("request should be buildable");
+
+    assert!(request.versioned_hashes.as_ref().is_empty());
+
+    let field_roots = [
+        request.execution_payload.hash_tree_root(),
+        request.versioned_hashes.hash_tree_root(),
+        request.parent_beacon_block_root.hash_tree_root(),
+        request.execution_requests.hash_tree_root(),
+    ];
+
+    assert_eq!(
+        request.zkboost_compatible_root(),
+        MerkleTree::<U2>::merkleize_chunks(field_roots),
+    );
+    assert_ne!(request.zkboost_compatible_root(), request.hash_tree_root());
+}
+
+fn assert_fixture_round_trips<P: Preset>() {
+    let request = NewPayloadRequest::<P>::from_ssz_default(ZKBOOST_NEW_PAYLOAD_REQUEST)
+        .expect("zkboost fixture should decode");
+
+    assert_eq!(request.execution_payload.block_number, 93354);
+    assert_eq!(request.versioned_hashes.as_ref().len(), 6);
+    assert_eq!(
+        request.to_ssz().expect("request should be serializable"),
+        ZKBOOST_NEW_PAYLOAD_REQUEST,
+    );
+}
+
+fn assert_fixture_roots<P: Preset>() {
+    let request = NewPayloadRequest::<P>::from_ssz_default(ZKBOOST_NEW_PAYLOAD_REQUEST)
+        .expect("zkboost fixture should decode");
+
+    assert_eq!(
+        request.zkboost_compatible_root(),
+        ZKBOOST_NEW_PAYLOAD_REQUEST_ROOT
+    );
+    assert_ne!(request.hash_tree_root(), ZKBOOST_NEW_PAYLOAD_REQUEST_ROOT);
+    assert_eq!(request.hash_tree_root(), CANONICAL_NEW_PAYLOAD_REQUEST_ROOT);
 }
 
 fn test_params_with_versioned_hashes<P: Preset>(count: usize) -> ExecutionPayloadParams<P> {
