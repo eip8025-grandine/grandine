@@ -4298,7 +4298,9 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             proof_data: envelope.proof_data.clone(),
             proof_type: envelope.proof_type,
             public_input: PublicInput {
-                new_payload_request_root: new_payload_request.hash_tree_root(),
+                // zkBoost guests commit to the ordinary-container root, not
+                // the canonical progressive root defined by consensus-specs.
+                new_payload_request_root: new_payload_request.zkboost_compatible_root(),
                 successful_validation: true,
                 chain_id: self.chain_config.deposit_chain_id,
                 schema_id: STATELESS_INPUT_SCHEMA_ID,
@@ -8066,7 +8068,12 @@ mod tests {
 
         assert_eq!(
             proof.public_input.new_payload_request_root,
+            expected_request.zkboost_compatible_root(),
+        );
+        assert_ne!(
+            proof.public_input.new_payload_request_root,
             expected_request.hash_tree_root(),
+            "zkBoost proofs bind the compatible root, not the canonical progressive root",
         );
         assert_eq!(proof.proof_data, envelope.proof_data);
         assert_eq!(proof.proof_type, envelope.proof_type);
