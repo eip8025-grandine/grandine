@@ -74,7 +74,7 @@ const MAX_VERSIONED_HASHES: usize = <Mainnet as Preset>::MaxBlobCommitmentsPerBl
 // checked at all. Design 0005 requires independent verification of
 // these roots.
 //
-// The only pyspec-checked roots here are the two zkBoost fixture
+// The only pyspec-checked roots here are the two zkboost fixture
 // roots, `ZKBOOST_NEW_PAYLOAD_REQUEST_ROOT` and
 // `CANONICAL_NEW_PAYLOAD_REQUEST_ROOT`. No `ssz_static` vectors exist
 // for EIP-8025.
@@ -602,7 +602,7 @@ fn new_accepts_max_versioned_hashes() {
 }
 
 // devnet-8 block 93354 (chain 7091047534, six versioned hashes), as
-// zkBoost sends it to its guests. Extracted from zkBoost `b83a23f9`
+// zkboost sends it to its guests. Extracted from zkboost `b83a23f9`
 // `crates/server/tests/fixture/stateless_input_amsterdam.ssz` (blob
 // `5c0a53f9`): after the 2-byte big-endian schema ID `0x1501`, the
 // body's first two offsets (20 and 125,425) delimit the request.
@@ -668,7 +668,7 @@ fn zkboost_compatible_root_is_depth_2_merkleization_of_field_roots() {
 
 fn assert_fixture_round_trips<P: Preset>() {
     let request = NewPayloadRequest::<P>::from_ssz_default(ZKBOOST_NEW_PAYLOAD_REQUEST)
-        .expect("zkBoost fixture should decode");
+        .expect("zkboost fixture should decode");
 
     assert_eq!(request.execution_payload.block_number, 93354);
     assert_eq!(request.versioned_hashes.as_ref().len(), 6);
@@ -680,7 +680,7 @@ fn assert_fixture_round_trips<P: Preset>() {
 
 fn assert_fixture_roots<P: Preset>() {
     let request = NewPayloadRequest::<P>::from_ssz_default(ZKBOOST_NEW_PAYLOAD_REQUEST)
-        .expect("zkBoost fixture should decode");
+        .expect("zkboost fixture should decode");
 
     assert_eq!(
         request.zkboost_compatible_root(),

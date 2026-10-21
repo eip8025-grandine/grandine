@@ -93,11 +93,11 @@ impl<P: Preset> NewPayloadRequest<P> {
         })
     }
 
-    /// The `new_payload_request_root` zkBoost and its guests commit to.
+    /// The `new_payload_request_root` zkboost and its guests commit to.
     ///
     /// This deliberately deviates from consensus-specs, which defines
     /// the root as [`hash_tree_root`](ssz::SszHash::hash_tree_root) of
-    /// this progressive container. zkBoost, ere-guests and
+    /// this progressive container. zkboost, ere-guests and
     /// execution-specs `tests-zkevm@v21.0.6` declare `NewPayloadRequest`
     /// as an ordinary container instead, so no proof they produce
     /// verifies against the canonical root.
