@@ -44,3 +44,6 @@ tynm = { workspace = true }
 typenum = { workspace = true }
 types = { workspace = true }
 unwrap_none = { workspace = true }
+
+[dev-dependencies]
+bls = { workspace = true }

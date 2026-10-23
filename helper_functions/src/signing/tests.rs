@@ -15,6 +15,7 @@ use types::{
         },
         primitives::ProofType,
     },
+    gloas::beacon_state::BeaconState as GloasBeaconState,
     phase0::{beacon_state::BeaconState as Phase0BeaconState, containers::Fork},
     preset::Minimal,
 };
@@ -224,6 +225,50 @@ fn sign_and_verify_round_trip() {
     envelope
         .verify(&config, &state, 0, signature.into(), public_key)
         .expect("signature should verify");
+}
+
+// The pinned bytes independently catch drift in the envelope root, domain, or signature.
+#[test]
+fn execution_proof_envelope_signature_matches_pinned_vector() {
+    let mut bytes = SecretKeyBytes::default();
+    bytes.as_mut()[31] = 1; // Deterministic test scalar, never a real validator key.
+    let key: SecretKey = bytes.try_into().expect("scalar one is a valid secret key");
+    let public_key: bls::PublicKeyBytes = key.to_public_key().into();
+
+    let state = types::combined::BeaconState::<Minimal>::from(GloasBeaconState::<Minimal> {
+        slot: 8,
+        ..Default::default()
+    });
+    let envelope = ExecutionProofEnvelope {
+        proof_data: ProofData::try_from(vec![0x42]).expect("one proof byte is within bounds"),
+        proof_type: 1,
+        beacon_block_root: H256::zero(),
+    };
+    let config = Config::default();
+    let signature: SignatureBytes = envelope.sign(&config, &state, 8, &key).into();
+
+    envelope
+        .verify(&config, &state, 8, signature, Arc::new(key.to_public_key()))
+        .expect("generated signature should verify");
+
+    assert_eq!(
+        envelope.signing_root(&config, &state, 8),
+        H256(hex!(
+            "a567b0591a96a42c966f43664256c285189409a792dce8b1c4945f665443c002"
+        )),
+    );
+    assert_eq!(
+        public_key.as_bytes(),
+        &hex!(
+            "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb"
+        ),
+    );
+    assert_eq!(
+        signature.as_bytes(),
+        &hex!(
+            "8fce12fb9d325b05c8d64267b14a89e18ab13d0fbfaadf6c3f6d7c6b1ae8cec949e8f9936fa31f0354982d0e52e8395b051e9c97b6683b327edc51786e8b1b041a043fa4ca233120df68960d2f83490a4a0ea46504317c3764bb9f991b68460d"
+        ),
+    );
 }
 
 // (d) Tampering must fail with `SignatureKind::ExecutionProofEnvelope`.
