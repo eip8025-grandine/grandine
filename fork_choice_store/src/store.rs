@@ -8037,12 +8037,11 @@ mod tests {
         let first_root = store.head().block_root;
         let second_root = H256::repeat_byte(0xee);
 
-        // Give the second synthetic root an actual block lookup entry. This fixture
-        // isolates root-key scoping; it does not model block import or consensus validity.
-        let mut second_link = store.finalized[0].clone();
-        second_link.block_root = second_root;
-        store.finalized.push_back(second_link);
-        store.finalized_indices.insert(second_root, 1);
+        // Make the second synthetic root the only finalized block lookup entry.
+        // The first root remains a bookkeeping key, not a block lookup entry.
+        store.finalized[0].block_root = second_root;
+        store.finalized_indices.remove(&first_root);
+        store.finalized_indices.insert(second_root, 0);
 
         let first_attempt = precheck_fixture(first_root, 1, 7, vec![0x42]);
         store
@@ -8083,13 +8082,13 @@ mod tests {
         let wrong_block_root = store.head().block_root;
         let candidate_block_root = H256::repeat_byte(0xee);
 
-        // This synthetic cross-key placement isolates the collection lookup contract.
-        // A proof root normally binds its beacon block root; this is not a protocol-valid
-        // root collision or a claim about network-reachable state.
-        let mut candidate_link = store.finalized[0].clone();
-        candidate_link.block_root = candidate_block_root;
-        store.finalized.push_back(candidate_link);
-        store.finalized_indices.insert(candidate_block_root, 1);
+        // This synthetic cross-key placement isolates the collection
+        // lookup contract. A proof root normally binds its beacon
+        // block root; this is not a protocol-valid root collision or
+        // a claim about network-reachable state.
+        store.finalized[0].block_root = candidate_block_root;
+        store.finalized_indices.remove(&wrong_block_root);
+        store.finalized_indices.insert(candidate_block_root, 0);
 
         let candidate = precheck_fixture(candidate_block_root, 1, 7, vec![0x42]);
         let candidate_root = candidate.message.hash_tree_root();
@@ -8855,6 +8854,12 @@ mod tests {
                 .expect("fixture target block must remain in Store")
                 .slot()
         );
+
+        seed_execution_proof_bookkeeping(&mut store, block_root);
+        let bookkeeping = execution_proof_bookkeeping(&store);
+        let block_context_envelope = context_signed_envelope(block_root);
+        let block_prechecked = context_prechecked(&store, &block_context_envelope);
+
         // Model another valid same-slot root as the latest stored link. This is a
         // root-selection fixture, not a fork-choice head or imported competing block.
         let other_link = other_store.finalized[0].clone();
@@ -8873,10 +8878,12 @@ mod tests {
             other_root
         );
 
-        seed_execution_proof_bookkeeping(&mut store, block_root);
-        let bookkeeping = execution_proof_bookkeeping(&store);
-        let block_context_envelope = context_signed_envelope(block_root);
-        let block_prechecked = context_prechecked(&store, &block_context_envelope);
+        // TODO delete
+        //         seed_execution_proof_bookkeeping(&mut store, block_root);
+        //         let bookkeeping = execution_proof_bookkeeping(&store);
+        //         let block_context_envelope = context_signed_envelope(block_root);
+        //         let block_prechecked = context_prechecked(&store, &block_context_envelope
+        // );
         assert!(matches!(
             load_execution_proof_context(&store, &block_prechecked),
             ExecutionProofContextLoad::Ignore(
