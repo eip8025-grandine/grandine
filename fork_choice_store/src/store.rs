@@ -56,10 +56,6 @@ use types::{
         containers::{BlobIdentifier, BlobSidecar},
         primitives::{BlobIndex, KzgCommitment},
     },
-    electra::{
-        containers::IndexedAttestation as ElectraIndexedAttestation,
-        error::AttestationConversionError,
-    },
     eip8025::{
         consts::STATELESS_INPUT_SCHEMA_ID,
         containers::{
@@ -67,6 +63,10 @@ use types::{
             SignedExecutionProofEnvelope,
         },
         primitives::{ProofType, get_supported_proof_types},
+    },
+    electra::{
+        containers::IndexedAttestation as ElectraIndexedAttestation,
+        error::AttestationConversionError,
     },
     fulu::{containers::DataColumnIdentifier, primitives::ColumnIndex},
     gloas::{

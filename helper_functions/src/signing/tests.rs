@@ -3,9 +3,9 @@ use hex_literal::hex;
 use ssz::Hc;
 use std_ext::CopyExt as _;
 use tap::{Conv as _, TryConv as _};
+use typenum::Unsigned as _;
 use types::phase0::primitives::{ExecutionAddress, Version};
 use types::preset::Mainnet;
-use typenum::Unsigned as _;
 use types::{
     eip8025::{
         consts::STATELESS_INPUT_SCHEMA_ID,
@@ -341,7 +341,6 @@ fn envelope_root_differs_from_bare_proof_root() {
 
     assert_ne!(envelope.hash_tree_root(), proof.hash_tree_root());
 }
-
 
 fn fork_info(previous_version: Version, current_version: Version) -> ForkInfo {
     ForkInfo {
