@@ -48,7 +48,7 @@ use types::{
 
 use crate::{
     segment::Position,
-    store::{AcceptedExecutionPayloadEnvelope, Store},
+    store::{AcceptedExecutionPayloadEnvelope, AdmittedExecutionProof, Store},
 };
 
 const EMPTY: &str = "empty";
@@ -1331,6 +1331,50 @@ pub enum ExecutionPayloadBidAction<P: Preset> {
 pub enum ExecutionProofAction {
     Accept(Arc<SignedExecutionProofEnvelope>),
     Ignore(&'static str),
+}
+
+/// Why live admission declined a prepared execution proof without consuming either Seen key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofAdmissionDecline {
+    Retired,
+    /// The accepted payload context is missing or no longer matches the prepared statement.
+    ContextInapplicable,
+    AlreadyVerified,
+    SeenRoot,
+    SeenProver,
+}
+
+/// A live admission result carrying either protected authority or a decline reason.
+#[must_use]
+pub enum ExecutionProofAdmission {
+    /// Both Seen keys were consumed by the authorizing live Store transition.
+    Admitted(AdmittedExecutionProof),
+    Declined(ExecutionProofAdmissionDecline),
+}
+
+/// An admitted attempt's verification report, not a live Store acceptance decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofVerificationOutcome {
+    Valid,
+    Invalid,
+    LocalFault,
+}
+
+/// Why a completion report no longer applies to the live Store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofDiscard {
+    Retired,
+    ContextInapplicable,
+}
+
+/// The live completion decision after checking target retention and context applicability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofCompletionOutcome {
+    /// An applicable valid attempt is accepted, whether or not another valid attempt stored first.
+    Accept,
+    Reject,
+    LocalFault,
+    Discarded(ExecutionProofDiscard),
 }
 
 // a list of Tuple(attesting_index, positions_in_committee)

@@ -85,11 +85,12 @@ pub use crate::{
         BlockOrigin, ChainLink, DataAvailabilityPolicy, DataColumnSidecarAction,
         DataColumnSidecarOrigin, ExecutionPayloadBidAction, ExecutionPayloadBidOrigin,
         ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-        ExecutionPayloadEnvelopeValidationAction, ExecutionProofAction, ExecutionProofOrigin,
-        PartialBlockAction, PayloadAction, PayloadAttestationAction, PayloadAttestationItem,
-        PayloadAttestationOrigin, PayloadAttestationValidationError, PayloadPresence,
-        ProposerPreferencesAction, ProposerPreferencesOrigin, Storage, ValidAttestation,
-        ValidPayloadAttestation,
+        ExecutionPayloadEnvelopeValidationAction, ExecutionProofAction, ExecutionProofAdmission,
+        ExecutionProofAdmissionDecline, ExecutionProofCompletionOutcome, ExecutionProofDiscard,
+        ExecutionProofOrigin, ExecutionProofVerificationOutcome, PartialBlockAction, PayloadAction,
+        PayloadAttestationAction, PayloadAttestationItem, PayloadAttestationOrigin,
+        PayloadAttestationValidationError, PayloadPresence, ProposerPreferencesAction,
+        ProposerPreferencesOrigin, Storage, ValidAttestation, ValidPayloadAttestation,
     },
     prepared_execution_proof::{
         ExecutionProofContextIdentity, ExecutionProofPreparation, PreparedExecutionProof,
@@ -97,7 +98,9 @@ pub use crate::{
     },
     segment::Segment,
     state_cache_processor::{Error as StateCacheError, StateCacheProcessor},
-    store::{AcceptedExecutionPayloadEnvelope, Store},
+    store::{
+        AcceptedExecutionPayloadEnvelope, AdmittedExecutionProof, ExecutionProofCompletion, Store,
+    },
     store_config::{DEFAULT_CACHE_LOCK_TIMEOUT_MILLIS, StoreConfig},
     validations::validate_merge_block,
 };

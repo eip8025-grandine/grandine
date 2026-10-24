@@ -1312,6 +1312,19 @@ fn proof_preparation_fixture(
     (store, state, signed_proof)
 }
 
+fn prepared_execution_proof_for_test(
+    store: &Store<Minimal, ContextStorage>,
+    signed_envelope: &SignedExecutionProofEnvelope,
+) -> Box<PreparedExecutionProof> {
+    match crate::prepare_execution_proof(store, signed_envelope) {
+        Ok(crate::ExecutionProofPreparation::Prepared(prepared)) => prepared,
+        Ok(crate::ExecutionProofPreparation::Ignore(reason)) => {
+            panic!("authenticated proof fixture should prepare: {reason}")
+        }
+        Err(error) => panic!("authenticated proof fixture failed to prepare: {error:#}"),
+    }
+}
+
 fn pre_gloas_proof_preparation_fixture() -> (
     Store<Minimal, ContextStorage>,
     Arc<BeaconState<Minimal>>,
@@ -2531,6 +2544,164 @@ fn execution_proof_context_ignores_same_slot_fixture_transition_error() {
         "a failed trusted transition must not publish a target state"
     );
     assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+}
+
+fn assert_admitted_callback_result(expected_valid: bool) {
+    let (store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+
+    let expected_input = prepared.execution_proof().clone();
+    let expected_message = prepared.signed_message().clone();
+    let expected_context_identity = *prepared.context_identity();
+    let expected_envelope_root = prepared.envelope_root();
+    let expected_validator_index = prepared.validator_index();
+    // Pointer checks cover the handoff only, not preparation or persistent-map copies.
+    let input_data_pointer = prepared.execution_proof().proof_data.as_bytes().as_ptr();
+    let message_data_pointer = prepared.signed_message().proof_data.as_bytes().as_ptr();
+    assert!(!expected_input.proof_data.as_bytes().is_empty());
+    assert!(!expected_message.proof_data.as_bytes().is_empty());
+
+    let bookkeeping = execution_proof_bookkeeping(&store);
+    let proof_contexts = store.execution_proof_contexts.clone();
+    // Synthetic admission: authentication is real, but live Seen checks are not exercised.
+    let admitted = AdmittedExecutionProof { prepared };
+    let mut callback_calls = 0_usize;
+    let completion = admitted.verify_with(|input| {
+        callback_calls = callback_calls
+            .checked_add(1)
+            .expect("a FnOnce callback can run at most once");
+        assert_eq!(
+            input.proof_data.as_bytes(),
+            expected_input.proof_data.as_bytes()
+        );
+        assert_eq!(input.proof_type, expected_input.proof_type);
+        assert_eq!(input.public_input, expected_input.public_input);
+        assert_eq!(input.proof_data.as_bytes().as_ptr(), input_data_pointer);
+        expected_valid
+    });
+
+    assert_eq!(callback_calls, 1, "the callback runs once on normal return");
+    assert_eq!(completion.envelope(), &expected_message);
+    assert_eq!(
+        completion.signed_envelope.signature,
+        signed_envelope.signature
+    );
+    assert_eq!(
+        completion.envelope().proof_data.as_bytes(),
+        expected_message.proof_data.as_bytes()
+    );
+    assert_eq!(
+        completion.envelope().proof_type,
+        expected_message.proof_type
+    );
+    assert_eq!(
+        completion.envelope().beacon_block_root,
+        expected_context_identity.beacon_block_root()
+    );
+    assert_eq!(
+        completion.envelope().proof_data.as_bytes().as_ptr(),
+        message_data_pointer,
+        "the associated message retains its original proof-byte allocation"
+    );
+    assert_eq!(completion.validator_index(), expected_validator_index);
+    assert_eq!(completion.context_identity(), &expected_context_identity);
+    assert_eq!(
+        completion.context_identity().public_input(),
+        &expected_input.public_input,
+        "the completion retains all fields of Q"
+    );
+    assert_eq!(completion.envelope_root(), expected_envelope_root);
+    assert_eq!(
+        completion.verification_outcome(),
+        if expected_valid {
+            ExecutionProofVerificationOutcome::Valid
+        } else {
+            ExecutionProofVerificationOutcome::Invalid
+        }
+    );
+    assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+    assert_eq!(store.execution_proof_contexts, proof_contexts);
+}
+
+#[test]
+fn admitted_execution_proof_verify_with_preserves_valid_result_and_owned_input() {
+    assert_admitted_callback_result(true);
+}
+
+#[test]
+fn admitted_execution_proof_verify_with_preserves_invalid_result_and_owned_input() {
+    assert_admitted_callback_result(false);
+}
+
+#[test]
+fn admitted_execution_proof_local_fault_preserves_association_without_store_mutation() {
+    let (store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+    let expected_message = prepared.signed_message().clone();
+    let expected_context_identity = *prepared.context_identity();
+    let expected_envelope_root = prepared.envelope_root();
+    let expected_validator_index = prepared.validator_index();
+    let message_data_pointer = prepared.signed_message().proof_data.as_bytes().as_ptr();
+    let bookkeeping = execution_proof_bookkeeping(&store);
+    let proof_contexts = store.execution_proof_contexts.clone();
+    // Synthetic admission, as in the callback tests above.
+    let admitted = AdmittedExecutionProof { prepared };
+
+    let completion = admitted.into_local_fault();
+
+    assert_eq!(completion.envelope(), &expected_message);
+    assert_eq!(
+        completion.signed_envelope.signature,
+        signed_envelope.signature
+    );
+    assert_eq!(
+        completion.envelope().proof_data.as_bytes().as_ptr(),
+        message_data_pointer
+    );
+    assert_eq!(completion.validator_index(), expected_validator_index);
+    assert_eq!(completion.context_identity(), &expected_context_identity);
+    assert_eq!(completion.envelope_root(), expected_envelope_root);
+    assert_eq!(
+        completion.verification_outcome(),
+        ExecutionProofVerificationOutcome::LocalFault
+    );
+    assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+    assert_eq!(store.execution_proof_contexts, proof_contexts);
+}
+
+#[test]
+fn prepared_execution_proof_into_parts_moves_all_components_and_cached_root() {
+    let (store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+    let expected_input = prepared.execution_proof().clone();
+    let expected_message = prepared.signed_message().clone();
+    let expected_context_identity = *prepared.context_identity();
+    let expected_envelope_root = prepared.envelope_root();
+    let input_data_pointer = prepared.execution_proof().proof_data.as_bytes().as_ptr();
+    let message_data_pointer = prepared.signed_message().proof_data.as_bytes().as_ptr();
+
+    let (actual_signed_envelope, actual_input, actual_context_identity, actual_envelope_root) =
+        (*prepared).into_parts();
+
+    assert_eq!(actual_signed_envelope.message.as_ref(), &expected_message);
+    assert_eq!(actual_signed_envelope.signature, signed_envelope.signature);
+    assert_eq!(actual_input, expected_input);
+    assert_eq!(actual_context_identity, expected_context_identity);
+    assert_eq!(actual_envelope_root, expected_envelope_root);
+    assert_eq!(
+        actual_input.proof_data.as_bytes().as_ptr(),
+        input_data_pointer,
+        "consuming extraction preserves the engine-input allocation"
+    );
+    assert_eq!(
+        actual_signed_envelope
+            .message
+            .proof_data
+            .as_bytes()
+            .as_ptr(),
+        message_data_pointer,
+        "consuming extraction preserves the signed-message allocation"
+    );
 }
 
 #[test]

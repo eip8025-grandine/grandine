@@ -298,6 +298,29 @@ pub struct PreparedExecutionProof {
 }
 
 impl PreparedExecutionProof {
+    /// Moves the bound components and cached root without cloning or rehashing proof bytes.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SignedExecutionProofEnvelope,
+        ExecutionProof,
+        ExecutionProofContextIdentity,
+        H256,
+    ) {
+        let Self {
+            signed_envelope,
+            execution_proof,
+            context_identity,
+            envelope_root,
+        } = self;
+        (
+            signed_envelope,
+            execution_proof,
+            context_identity,
+            envelope_root,
+        )
+    }
+
     // Keep construction private to the preparation implementation. This checks consistency
     // only; its preparation path must authenticate and establish trusted context first.
     fn from_validated_context(

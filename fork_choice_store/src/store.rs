@@ -116,12 +116,13 @@ use crate::{
         DataAvailabilityPolicy, DataColumnSidecarAction, DataColumnSidecarOrigin, Difference,
         DifferenceAtLocation, Differences, DissolvedDifference, ExecutionPayloadBidAction,
         ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-        ExecutionPayloadEnvelopeValidationAction, LatestMessage, Location,
-        PartialAttestationAction, PartialBlockAction, PayloadAction, PayloadAttestationAction,
-        PayloadAttestationItem, PayloadAttestationValidationError, PayloadPresence,
-        ProposerPreferencesAction, ProposerPreferencesOrigin, Score, SegmentId, Storage,
-        UnfinalizedBlock, ValidAttestation, ValidPayloadAttestation,
+        ExecutionPayloadEnvelopeValidationAction, ExecutionProofVerificationOutcome, LatestMessage,
+        Location, PartialAttestationAction, PartialBlockAction, PayloadAction,
+        PayloadAttestationAction, PayloadAttestationItem, PayloadAttestationValidationError,
+        PayloadPresence, ProposerPreferencesAction, ProposerPreferencesOrigin, Score, SegmentId,
+        Storage, UnfinalizedBlock, ValidAttestation, ValidPayloadAttestation,
     },
+    prepared_execution_proof::{ExecutionProofContextIdentity, PreparedExecutionProof},
     segment::{Position, Segment},
     state_cache_processor::StateCacheProcessor,
     store_config::StoreConfig,
@@ -179,6 +180,88 @@ impl<P: Preset> AcceptedExecutionPayloadEnvelope<P> {
     #[must_use]
     pub fn payload_block_hash(&self) -> ExecutionBlockHash {
         self.envelope.message.payload.block_hash
+    }
+}
+
+/// An authenticated, bound proof input admitted after both Seen keys were consumed.
+#[must_use]
+pub struct AdmittedExecutionProof {
+    prepared: Box<PreparedExecutionProof>,
+}
+
+impl AdmittedExecutionProof {
+    /// Passes the owned input to an off-mutator callback and pairs its result with the same context.
+    /// The callback is trusted to verify that input; panics do not produce a completion.
+    pub fn verify_with(
+        self,
+        verify: impl FnOnce(ExecutionProof) -> bool,
+    ) -> ExecutionProofCompletion {
+        let (signed_envelope, input, context_identity, envelope_root) =
+            (*self.prepared).into_parts();
+        let verification_outcome = if verify(input) {
+            ExecutionProofVerificationOutcome::Valid
+        } else {
+            ExecutionProofVerificationOutcome::Invalid
+        };
+
+        ExecutionProofCompletion {
+            signed_envelope,
+            context_identity,
+            envelope_root,
+            verification_outcome,
+        }
+    }
+
+    /// Reports a local fault without verification or rolling back Seen bookkeeping.
+    pub fn into_local_fault(self) -> ExecutionProofCompletion {
+        let (signed_envelope, input, context_identity, envelope_root) =
+            (*self.prepared).into_parts();
+        drop(input);
+
+        ExecutionProofCompletion {
+            signed_envelope,
+            context_identity,
+            envelope_root,
+            verification_outcome: ExecutionProofVerificationOutcome::LocalFault,
+        }
+    }
+}
+
+/// An admitted attempt's report, pending the live Store's applicability and storage checks.
+#[must_use]
+pub struct ExecutionProofCompletion {
+    signed_envelope: SignedExecutionProofEnvelope,
+    context_identity: ExecutionProofContextIdentity,
+    envelope_root: H256,
+    verification_outcome: ExecutionProofVerificationOutcome,
+}
+
+impl ExecutionProofCompletion {
+    /// Returns the underlying bare message, not its signed `Hc` wrapper.
+    #[must_use]
+    pub fn envelope(&self) -> &ExecutionProofEnvelope {
+        self.signed_envelope.message.as_ref()
+    }
+
+    #[must_use]
+    pub const fn context_identity(&self) -> &ExecutionProofContextIdentity {
+        &self.context_identity
+    }
+
+    #[must_use]
+    pub const fn validator_index(&self) -> ValidatorIndex {
+        self.signed_envelope.validator_index
+    }
+
+    /// Returns the cached root of the bare envelope, not its signed wrapper.
+    #[must_use]
+    pub const fn envelope_root(&self) -> H256 {
+        self.envelope_root
+    }
+
+    #[must_use]
+    pub const fn verification_outcome(&self) -> ExecutionProofVerificationOutcome {
+        self.verification_outcome
     }
 }
 
