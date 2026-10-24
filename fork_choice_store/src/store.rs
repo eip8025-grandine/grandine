@@ -4389,32 +4389,46 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         let post_gloas_state = state
             .post_gloas()
             .ok_or_else(|| anyhow!("execution proof binding requires a Gloas state"))?;
-        let versioned_hashes = post_gloas_state
-            .latest_execution_payload_bid()
-            .blob_kzg_commitments
-            .iter()
-            .copied()
-            .map(misc::kzg_commitment_to_versioned_hash)
-            .collect();
+        let public_input = self.execution_proof_public_input_from_parts(
+            payload_envelope,
+            post_gloas_state
+                .latest_execution_payload_bid()
+                .blob_kzg_commitments
+                .iter()
+                .copied()
+                .map(misc::kzg_commitment_to_versioned_hash),
+        )?;
+
+        // Keep the fallible binding ahead of copying the potentially large proof byte list.
+        Ok(ExecutionProof {
+            proof_data: envelope.proof_data.clone(),
+            proof_type: envelope.proof_type,
+            public_input,
+        })
+    }
+
+    /// Builds only the pure EIP-8025 statement from the envelope and the selected bid's hashes.
+    /// State selection and the zkBoost-compatible root convention remain at the callers.
+    fn execution_proof_public_input_from_parts(
+        &self,
+        payload_envelope: &ExecutionPayloadEnvelope<P>,
+        versioned_hashes: impl Iterator<Item = H256>,
+    ) -> Result<PublicInput> {
         let payload = types::combined::ExecutionPayload::Gloas(payload_envelope.payload.clone());
         let params = ExecutionPayloadParams::Gloas {
-            versioned_hashes,
+            versioned_hashes: versioned_hashes.collect(),
             parent_beacon_block_root: payload_envelope.parent_beacon_block_root,
             execution_requests: payload_envelope.execution_requests.clone(),
         };
         let new_payload_request = NewPayloadRequest::new(&payload, &params)?;
 
-        Ok(ExecutionProof {
-            proof_data: envelope.proof_data.clone(),
-            proof_type: envelope.proof_type,
-            public_input: PublicInput {
-                // zkBoost guests commit to the ordinary-container root, not
-                // the canonical progressive root defined by consensus-specs.
-                new_payload_request_root: new_payload_request.zkboost_compatible_root(),
-                successful_validation: true,
-                chain_id: self.chain_config.deposit_chain_id,
-                schema_id: STATELESS_INPUT_SCHEMA_ID,
-            },
+        Ok(PublicInput {
+            // zkBoost guests commit to the ordinary-container root, not
+            // the canonical progressive root defined by consensus-specs.
+            new_payload_request_root: new_payload_request.zkboost_compatible_root(),
+            successful_validation: true,
+            chain_id: self.chain_config.deposit_chain_id,
+            schema_id: STATELESS_INPUT_SCHEMA_ID,
         })
     }
 
