@@ -59,6 +59,7 @@ types = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+bls = { workspace = true }
 bytesize = { workspace = true }
 duplicate = { workspace = true }
 eth2_cache_utils = { workspace = true }
