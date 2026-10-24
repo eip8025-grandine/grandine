@@ -32,6 +32,15 @@ type PayloadValidationFixture<S> = (
     Arc<SignedExecutionPayloadEnvelope<Minimal>>,
 );
 
+type RetainedUnfinalizedPayloadFixture = (
+    Store<Minimal, NoopStorage>,
+    Arc<BeaconState<Minimal>>,
+    Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+    H256,
+    H256,
+    SecretKey,
+);
+
 #[derive(Clone)]
 struct NoopStorage;
 
@@ -338,6 +347,247 @@ fn accepted_payload_carrier<S: Storage<Minimal>>(
         ExecutionPayloadEnvelopeValidationAction::Accept(accepted) => accepted,
         _ => panic!("fixture payload should be accepted by ordinary validation"),
     }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the target, descendants, and checkpoint boundary form one topology fixture"
+)]
+fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
+    let key = proof_signing_key();
+    let validator = Validator {
+        pubkey: key.to_public_key().into(),
+        activation_epoch: 0,
+        exit_epoch: FAR_FUTURE_EPOCH,
+        ..Default::default()
+    };
+    let (mut store, _, _) = payload_validation_fixture_with_state_bid_commitments(
+        Arc::new(NoopStorage),
+        None,
+        None,
+        Some(validator),
+    );
+    // These synthetic links use Gloas fork-choice semantics, including head selection
+    // during finalization; the default fork schedule does not activate Gloas at slot zero.
+    store.chain_config = Arc::new(ChainConfig::default().start_and_stay_in(Phase::Gloas));
+    assert_eq!(store.phase(), Phase::Gloas);
+    let parent_root = store.last_finalized().block_root;
+    let slot = 1;
+    let execution_requests = ExecutionRequests::<Minimal>::default();
+    let bid = ExecutionPayloadBid::<Minimal> {
+        block_hash: ExecutionBlockHash::repeat_byte(0x61),
+        prev_randao: H256::repeat_byte(0x62),
+        gas_limit: 30_000_000,
+        builder_index: BUILDER_INDEX_SELF_BUILD,
+        execution_requests_root: execution_requests.hash_tree_root(),
+        ..Default::default()
+    };
+    let body = GloasBeaconBlockBody::<Minimal> {
+        signed_execution_payload_bid: SignedExecutionPayloadBid {
+            message: bid.clone(),
+            signature: <_>::default(),
+        },
+        ..Default::default()
+    };
+    let target_state = Arc::new(BeaconState::from(GloasBeaconState::<Minimal> {
+        validators: core::iter::once(Validator {
+            pubkey: key.to_public_key().into(),
+            activation_epoch: 0,
+            exit_epoch: FAR_FUTURE_EPOCH,
+            ..Default::default()
+        })
+        .collect(),
+        slot,
+        latest_block_header: BeaconBlockHeader {
+            slot,
+            proposer_index: 0,
+            parent_root,
+            body_root: body.hash_tree_root(),
+            ..Default::default()
+        },
+        latest_execution_payload_bid: bid.clone(),
+        ..Default::default()
+    }));
+    let target_block = GloasSignedBeaconBlock {
+        message: Hc::from(GloasBeaconBlock {
+            slot,
+            proposer_index: 0,
+            parent_root,
+            state_root: target_state.hash_tree_root(),
+            body,
+        }),
+        signature: <_>::default(),
+    };
+    let target_root = target_block.message.hash_tree_root();
+    assert_eq!(target_block.message.slot, slot);
+    assert_eq!(target_block.message.proposer_index, 0);
+    assert_eq!(target_block.message.parent_root, parent_root);
+    assert_eq!(
+        target_block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message,
+        bid
+    );
+    assert_eq!(target_state.latest_block_header().slot, slot);
+    assert_eq!(target_state.latest_block_header().proposer_index, 0);
+    assert_eq!(target_state.latest_block_header().parent_root, parent_root);
+    assert_eq!(
+        target_state.latest_block_header().body_root,
+        target_block.message.body.hash_tree_root()
+    );
+    assert_eq!(
+        target_state
+            .post_gloas()
+            .expect("target state is Gloas")
+            .latest_execution_payload_bid(),
+        &bid
+    );
+    let validators = target_state.validators();
+    assert_eq!(validators.len_u64(), 1);
+    assert_eq!(
+        validators
+            .get(0)
+            .expect("target state has validator 0")
+            .pubkey,
+        key.to_public_key().into()
+    );
+    assert_eq!(accessors::latest_block_root(&target_state), target_root);
+
+    let checkpoint = store.finalized_checkpoint;
+    store
+        .insert_block(ChainLink {
+            block_root: target_root,
+            block: Arc::new(SignedBeaconBlock::<Minimal>::from(target_block)),
+            state: Some(target_state.clone_arc()),
+            current_justified_checkpoint: checkpoint,
+            finalized_checkpoint: checkpoint,
+            unrealized_justified_checkpoint: checkpoint,
+            unrealized_finalized_checkpoint: checkpoint,
+            payload_status: PayloadStatus::Optimistic,
+            parent_payload_presence: PayloadPresence::default(),
+        })
+        .expect("target should be inserted below the current finalized anchor");
+    assert!(store.unfinalized_locations.contains_key(&target_root));
+
+    // This child supplies a retained finalization target only; no child state is replayed.
+    let descendant_block = GloasSignedBeaconBlock {
+        message: Hc::from(GloasBeaconBlock {
+            slot: slot + 1,
+            proposer_index: 0,
+            parent_root: target_root,
+            state_root: H256::repeat_byte(0x63),
+            body: GloasBeaconBlockBody::default(),
+        }),
+        signature: <_>::default(),
+    };
+    let descendant_root = descendant_block.message.hash_tree_root();
+    assert_eq!(descendant_block.message.slot, slot + 1);
+    assert_eq!(descendant_block.message.parent_root, target_root);
+    store
+        .insert_block(ChainLink {
+            block_root: descendant_root,
+            block: Arc::new(SignedBeaconBlock::<Minimal>::from(descendant_block)),
+            state: None,
+            current_justified_checkpoint: checkpoint,
+            finalized_checkpoint: checkpoint,
+            unrealized_justified_checkpoint: checkpoint,
+            unrealized_finalized_checkpoint: checkpoint,
+            payload_status: PayloadStatus::Optimistic,
+            parent_payload_presence: PayloadPresence::default(),
+        })
+        .expect("descendant should extend the retained target");
+    assert!(store.unfinalized_locations.contains_key(&descendant_root));
+    let retained_descendant = store
+        .chain_link(descendant_root)
+        .expect("inserted descendant remains addressable");
+    assert_eq!(retained_descendant.parent_root(), target_root);
+    assert_eq!(retained_descendant.slot(), slot + 1);
+    assert_eq!(retained_descendant.block_root, descendant_root);
+    assert!(retained_descendant.state.is_none());
+
+    // Keep one child beyond the checkpoint: Segment::finalize_up_to must retain a nonempty
+    // suffix when the target and checkpoint are finalized through their ordinary Store path.
+    let post_checkpoint_block = GloasSignedBeaconBlock {
+        message: Hc::from(GloasBeaconBlock {
+            slot: slot + 2,
+            proposer_index: 0,
+            parent_root: descendant_root,
+            state_root: H256::repeat_byte(0x64),
+            body: GloasBeaconBlockBody::default(),
+        }),
+        signature: <_>::default(),
+    };
+    let post_checkpoint_root = post_checkpoint_block.message.hash_tree_root();
+    store
+        .insert_block(ChainLink {
+            block_root: post_checkpoint_root,
+            block: Arc::new(SignedBeaconBlock::<Minimal>::from(post_checkpoint_block)),
+            state: None,
+            current_justified_checkpoint: checkpoint,
+            finalized_checkpoint: checkpoint,
+            unrealized_justified_checkpoint: checkpoint,
+            unrealized_finalized_checkpoint: checkpoint,
+            payload_status: PayloadStatus::Optimistic,
+            parent_payload_presence: PayloadPresence::default(),
+        })
+        .expect("post-checkpoint child should extend the finalization target");
+    assert!(
+        store
+            .unfinalized_locations
+            .contains_key(&post_checkpoint_root)
+    );
+    let retained_post_checkpoint = store
+        .chain_link(post_checkpoint_root)
+        .expect("post-checkpoint child remains addressable");
+    assert_eq!(retained_post_checkpoint.parent_root(), descendant_root);
+    assert_eq!(retained_post_checkpoint.slot(), slot + 2);
+    assert_eq!(retained_post_checkpoint.block_root, post_checkpoint_root);
+    assert!(retained_post_checkpoint.state.is_none());
+
+    let chain_config = store.chain_config.clone_arc();
+    let timestamp = misc::compute_timestamp_at_slot(&chain_config, &target_state, slot)
+        .expect("fixture target timestamp should be computable");
+    let payload_envelope = Arc::new(SignedExecutionPayloadEnvelope {
+        message: ExecutionPayloadEnvelope {
+            payload: GloasExecutionPayload {
+                parent_hash: target_state
+                    .post_gloas()
+                    .expect("target state is Gloas")
+                    .latest_block_hash(),
+                prev_randao: bid.prev_randao,
+                gas_limit: bid.gas_limit,
+                timestamp,
+                block_hash: bid.block_hash,
+                slot_number: slot,
+                ..Default::default()
+            },
+            execution_requests,
+            builder_index: bid.builder_index,
+            beacon_block_root: target_root,
+            parent_beacon_block_root: parent_root,
+        },
+        ..Default::default()
+    });
+
+    (
+        store,
+        target_state,
+        payload_envelope,
+        descendant_root,
+        post_checkpoint_root,
+        key,
+    )
+}
+
+fn payload_with_gas_used(
+    envelope: &Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+    gas_used: u64,
+) -> Arc<SignedExecutionPayloadEnvelope<Minimal>> {
+    let mut replacement = envelope.as_ref().clone();
+    replacement.message.payload.gas_used = gas_used;
+    Arc::new(replacement)
 }
 
 fn assert_selected_payload_application<S: Storage<Minimal>>(
@@ -3514,6 +3764,157 @@ fn execution_proof_custom_state_payload_validation_cannot_mint_live_proof_author
 }
 
 #[test]
+fn execution_proof_payload_context_replacement_tracks_some_to_some_content_and_snapshots() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    let first = payload_carrier_from_snapshot(&store, &envelope, false);
+    let first_q = first.proof_public_input.expect("capture should succeed");
+    let equivalent_envelope = Arc::new(envelope.as_ref().clone());
+    let equivalent = payload_carrier_from_snapshot(&store, &equivalent_envelope, false);
+    let equivalent_q = equivalent
+        .proof_public_input
+        .expect("equivalent capture should succeed");
+    let changed_envelope = payload_with_gas_used(&envelope, 1);
+    let changed = payload_carrier_from_snapshot(&store, &changed_envelope, false);
+    let changed_q = changed
+        .proof_public_input
+        .expect("changed capture should succeed");
+
+    assert_eq!(
+        first_q, equivalent_q,
+        "allocation identity is not Q identity"
+    );
+    assert_ne!(first_q, changed_q, "full request content changes Q");
+
+    let block_root = envelope.block_root();
+    store.apply_execution_payload_envelope(first, false);
+    assert_selected_payload_application(&store, &envelope, Some(first_q), false);
+    let first_snapshot = store.clone();
+    store.apply_execution_payload_envelope(equivalent, true);
+    assert_selected_payload_application(&store, &equivalent_envelope, Some(first_q), true);
+    assert_eq!(
+        store.execution_proof_contexts.get(&block_root),
+        Some(&first_q)
+    );
+    assert_eq!(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .expect("replacement payload should remain selected")
+            .as_ref(),
+        equivalent_envelope.as_ref()
+    );
+    assert_eq!(
+        first_snapshot.execution_proof_contexts.get(&block_root),
+        Some(&first_q)
+    );
+    assert!(first_snapshot.execution_proof_context_is_applicable(block_root, &first_q));
+
+    let equivalent_snapshot = store.clone();
+    store.apply_execution_payload_envelope(changed, false);
+    assert_selected_payload_application(&store, &changed_envelope, Some(changed_q), true);
+    assert_eq!(
+        store.execution_proof_contexts.get(&block_root),
+        Some(&changed_q)
+    );
+    assert!(!store.execution_proof_context_is_applicable(block_root, &first_q));
+    assert_eq!(
+        equivalent_snapshot
+            .execution_proof_contexts
+            .get(&block_root),
+        Some(&first_q),
+        "older persistent snapshots retain their prior selection and evidence"
+    );
+}
+
+#[test]
+fn execution_proof_payload_context_some_none_pairing_matrix_clears_old_authority() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    let none_a = payload_carrier_from_snapshot(&store, &envelope, true);
+    let none_b = payload_carrier_from_snapshot(&store, &envelope, true);
+    let some = payload_carrier_from_snapshot(&store, &envelope, false);
+    let some_q = some.proof_public_input.expect("capture should succeed");
+    let none_c = payload_carrier_from_snapshot(&store, &envelope, true);
+    let block_root = envelope.block_root();
+
+    assert!(none_a.proof_public_input.is_none());
+    assert!(none_b.proof_public_input.is_none());
+    assert!(none_c.proof_public_input.is_none());
+    store.apply_execution_payload_envelope(none_a, false);
+    assert_selected_payload_application(&store, &envelope, None, false);
+    store.apply_execution_payload_envelope(none_b, true);
+    assert_selected_payload_application(&store, &envelope, None, true);
+    store.apply_execution_payload_envelope(some, false);
+    assert_selected_payload_application(&store, &envelope, Some(some_q), true);
+    let some_snapshot = store.clone();
+    store.apply_execution_payload_envelope(none_c, true);
+    assert_selected_payload_application(&store, &envelope, None, true);
+    assert!(some_snapshot.execution_proof_context_is_applicable(block_root, &some_q));
+}
+
+#[test]
+fn execution_proof_reverse_application_order_tracks_selected_envelope_and_full_q() {
+    let (mut store, _, envelope_a) = payload_validation_fixture();
+    let envelope_b = payload_with_gas_used(&envelope_a, 45_000);
+    let carrier_a = payload_carrier_from_snapshot(&store, &envelope_a, false);
+    let q_a = carrier_a.proof_public_input.expect("A should capture Q");
+    let carrier_b = payload_carrier_from_snapshot(&store, &envelope_b, false);
+    let q_b = carrier_b.proof_public_input.expect("B should capture Q");
+    assert_ne!(q_a, q_b);
+
+    store.apply_execution_payload_envelope(carrier_b, false);
+    assert_selected_payload_application(&store, &envelope_b, Some(q_b), false);
+    store.apply_execution_payload_envelope(carrier_a, false);
+    assert_selected_payload_application(&store, &envelope_a, Some(q_a), false);
+}
+
+#[test]
+fn execution_proof_a_b_a_application_tracks_selected_envelope_and_full_q_each_time() {
+    let (mut store, _, envelope_a) = payload_validation_fixture();
+    let envelope_b = payload_with_gas_used(&envelope_a, 46_000);
+    let equivalent_a = Arc::new(envelope_a.as_ref().clone());
+    let carrier_a1 = payload_carrier_from_snapshot(&store, &envelope_a, false);
+    let q_a = carrier_a1
+        .proof_public_input
+        .expect("first A should capture Q");
+    let carrier_b = payload_carrier_from_snapshot(&store, &envelope_b, false);
+    let q_b = carrier_b.proof_public_input.expect("B should capture Q");
+    let carrier_a2 = payload_carrier_from_snapshot(&store, &equivalent_a, false);
+    let q_a2 = carrier_a2
+        .proof_public_input
+        .expect("second A should capture Q");
+    assert_eq!(q_a, q_a2);
+    assert_ne!(q_a, q_b);
+
+    store.apply_execution_payload_envelope(carrier_a1, false);
+    assert_selected_payload_application(&store, &envelope_a, Some(q_a), false);
+    store.apply_execution_payload_envelope(carrier_b, false);
+    assert_selected_payload_application(&store, &envelope_b, Some(q_b), false);
+    store.apply_execution_payload_envelope(carrier_a2, false);
+    assert_selected_payload_application(&store, &equivalent_a, Some(q_a), false);
+}
+
+#[test]
+fn execution_proof_equivalent_replacement_capture_failure_clears_q_without_affecting_snapshot() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    let selected = payload_carrier_from_snapshot(&store, &envelope, false);
+    let selected_q = selected.proof_public_input.expect("capture should succeed");
+    let equivalent_envelope = Arc::new(envelope.as_ref().clone());
+    let failed_replacement = payload_carrier_from_snapshot(&store, &equivalent_envelope, true);
+    let block_root = envelope.block_root();
+
+    store.apply_execution_payload_envelope(selected, false);
+    let old_snapshot = store.clone();
+    store.apply_execution_payload_envelope(failed_replacement, true);
+
+    assert!(store.is_payload_verified(block_root));
+    assert_selected_payload_application(&store, &equivalent_envelope, None, true);
+    assert_eq!(
+        old_snapshot.execution_proof_contexts.get(&block_root),
+        Some(&selected_q)
+    );
+    assert!(old_snapshot.execution_proof_context_is_applicable(block_root, &selected_q));
+}
+
+#[test]
 fn execution_proof_live_payload_applicability_compares_every_public_input_field() {
     let (mut store, _, envelope) = payload_validation_fixture();
     let accepted = payload_carrier_from_snapshot(&store, &envelope, false);
@@ -3551,6 +3952,149 @@ fn execution_proof_live_payload_applicability_compares_every_public_input_field(
     markerless_snapshot.payloads.remove(&block_root);
     assert!(!markerless_snapshot.execution_proof_context_is_applicable(block_root, &public_input));
     assert!(store.execution_proof_context_is_applicable(block_root, &public_input));
+}
+
+#[test]
+fn execution_proof_unfinalized_target_late_results_preserve_ordinary_apply_but_not_authority() {
+    let (mut store, target_state, target_envelope, descendant_root, post_checkpoint_root, key) =
+        retained_unfinalized_payload_fixture();
+    let target_root = target_envelope.block_root();
+    let target_bid = store
+        .chain_link(target_root)
+        .expect("target remains retained")
+        .block
+        .message()
+        .body()
+        .with_payload_bid()
+        .map(|body| &body.signed_execution_payload_bid().message)
+        .expect("target block contains a bid");
+    let target_q = store
+        .execution_proof_public_input_from_parts(
+            &target_envelope.message,
+            target_bid
+                .blob_kzg_commitments
+                .iter()
+                .copied()
+                .map(misc::kzg_commitment_to_versioned_hash),
+        )
+        .expect("target request should bind");
+    let selected = AcceptedExecutionPayloadEnvelope::from_validation(
+        target_envelope.clone_arc(),
+        Some(target_q),
+    );
+    store.apply_execution_payload_envelope(selected, false);
+    assert!(store.unfinalized_locations.contains_key(&target_root));
+    assert_selected_payload_application(&store, &target_envelope, Some(target_q), false);
+    assert!(store.execution_proof_context_is_applicable(target_root, &target_q));
+
+    // Finalize the descendant. The target becomes a historical finalized ancestor: its
+    // ChainLink remains readable, but it leaves the shared live eligibility domain.
+    store.finalized_checkpoint = Checkpoint {
+        epoch: 0,
+        root: descendant_root,
+    };
+    store.prune_after_finalization();
+    assert!(store.finalized_indices.contains_key(&target_root));
+    assert!(store.finalized_indices.contains_key(&descendant_root));
+    assert_eq!(store.last_finalized().block_root, descendant_root);
+    assert!(!store.unfinalized_locations.contains_key(&target_root));
+    assert!(!store.unfinalized_locations.contains_key(&descendant_root));
+    assert!(
+        store
+            .unfinalized_locations
+            .contains_key(&post_checkpoint_root)
+    );
+    assert_eq!(
+        store
+            .chain_link(post_checkpoint_root)
+            .expect("post-checkpoint child must remain in the live segment")
+            .parent_root(),
+        descendant_root
+    );
+    assert!(store.chain_link(target_root).is_some());
+    assert!(!store.payloads.contains(&target_root));
+    assert_eq!(
+        store.execution_proof_contexts.get(&target_root),
+        Some(&target_q)
+    );
+    assert!(!store.execution_proof_context_is_applicable(target_root, &target_q));
+
+    // Late Some still performs the ordinary selection/cache writes, but cannot reinstall
+    // authority for the retired root.
+    let late_some = AcceptedExecutionPayloadEnvelope::from_validation(
+        target_envelope.clone_arc(),
+        Some(target_q),
+    );
+    store.apply_execution_payload_envelope(late_some, false);
+    assert_selected_payload_application(&store, &target_envelope, None, false);
+    assert!(!store.execution_proof_context_is_applicable(target_root, &target_q));
+
+    let proof_envelope = ExecutionProofEnvelope {
+        proof_data: ProofData::try_from(vec![0x42])
+            .expect("one byte is within the proof-data bound"),
+        proof_type: 1,
+        beacon_block_root: target_root,
+    };
+    let signed_proof = SignedExecutionProofEnvelope {
+        signature: proof_envelope
+            .sign(
+                &store.chain_config,
+                &target_state,
+                target_state.slot(),
+                &key,
+            )
+            .into(),
+        message: Hc::from(proof_envelope),
+        validator_index: 0,
+    };
+    let bookkeeping = execution_proof_bookkeeping(&store);
+    assert!(matches!(
+        crate::prepare_execution_proof(&store, &signed_proof),
+        Ok(crate::ExecutionProofPreparation::Ignore(
+            "execution proof's accepted payload context is no longer applicable"
+        ))
+    ));
+    assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+    // A still later None result replaces selected bytes as usual and clears any stale Q.
+    let changed_envelope = payload_with_gas_used(&target_envelope, 99);
+    let late_none =
+        AcceptedExecutionPayloadEnvelope::from_validation(changed_envelope.clone_arc(), None);
+    store.apply_execution_payload_envelope(late_none, true);
+    assert_selected_payload_application(&store, &changed_envelope, None, true);
+    assert!(!store.execution_proof_context_is_applicable(target_root, &target_q));
+}
+
+#[test]
+fn execution_proof_payload_context_survives_byte_eviction_and_retirement_needs_no_gc() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    let accepted = payload_carrier_from_snapshot(&store, &envelope, false);
+    let public_input = accepted.proof_public_input.expect("capture should succeed");
+    let block_root = envelope.block_root();
+    store.apply_execution_payload_envelope(accepted, false);
+
+    store
+        .execution_payload_envelope_cache
+        .prune_finalized(envelope.slot().saturating_add(1));
+    assert!(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .is_none()
+    );
+    assert!(store.execution_proof_context_is_applicable(block_root, &public_input));
+
+    let retired_root = H256::repeat_byte(0xaa);
+    assert_ne!(retired_root, store.last_finalized().block_root);
+    store.payloads.insert(retired_root);
+    store
+        .execution_proof_contexts
+        .insert(retired_root, public_input);
+    assert!(!store.execution_proof_context_is_applicable(retired_root, &public_input));
+    assert_eq!(
+        store.execution_proof_contexts.get(&retired_root),
+        Some(&public_input),
+        "retained-domain eligibility blocks stale evidence without physical pruning"
+    );
 }
 
 #[test]
