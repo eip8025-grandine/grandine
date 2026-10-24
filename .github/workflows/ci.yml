@@ -95,6 +95,11 @@ jobs:
         run: cargo test --release --no-default-features --features default-networks,${{ matrix.backend }} --workspace --exclude zkvm_host --exclude zkvm_guest_risc0 --exclude c_grandine --exclude csharp_grandine
         env:
           KZG_BACKEND: ${{ matrix.default_kzg_backend }}
+      # Real SP1 verification is behind a non-default feature, so the steps above do not cover it.
+      # The SP1 verifier's build script resolves ere's workspace, so this needs the network.
+      - name: Run SP1 proof engine tests (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --release -p proof_engine -p bls --features bls/blst,proof_engine/sp1 --lib
       - name: Run other kzg backend tests
         if: matrix.test_kzg_backends != ''
         run: ${{ matrix.test_kzg_backends }}

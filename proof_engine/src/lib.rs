@@ -7,6 +7,8 @@ pub use crate::{
 
 mod backend;
 mod engine;
+#[cfg(feature = "sp1")]
+mod ere_backend;
 mod mock_engine;
 mod null_engine;
 mod zkboost_mock;

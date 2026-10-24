@@ -6,8 +6,14 @@ authors = ["Grandine <info@grandine.io>"]
 [lints]
 workspace = true
 
+[features]
+# Real verification of ere SP1 proofs. Pulls in the SP1 verifier.
+sp1 = ['dep:ere-verifier-core', 'dep:ere-verifier-sp1']
+
 [dependencies]
 anyhow = { workspace = true }
+ere-verifier-core = { workspace = true, optional = true }
+ere-verifier-sp1 = { workspace = true, optional = true }
 logging = { workspace = true }
 panics = { workspace = true }
 ssz = { workspace = true }
