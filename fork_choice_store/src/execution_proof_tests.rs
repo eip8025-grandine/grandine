@@ -2,6 +2,7 @@ use std::collections::HashMap as StdHashMap;
 
 use super::*;
 use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
+use eth2_libp2p::GossipId;
 use spec_test_utils::Case;
 use ssz::{Hc, ProgressiveList, SszRead as _, SszWrite as _};
 use types::{
@@ -2558,6 +2559,80 @@ fn execution_proof_payload_context_capture_failure_is_after_notify_and_does_not_
 }
 
 #[test]
+fn execution_proof_payload_context_capture_is_skipped_when_engine_submission_fails() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    store.fail_execution_proof_context_capture = true;
+    let engine = RecordingPayloadEngine {
+        fail_notification: true,
+        ..recording_payload_engine(&store, true)
+    };
+
+    let error = store
+        .validate_execution_payload_envelope(
+            &envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            &engine,
+            NullVerifier,
+        )
+        .expect_err("ordinary EL submission failure must remain an error");
+
+    assert!(
+        error
+            .to_string()
+            .contains("test-only execution submission failure")
+    );
+    assert_eq!(
+        *store.execution_proof_context_capture_trace.lock(),
+        ["notify"]
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert!(store.execution_proof_contexts.is_empty());
+    assert!(!store.is_payload_verified(envelope.block_root()));
+}
+
+#[test]
+fn execution_proof_payload_capture_is_not_run_before_ordinary_rejection() {
+    let (store, _, envelope) = payload_validation_fixture();
+    let mut invalid_envelope = envelope.as_ref().clone();
+    invalid_envelope.message.payload.block_hash = ExecutionBlockHash::repeat_byte(0x77);
+    let invalid_envelope = Arc::new(invalid_envelope);
+    let engine = recording_payload_engine(&store, false);
+
+    let error = store
+        .validate_execution_payload_envelope(
+            &invalid_envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            &engine,
+            NullVerifier,
+        )
+        .expect_err("ordinary bid binding rejection should remain an error");
+
+    assert!(matches!(
+        error.downcast_ref::<Error<Minimal>>(),
+        Some(Error::ExecutionPayloadBlockHashMismatch { .. })
+    ));
+    assert!(
+        store
+            .execution_proof_context_capture_trace
+            .lock()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert!(engine.requests.lock().is_empty());
+    assert!(!store.is_payload_verified(envelope.block_root()));
+}
+
+#[test]
 fn execution_proof_payload_capture_matches_full_submitted_request_and_trusted_proof_binder() {
     let (mut store, state, envelope) = payload_validation_fixture();
     let engine = recording_payload_engine(&store, false);
@@ -2685,6 +2760,349 @@ fn execution_proof_payload_context_capture_declines_oversized_binding_without_ch
 
     assert!(store.is_payload_verified(block_root));
     assert_selected_payload_application(&store, &envelope, None, true);
+}
+
+#[test]
+fn execution_proof_payload_capture_is_skipped_for_ignore_and_delay_actions() {
+    let (mut ignored_store, _, envelope) = payload_validation_fixture();
+    ignored_store.accepted_execution_payload_envelopes.insert((
+        envelope.slot(),
+        envelope.block_root(),
+        envelope.builder_index(),
+    ));
+    let ignored_engine = recording_payload_engine(&ignored_store, true);
+    let ignored = ignored_store
+        .validate_execution_payload_envelope(
+            &envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            &ignored_engine,
+            NullVerifier,
+        )
+        .expect("duplicate envelope should be ignored before execution");
+    assert!(matches!(
+        ignored,
+        ExecutionPayloadEnvelopeValidationAction::Ignore(true)
+    ));
+    assert!(ignored_engine.requests.lock().is_empty());
+    assert!(
+        ignored_store
+            .execution_proof_context_capture_trace
+            .lock()
+            .is_empty()
+    );
+    assert_eq!(
+        ignored_store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    let (delayed_store, _, envelope) = payload_validation_fixture();
+    let mut unknown_envelope = envelope.as_ref().clone();
+    let unknown_root = H256::repeat_byte(0xee);
+    unknown_envelope.message.beacon_block_root = unknown_root;
+    let unknown_envelope = Arc::new(unknown_envelope);
+    let delayed_engine = recording_payload_engine(&delayed_store, true);
+    let delayed = delayed_store
+        .validate_execution_payload_envelope(
+            &unknown_envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            &delayed_engine,
+            NullVerifier,
+        )
+        .expect("unknown block should delay the envelope before execution");
+    assert!(matches!(
+        delayed,
+        ExecutionPayloadEnvelopeValidationAction::DelayUntilBeaconBlock(_, root)
+            if root == unknown_root
+    ));
+    assert!(delayed_engine.requests.lock().is_empty());
+    assert!(
+        delayed_store
+            .execution_proof_context_capture_trace
+            .lock()
+            .is_empty()
+    );
+    assert_eq!(
+        delayed_store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn execution_proof_payload_signature_error_skips_notification_and_capture() {
+    let key = proof_signing_key();
+    let validator = Validator {
+        pubkey: key.to_public_key().into(),
+        activation_epoch: 0,
+        exit_epoch: FAR_FUTURE_EPOCH,
+        ..Default::default()
+    };
+    let (store, state, envelope) = payload_validation_fixture_with_state_bid_commitments(
+        Arc::new(NoopStorage),
+        None,
+        None,
+        Some(validator),
+    );
+    let mut wrong_signer_bytes = SecretKeyBytes::default();
+    wrong_signer_bytes.as_mut()[31] = 2;
+    let wrong_signer: SecretKey = wrong_signer_bytes
+        .try_into()
+        .expect("scalar two is a valid test key");
+    let mut invalid_envelope = envelope.as_ref().clone();
+    invalid_envelope.signature = invalid_envelope
+        .message
+        .sign(&store.chain_config, &state, &wrong_signer)
+        .into();
+    let invalid_envelope = Arc::new(invalid_envelope);
+    let engine = recording_payload_engine(&store, false);
+
+    let error = store
+        .validate_execution_payload_envelope(
+            &invalid_envelope,
+            &ExecutionPayloadEnvelopeOrigin::Gossip(GossipId::default()),
+            &engine,
+            NullVerifier,
+        )
+        .expect_err("a validly encoded signature from the wrong key must fail authentication");
+
+    assert!(matches!(
+        error.downcast_ref::<helper_functions::error::Error>(),
+        Some(helper_functions::error::Error::SignatureInvalid(
+            SignatureKind::ExecutionPayloadEnvelope
+        ))
+    ));
+    assert!(engine.requests.lock().is_empty());
+    assert!(
+        store
+            .execution_proof_context_capture_trace
+            .lock()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn execution_proof_payload_data_availability_delay_skips_notification_and_capture() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    // All earlier forks must be active before Fulu in fork_slots() iteration; otherwise
+    // phase_at_slot stops at the first unscheduled fork and selects the blob availability
+    // window instead of the data-column window.
+    let chain_config = ChainConfig {
+        altair_fork_epoch: GENESIS_EPOCH,
+        bellatrix_fork_epoch: GENESIS_EPOCH,
+        capella_fork_epoch: GENESIS_EPOCH,
+        deneb_fork_epoch: GENESIS_EPOCH,
+        electra_fork_epoch: GENESIS_EPOCH,
+        fulu_fork_epoch: GENESIS_EPOCH,
+        gloas_fork_epoch: GENESIS_EPOCH,
+        ..Default::default()
+    };
+    store.chain_config = Arc::new(chain_config);
+    store.tick = Tick::start_of_slot(envelope.slot());
+    store.store_sampling_columns([0].into());
+
+    let slot_epoch = misc::compute_epoch_at_slot::<Minimal>(envelope.slot());
+    assert_eq!(slot_epoch, GENESIS_EPOCH);
+    assert_eq!(store.tick.epoch::<Minimal>(), slot_epoch);
+    assert_eq!(
+        store.chain_config.phase_at_slot::<Minimal>(envelope.slot()),
+        Phase::Gloas
+    );
+    assert!(matches!(
+        store.storage_mode(),
+        StorageMode::Standard {
+            custom_data_availability_window: None
+        }
+    ));
+    assert_eq!(
+        store
+            .chain_config
+            .min_epochs_for_data_column_sidecars_requests,
+        4_096
+    );
+    assert_eq!(
+        store
+            .storage_mode()
+            .min_epochs_for_data_column_sidecars_requests(&store.chain_config),
+        4_096
+    );
+    assert_eq!(
+        store.min_checked_data_column_availability_epoch(),
+        GENESIS_EPOCH
+    );
+    assert_eq!(
+        store.min_checked_data_availability_epoch(envelope.slot()),
+        GENESIS_EPOCH
+    );
+    assert!(store.should_check_data_availability_at_slot(envelope.slot()));
+
+    let target_block = &store
+        .chain_link(envelope.block_root())
+        .expect("fixture target block is retained")
+        .block;
+    assert_eq!(target_block.phase(), Phase::Gloas);
+    assert_eq!(store.indices_of_missing_data_columns(target_block), vec![0]);
+
+    let engine = recording_payload_engine(&store, false);
+    let block_root = envelope.block_root();
+    let action = store
+        .validate_execution_payload_envelope(
+            &envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            &engine,
+            NullVerifier,
+        )
+        .expect("missing Gloas data columns should delay, not reject");
+    assert!(matches!(
+        action,
+        ExecutionPayloadEnvelopeValidationAction::DelayUntilData(_, block)
+            if block.message().hash_tree_root() == block_root
+    ));
+    assert!(engine.requests.lock().is_empty());
+    assert!(
+        store
+            .execution_proof_context_capture_trace
+            .lock()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn execution_proof_payload_missing_state_delays_without_notification_or_capture() {
+    let (store, _, envelope) = payload_validation_fixture();
+    let block_root = envelope.block_root();
+    let block = store
+        .chain_link(block_root)
+        .expect("fixture target block is retained")
+        .block
+        .clone_arc();
+    let engine = recording_payload_engine(&store, false);
+
+    let action = store
+        .validate_execution_payload_envelope_with_state(
+            envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            || Some(block),
+            || None,
+            &engine,
+        )
+        .expect("missing callback state should preserve the ordinary delay action");
+    assert!(matches!(
+        action,
+        ExecutionPayloadEnvelopeAction::DelayUntilState(_, root)
+            if root == block_root
+    ));
+    assert!(engine.requests.lock().is_empty());
+    assert!(
+        store
+            .execution_proof_context_capture_trace
+            .lock()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn execution_proof_payload_state_slot_mismatch_rejects_without_notification_or_capture() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    let mismatched_state = Arc::new(BeaconState::from(GloasBeaconState::<Minimal> {
+        slot: envelope.slot() + 1,
+        ..Default::default()
+    }));
+    store
+        .finalized
+        .iter_mut()
+        .next()
+        .expect("fixture anchor remains in the finalized chain")
+        .state = Some(mismatched_state.clone_arc());
+    let engine = recording_payload_engine(&store, false);
+
+    let error = store
+        .validate_execution_payload_envelope(
+            &envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            &engine,
+            NullVerifier,
+        )
+        .expect_err("an inconsistent selected state must preserve ordinary rejection");
+    assert!(matches!(
+        error.downcast_ref::<Error<Minimal>>(),
+        Some(Error::ExecutionPayloadEnvelopeSlotMismatch { .. })
+    ));
+    assert!(engine.requests.lock().is_empty());
+    assert!(
+        store
+            .execution_proof_context_capture_trace
+            .lock()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn execution_proof_capture_disabled_preserves_ordinary_payload_validation_observables() {
+    let (store, state, envelope) = payload_validation_fixture();
+    let ordinary_engine = recording_payload_engine(&store, false);
+    let ordinary = accepted_payload_carrier(&store, &envelope, &ordinary_engine);
+    assert!(ordinary.proof_public_input.is_some());
+
+    let disabled_engine = recording_payload_engine(&store, false);
+    let block_root = envelope.block_root();
+    let disabled = store
+        .validate_execution_payload_envelope_with_state(
+            envelope.clone_arc(),
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            || {
+                store
+                    .chain_link(block_root)
+                    .map(|link| link.block.clone_arc())
+            },
+            || Some(state.clone_arc()),
+            &disabled_engine,
+        )
+        .expect("capture-disabled validation should preserve ordinary acceptance");
+    assert!(matches!(
+        disabled,
+        ExecutionPayloadEnvelopeAction::Accept(_)
+    ));
+    assert_eq!(
+        recorded_payload_request(&ordinary_engine, 0),
+        recorded_payload_request(&disabled_engine, 0)
+    );
+    assert_eq!(
+        *store.execution_proof_context_capture_trace.lock(),
+        ["notify", "capture", "notify"]
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        1
+    );
 }
 
 #[test]
