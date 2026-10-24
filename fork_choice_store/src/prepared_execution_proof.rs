@@ -226,6 +226,15 @@ pub fn prepare_execution_proof<P: Preset, S: Storage<P>>(
         signed_envelope.message.as_ref(),
         &payload_envelope.message,
     )?;
+    if !store.execution_proof_context_is_applicable(
+        prechecked.beacon_block_root,
+        &execution_proof.public_input,
+    ) {
+        return Ok(ExecutionProofPreparation::Ignore(
+            "execution proof's accepted payload context is no longer applicable",
+        ));
+    }
+
     let context_identity = ExecutionProofContextIdentity::new(
         prechecked.beacon_block_root,
         execution_proof.public_input,

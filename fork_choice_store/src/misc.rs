@@ -46,7 +46,10 @@ use types::{
     traits::{self, SignedBeaconBlock as _, SszValidatorList},
 };
 
-use crate::{segment::Position, store::Store};
+use crate::{
+    segment::Position,
+    store::{AcceptedExecutionPayloadEnvelope, Store},
+};
 
 const EMPTY: &str = "empty";
 const FULL: &str = "full";
@@ -1514,6 +1517,29 @@ pub enum ExecutionPayloadEnvelopeAction<P: Preset> {
 }
 
 impl<P: Preset> ExecutionPayloadEnvelopeAction<P> {
+    #[must_use]
+    pub const fn accepted(&self) -> bool {
+        matches!(self, Self::Accept(_))
+    }
+}
+
+/// Result of validating an execution payload envelope for the live Store path.
+///
+/// Its accepted value pairs the ordinary envelope with optional proof context captured after
+/// successful EL submission. Custom-state validation continues to use the raw action above.
+#[derive(Debug)]
+pub enum ExecutionPayloadEnvelopeValidationAction<P: Preset> {
+    Accept(AcceptedExecutionPayloadEnvelope<P>),
+    Ignore(Publishable),
+    DelayUntilBeaconBlock(Arc<SignedExecutionPayloadEnvelope<P>>, H256),
+    DelayUntilState(Arc<SignedExecutionPayloadEnvelope<P>>, H256),
+    DelayUntilData(
+        Arc<SignedExecutionPayloadEnvelope<P>>,
+        Arc<SignedBeaconBlock<P>>,
+    ),
+}
+
+impl<P: Preset> ExecutionPayloadEnvelopeValidationAction<P> {
     #[must_use]
     pub const fn accepted(&self) -> bool {
         matches!(self, Self::Accept(_))

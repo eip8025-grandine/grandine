@@ -12,9 +12,9 @@ use fork_choice_store::{
     AggregateAndProofOrigin, AttestationAction, AttestationItem, AttestationValidationError,
     AttesterSlashingOrigin, BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockOrigin,
     ChainLink, DataColumnSidecarAction, DataColumnSidecarOrigin, ExecutionPayloadBidAction,
-    ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-    ExecutionProofAction, ExecutionProofOrigin, ProposerPreferencesAction,
-    ProposerPreferencesOrigin,
+    ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeOrigin,
+    ExecutionPayloadEnvelopeValidationAction, ExecutionProofAction, ExecutionProofOrigin,
+    ProposerPreferencesAction, ProposerPreferencesOrigin,
 };
 use logging::debug_with_peers;
 use serde::Serialize;
@@ -160,7 +160,7 @@ pub enum MutatorMessage<P: Preset, W> {
     },
     ExecutionPayloadEnvelope {
         wait_group: W,
-        result: Result<ExecutionPayloadEnvelopeAction<P>>,
+        result: Result<ExecutionPayloadEnvelopeValidationAction<P>>,
         origin: ExecutionPayloadEnvelopeOrigin,
         payload_envelope_identifier: PayloadEnvelopeIdentifier,
         seen_before_deadline: bool,

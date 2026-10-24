@@ -34,14 +34,15 @@ use execution_engine::{
     PayloadStatusV1,
 };
 use fork_choice_store::{
-    AggregateAndProofAction, ApplyBlockChanges, ApplyTickChanges, AttestationAction,
-    AttestationItem, AttestationOrigin, AttestationValidationError, AttesterSlashingOrigin,
-    BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockItem, BlockOrigin, ChainLink,
-    DataColumnSidecarAction, DataColumnSidecarOrigin, Error, ExecutionPayloadBidAction,
-    ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-    ExecutionProofAction, ExecutionProofOrigin, PayloadAction, PayloadAttestationAction,
-    PayloadAttestationItem, PayloadPresence, ProposerPreferencesAction, ProposerPreferencesOrigin,
-    StateCacheProcessor, Store, ValidAttestation, ValidPayloadAttestation,
+    AcceptedExecutionPayloadEnvelope, AggregateAndProofAction, ApplyBlockChanges, ApplyTickChanges,
+    AttestationAction, AttestationItem, AttestationOrigin, AttestationValidationError,
+    AttesterSlashingOrigin, BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockItem,
+    BlockOrigin, ChainLink, DataColumnSidecarAction, DataColumnSidecarOrigin, Error,
+    ExecutionPayloadBidAction, ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeOrigin,
+    ExecutionPayloadEnvelopeValidationAction, ExecutionProofAction, ExecutionProofOrigin,
+    PayloadAction, PayloadAttestationAction, PayloadAttestationItem, PayloadPresence,
+    ProposerPreferencesAction, ProposerPreferencesOrigin, StateCacheProcessor, Store,
+    ValidAttestation, ValidPayloadAttestation,
 };
 use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSender};
 use helper_functions::{accessors, misc, predicates, verifier::NullVerifier};
@@ -63,7 +64,7 @@ use types::{
     },
     deneb::containers::{BlobIdentifier, BlobSidecar},
     fulu::{containers::DataColumnIdentifier, primitives::ColumnIndex},
-    gloas::containers::{PayloadEnvelopeIdentifier, SignedExecutionPayloadEnvelope},
+    gloas::containers::PayloadEnvelopeIdentifier,
     nonstandard::{
         PayloadStatus, Phase, RelativeEpoch, ValidationOutcome, ValidationOutcomeWithReason,
     },
@@ -2256,7 +2257,7 @@ where
     fn handle_execution_payload_envelope(
         &mut self,
         wait_group: W,
-        result: Result<ExecutionPayloadEnvelopeAction<P>>,
+        result: Result<ExecutionPayloadEnvelopeValidationAction<P>>,
         origin: ExecutionPayloadEnvelopeOrigin,
         payload_envelope_identifier: PayloadEnvelopeIdentifier,
         seen_before_deadline: bool,
@@ -2264,15 +2265,15 @@ where
         tracing_span: Span,
     ) {
         match result {
-            Ok(ExecutionPayloadEnvelopeAction::Accept(envelope)) => {
+            Ok(ExecutionPayloadEnvelopeValidationAction::Accept(accepted)) => {
                 if let Some(metrics) = self.metrics.as_ref() {
                     metrics.register_mutator_execution_payload_envelope(&["accepted"]);
                 }
 
-                let beacon_block_root = envelope.block_root();
-                let slot = envelope.slot();
-                let builder_index = envelope.builder_index();
-                let block_hash = envelope.message.payload.block_hash;
+                let beacon_block_root = accepted.beacon_block_root();
+                let slot = accepted.slot();
+                let builder_index = accepted.builder_index();
+                let block_hash = accepted.payload_block_hash();
                 let should_send_gossip_event = origin.should_send_gossip_event();
                 let should_generate_event = origin.should_generate_event();
 
@@ -2318,7 +2319,7 @@ where
                     Ok(ValidationOutcome::Accept),
                 );
 
-                self.accept_execution_payload_envelope(&wait_group, envelope, seen_before_deadline);
+                self.accept_execution_payload_envelope(&wait_group, accepted, seen_before_deadline);
 
                 if should_generate_event
                     && let Some(chain_link) = self.store.chain_link(beacon_block_root)
@@ -2362,7 +2363,7 @@ where
                     }
                 }
             }
-            Ok(ExecutionPayloadEnvelopeAction::Ignore(publishable)) => {
+            Ok(ExecutionPayloadEnvelopeValidationAction::Ignore(publishable)) => {
                 if let Some(metrics) = self.metrics.as_ref() {
                     metrics.register_mutator_execution_payload_envelope(&["ignored"]);
                 }
@@ -2378,7 +2379,7 @@ where
                     Ok(ValidationOutcome::Ignore(publishable)),
                 );
             }
-            Ok(ExecutionPayloadEnvelopeAction::DelayUntilBeaconBlock(
+            Ok(ExecutionPayloadEnvelopeValidationAction::DelayUntilBeaconBlock(
                 execution_payload_envelope,
                 beacon_block_root,
             )) => {
@@ -2418,7 +2419,7 @@ where
                     ));
                 }
             }
-            Ok(ExecutionPayloadEnvelopeAction::DelayUntilState(
+            Ok(ExecutionPayloadEnvelopeValidationAction::DelayUntilState(
                 execution_payload_envelope,
                 beacon_block_root,
             )) => {
@@ -2459,7 +2460,7 @@ where
                         .push(pending_envelope);
                 }
             }
-            Ok(ExecutionPayloadEnvelopeAction::DelayUntilData(
+            Ok(ExecutionPayloadEnvelopeValidationAction::DelayUntilData(
                 execution_payload_envelope,
                 block,
             )) => {
@@ -3877,14 +3878,14 @@ where
     fn accept_execution_payload_envelope(
         &mut self,
         wait_group: &W,
-        envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
+        accepted: AcceptedExecutionPayloadEnvelope<P>,
         is_before_deadline: bool,
     ) {
-        let beacon_block_root = envelope.block_root();
-        let execution_block_hash = envelope.message.payload.block_hash;
+        let beacon_block_root = accepted.beacon_block_root();
+        let execution_block_hash = accepted.payload_block_hash();
 
         self.store_mut()
-            .apply_execution_payload_envelope(envelope, is_before_deadline);
+            .apply_execution_payload_envelope(accepted, is_before_deadline);
 
         self.update_store_snapshot();
 
@@ -6340,7 +6341,7 @@ fn reply_delayed_data_column_sidecar_validation_result<P: Preset>(
 #[cfg(test)]
 mod tests {
     use eth2_libp2p::PeerId;
-    use types::preset::Minimal;
+    use types::{gloas::containers::SignedExecutionPayloadEnvelope, preset::Minimal};
 
     use super::*;
 

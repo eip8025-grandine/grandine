@@ -116,10 +116,11 @@ use crate::{
         DataAvailabilityPolicy, DataColumnSidecarAction, DataColumnSidecarOrigin, Difference,
         DifferenceAtLocation, Differences, DissolvedDifference, ExecutionPayloadBidAction,
         ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-        LatestMessage, Location, PartialAttestationAction, PartialBlockAction, PayloadAction,
-        PayloadAttestationAction, PayloadAttestationItem, PayloadAttestationValidationError,
-        PayloadPresence, ProposerPreferencesAction, ProposerPreferencesOrigin, Score, SegmentId,
-        Storage, UnfinalizedBlock, ValidAttestation, ValidPayloadAttestation,
+        ExecutionPayloadEnvelopeValidationAction, LatestMessage, Location,
+        PartialAttestationAction, PartialBlockAction, PayloadAction, PayloadAttestationAction,
+        PayloadAttestationItem, PayloadAttestationValidationError, PayloadPresence,
+        ProposerPreferencesAction, ProposerPreferencesOrigin, Score, SegmentId, Storage,
+        UnfinalizedBlock, ValidAttestation, ValidPayloadAttestation,
     },
     segment::{Position, Segment},
     state_cache_processor::StateCacheProcessor,
@@ -135,6 +136,50 @@ type BranchChildren = StdHashSet<(H256, PayloadPresence)>;
 struct SeenGossipAttestations {
     attesters: BTreeMap<Epoch, BitVec>,
     aggregators: BTreeMap<Epoch, StdHashSet<ValidatorIndex>>,
+}
+
+/// A payload accepted by ordinary Store validation, paired with optional proof context captured
+/// after successful execution-layer submission.
+///
+/// `Some` records the exact `NewPayloadRequest` statement captured from ordinary submission; it
+/// does not represent an EL VALID verdict. Fields and construction stay private so Control cannot
+/// detach or synthesize proof evidence independently of the accepted envelope.
+#[derive(Debug)]
+pub struct AcceptedExecutionPayloadEnvelope<P: Preset> {
+    envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
+    proof_public_input: Option<PublicInput>,
+}
+
+impl<P: Preset> AcceptedExecutionPayloadEnvelope<P> {
+    const fn from_validation(
+        envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
+        proof_public_input: Option<PublicInput>,
+    ) -> Self {
+        Self {
+            envelope,
+            proof_public_input,
+        }
+    }
+
+    #[must_use]
+    pub fn beacon_block_root(&self) -> H256 {
+        self.envelope.block_root()
+    }
+
+    #[must_use]
+    pub fn slot(&self) -> Slot {
+        self.envelope.slot()
+    }
+
+    #[must_use]
+    pub fn builder_index(&self) -> BuilderIndex {
+        self.envelope.builder_index()
+    }
+
+    #[must_use]
+    pub fn payload_block_hash(&self) -> ExecutionBlockHash {
+        self.envelope.message.payload.block_hash
+    }
 }
 
 /// [`Store`] from the Fork Choice specification.
@@ -232,6 +277,11 @@ pub struct Store<P: Preset, S: Storage<P>> {
     // - Obtaining active balances from the justified state requires it to be in the right epoch.
     checkpoint_states: HashMap<Checkpoint, Arc<BeaconState<P>>>,
     payloads: HashSet<H256>,
+    // The full proof statement captured from a successfully submitted ordinary payload request.
+    // This is separate from both payload-byte cache residency and execution-engine VALID status.
+    // Retired entries may remain until the deferred physical-pruning follow-up; applicability
+    // always checks the live retained-block domain before trusting one.
+    execution_proof_contexts: HashMap<H256, PublicInput>,
     timely_payloads: HashSet<H256>,
     // This field is used to track which PTC members have cast a valid vote for a given block root.
     payload_vote: HashMap<H256, BitVector<P::PtcSize>>,
@@ -332,11 +382,21 @@ pub struct Store<P: Preset, S: Storage<P>> {
     delayed_block_at_slot: HashMap<Slot, H256>,
     requested_blobs_from_el: HashMap<H256, Slot>,
     current_slot_blocks_in_processing: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_execution_proof_context_capture: bool,
+    #[cfg(test)]
+    execution_proof_context_capture_attempts: Arc<AtomicUsize>,
+    #[cfg(test)]
+    execution_proof_context_capture_trace: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl<P: Preset, S: Storage<P>> Store<P, S> {
     /// [`get_forkchoice_store`](https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/phase0/fork-choice.md#get_forkchoice_store)
     #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep anchor initialization and the complete Store snapshot fields together"
+    )]
     #[must_use]
     pub fn new(
         chain_config: Arc<ChainConfig>,
@@ -420,6 +480,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             } },
             checkpoint_states: HashMap::unit(checkpoint, anchor_state),
             payloads: HashSet::new(),
+            execution_proof_contexts: HashMap::new(),
             timely_payloads: HashSet::new(),
             payload_vote: HashMap::new(),
             payload_timeliness_vote: HashMap::new(),
@@ -454,6 +515,12 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             delayed_block_at_slot: HashMap::default(),
             requested_blobs_from_el: HashMap::default(),
             current_slot_blocks_in_processing: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_execution_proof_context_capture: false,
+            #[cfg(test)]
+            execution_proof_context_capture_attempts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            execution_proof_context_capture_trace: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -4019,7 +4086,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         origin: &ExecutionPayloadEnvelopeOrigin,
         execution_engine: &(impl ExecutionEngine<P> + Send),
         _verifier: impl Verifier + Send,
-    ) -> Result<ExecutionPayloadEnvelopeAction<P>> {
+    ) -> Result<ExecutionPayloadEnvelopeValidationAction<P>> {
         let block_root = envelope.block_root();
         let chain_link = self.chain_link(block_root);
 
@@ -4047,13 +4114,35 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
                 })
         };
 
-        self.validate_execution_payload_envelope_with_state(
-            envelope.clone_arc(),
-            origin,
-            block_info,
-            state_fn,
-            execution_engine,
-        )
+        let (action, proof_public_input) = self
+            .validate_execution_payload_envelope_with_state_inner(
+                envelope.clone_arc(),
+                origin,
+                block_info,
+                state_fn,
+                execution_engine,
+                true,
+            )?;
+
+        Ok(match action {
+            ExecutionPayloadEnvelopeAction::Accept(envelope) => {
+                ExecutionPayloadEnvelopeValidationAction::Accept(
+                    AcceptedExecutionPayloadEnvelope::from_validation(envelope, proof_public_input),
+                )
+            }
+            ExecutionPayloadEnvelopeAction::Ignore(publishable) => {
+                ExecutionPayloadEnvelopeValidationAction::Ignore(publishable)
+            }
+            ExecutionPayloadEnvelopeAction::DelayUntilBeaconBlock(envelope, root) => {
+                ExecutionPayloadEnvelopeValidationAction::DelayUntilBeaconBlock(envelope, root)
+            }
+            ExecutionPayloadEnvelopeAction::DelayUntilState(envelope, root) => {
+                ExecutionPayloadEnvelopeValidationAction::DelayUntilState(envelope, root)
+            }
+            ExecutionPayloadEnvelopeAction::DelayUntilData(envelope, block) => {
+                ExecutionPayloadEnvelopeValidationAction::DelayUntilData(envelope, block)
+            }
+        })
     }
 
     pub fn validate_execution_payload_envelope_for_gossip_rules(
@@ -4092,7 +4181,6 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         None
     }
 
-    #[expect(clippy::too_many_lines)]
     pub fn validate_execution_payload_envelope_with_state(
         &self,
         envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
@@ -4101,6 +4189,27 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         state_fn: impl FnOnce() -> Option<Arc<BeaconState<P>>>,
         execution_engine: &(impl ExecutionEngine<P> + Send),
     ) -> Result<ExecutionPayloadEnvelopeAction<P>> {
+        self.validate_execution_payload_envelope_with_state_inner(
+            envelope,
+            origin,
+            block_info,
+            state_fn,
+            execution_engine,
+            false,
+        )
+        .map(|(action, _)| action)
+    }
+
+    #[expect(clippy::too_many_lines)]
+    fn validate_execution_payload_envelope_with_state_inner(
+        &self,
+        envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
+        origin: &ExecutionPayloadEnvelopeOrigin,
+        block_info: impl FnOnce() -> Option<Arc<SignedBeaconBlock<P>>>,
+        state_fn: impl FnOnce() -> Option<Arc<BeaconState<P>>>,
+        execution_engine: &(impl ExecutionEngine<P> + Send),
+        capture_proof_context: bool,
+    ) -> Result<(ExecutionPayloadEnvelopeAction<P>, Option<PublicInput>)> {
         let slot = envelope.slot();
         let beacon_block_root = envelope.block_root();
         let builder_index = envelope.builder_index();
@@ -4108,7 +4217,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         if let Some(payload_action) =
             self.validate_execution_payload_envelope_for_gossip_rules(&envelope, origin)
         {
-            return Ok(payload_action);
+            return Ok((payload_action, None));
         }
 
         // [REJECT] block passes validation.
@@ -4123,9 +4232,9 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         // (a client MAY queue envelope for processing once the block is retrieved)
         let Some(block) = block_info() else {
             // Block not available yet, delay until it arrives
-            return Ok(ExecutionPayloadEnvelopeAction::DelayUntilBeaconBlock(
-                envelope,
-                beacon_block_root,
+            return Ok((
+                ExecutionPayloadEnvelopeAction::DelayUntilBeaconBlock(envelope, beacon_block_root),
+                None,
             ));
         };
 
@@ -4180,16 +4289,16 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         if self.should_check_data_availability_at_slot(slot)
             && !self.indices_of_missing_data_columns(&block).is_empty()
         {
-            return Ok(ExecutionPayloadEnvelopeAction::DelayUntilData(
-                envelope,
-                block.clone_arc(),
+            return Ok((
+                ExecutionPayloadEnvelopeAction::DelayUntilData(envelope, block.clone_arc()),
+                None,
             ));
         }
 
         let Some(state) = state_fn() else {
-            return Ok(ExecutionPayloadEnvelopeAction::DelayUntilState(
-                envelope,
-                beacon_block_root,
+            return Ok((
+                ExecutionPayloadEnvelopeAction::DelayUntilState(envelope, beacon_block_root),
+                None,
             ));
         };
 
@@ -4308,7 +4417,16 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         // TODO(Gloas): review envelope validation for HTTP API
         execution_engine.notify_new_payload(beacon_block_root, payload, params, None)?;
 
-        Ok(ExecutionPayloadEnvelopeAction::Accept(envelope))
+        let proof_public_input = if capture_proof_context {
+            self.capture_execution_proof_public_input(&envelope.message, bid)
+        } else {
+            None
+        };
+
+        Ok((
+            ExecutionPayloadEnvelopeAction::Accept(envelope),
+            proof_public_input,
+        ))
     }
 
     /// Implements `verify_execution_proof_envelope`:
@@ -4430,6 +4548,54 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             chain_id: self.chain_config.deposit_chain_id,
             schema_id: STATELESS_INPUT_SCHEMA_ID,
         })
+    }
+
+    /// Captures the submitted ordinary request's statement after notification succeeds.
+    /// Errors are local bookkeeping failures and therefore cannot change the payload action.
+    fn capture_execution_proof_public_input(
+        &self,
+        payload_envelope: &ExecutionPayloadEnvelope<P>,
+        bid: &ExecutionPayloadBid<P>,
+    ) -> Option<PublicInput> {
+        // A forced test failure short-circuits before the shared binder, so failure coverage does
+        // not hash the request and production/test builds call the same builder.
+        let result: Result<()> = Ok(());
+        #[cfg(test)]
+        let result = {
+            self.execution_proof_context_capture_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            self.execution_proof_context_capture_trace
+                .lock()
+                .push("capture");
+            if self.fail_execution_proof_context_capture {
+                Err(anyhow!("test-only forced proof-context capture failure"))
+            } else {
+                result
+            }
+        };
+
+        let result = result.and_then(|()| {
+            self.execution_proof_public_input_from_parts(
+                payload_envelope,
+                bid.blob_kzg_commitments
+                    .iter()
+                    .copied()
+                    .map(misc::kzg_commitment_to_versioned_hash),
+            )
+        });
+
+        match result {
+            Ok(public_input) => Some(public_input),
+            Err(error) => {
+                tracing::warn!(
+                    "execution proof context capture failed after payload submission \
+                    (block root: {:?}, cause: {})",
+                    payload_envelope.beacon_block_root,
+                    error,
+                );
+                None
+            }
+        }
     }
 
     pub fn validate_payload_attestation(
@@ -5062,13 +5228,18 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
 
     pub fn apply_execution_payload_envelope(
         &mut self,
-        envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
+        accepted: AcceptedExecutionPayloadEnvelope<P>,
         is_before_deadline: bool,
     ) {
+        let AcceptedExecutionPayloadEnvelope {
+            envelope,
+            proof_public_input,
+        } = accepted;
         let slot = envelope.slot();
         let beacon_block_root = envelope.block_root();
         let builder_index = envelope.builder_index();
 
+        // Ordinary payload acceptance and selection remain unconditional on optional proof data.
         let first_delivery = self.payloads.insert(beacon_block_root).is_none();
 
         if is_before_deadline {
@@ -5095,6 +5266,18 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         }
 
         self.execution_payload_envelope_cache.insert(envelope);
+
+        let is_retained = beacon_block_root == self.last_finalized().block_root
+            || self.unfinalized_locations.contains_key(&beacon_block_root);
+        if is_retained && let Some(public_input) = proof_public_input {
+            self.execution_proof_contexts
+                .insert(beacon_block_root, public_input);
+            return;
+        }
+
+        // Any selection without paired evidence revokes old authority, including an
+        // equivalent payload replacement whose fresh best-effort capture failed.
+        self.execution_proof_contexts.remove(&beacon_block_root);
     }
 
     pub fn apply_blob_sidecar(&mut self, blob_sidecar: Arc<BlobSidecar<P>>) {
@@ -5649,6 +5832,22 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         &self.execution_proof_provers
     }
 
+    /// Cheaply checks whether the live accepted payload still represents a prepared full-Q identity.
+    /// The retained-domain check deliberately remains even while physical proof-map pruning is
+    /// deferred: stale resident entries must not authorize a retired target.
+    pub(crate) fn execution_proof_context_is_applicable(
+        &self,
+        block_root: H256,
+        public_input: &PublicInput,
+    ) -> bool {
+        let is_retained = block_root == self.last_finalized().block_root
+            || self.unfinalized_locations.contains_key(&block_root);
+
+        is_retained
+            && self.payloads.contains(&block_root)
+            && self.execution_proof_contexts.get(&block_root) == Some(public_input)
+    }
+
     // `Vector` has no `resize` method as of `im` version 15.1.0.
     fn extend_latest_messages_after_finalization(&mut self) {
         let old_length = self.latest_messages.len();
@@ -5659,8 +5858,8 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
     }
 
     fn prune_after_finalization(&mut self) {
-        // TODO(eip8025-grandine): Prune execution_proof_roots, execution_proof_provers,
-        // and execution_proofs after finalization.
+        // TODO(eip8025-grandine): A later cleanup PR must physically prune execution_proof_contexts,
+        // execution_proof_roots, execution_proof_provers, and execution_proofs after finalization.
         if let Some(partially_finalized_location) = self.finalize_blocks() {
             self.prune_orphans(partially_finalized_location);
         }

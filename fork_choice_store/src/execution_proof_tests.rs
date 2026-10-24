@@ -3,15 +3,15 @@ use std::collections::HashMap as StdHashMap;
 use super::*;
 use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
 use spec_test_utils::Case;
-use ssz::{Hc, SszRead as _, SszWrite as _};
+use ssz::{Hc, ProgressiveList, SszRead as _, SszWrite as _};
 use types::{
     eip8025::containers::ProofData,
     gloas::{
         beacon_state::BeaconState as GloasBeaconState,
         containers::{
             BeaconBlock as GloasBeaconBlock, BeaconBlockBody as GloasBeaconBlockBody,
-            ExecutionPayload as GloasExecutionPayload, ExecutionRequests,
-            SignedBeaconBlock as GloasSignedBeaconBlock,
+            ExecutionPayload as GloasExecutionPayload, ExecutionPayloadBid, ExecutionRequests,
+            SignedBeaconBlock as GloasSignedBeaconBlock, SignedExecutionPayloadBid,
         },
     },
     phase0::{
@@ -25,6 +25,13 @@ use types::{
     preset::Minimal,
 };
 
+type PayloadValidationFixture<S> = (
+    Store<Minimal, S>,
+    Arc<BeaconState<Minimal>>,
+    Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+);
+
+#[derive(Clone)]
 struct NoopStorage;
 
 impl Storage<Minimal> for NoopStorage {
@@ -66,6 +73,303 @@ impl Storage<Minimal> for ContextStorage {
 
         Ok(self.states.lock().get(&block_root).cloned())
     }
+}
+
+struct RecordedPayloadSubmission {
+    block_root: H256,
+    payload: types::combined::ExecutionPayload<Minimal>,
+    params: Option<ExecutionPayloadParams<Minimal>>,
+}
+
+struct RecordingPayloadEngine {
+    requests: Arc<Mutex<Vec<RecordedPayloadSubmission>>>,
+    trace: Arc<Mutex<Vec<&'static str>>>,
+    fail_notification: bool,
+}
+
+impl ExecutionEngine<Minimal> for RecordingPayloadEngine {
+    const IS_NULL: bool = false;
+
+    fn allow_optimistic_merge_block_validation(&self) -> bool {
+        false
+    }
+
+    fn exchange_capabilities(&self) {}
+
+    fn get_blobs(&self, _params: execution_engine::EngineGetBlobsParams<Minimal>) {}
+
+    fn get_payload_bodies_by_hash(
+        &self,
+        _block_hashes: Vec<ExecutionBlockHash>,
+        _sender: futures::channel::oneshot::Sender<
+            Result<Vec<Option<types::nonstandard::ExecutionPayloadBody<Minimal>>>>,
+        >,
+    ) {
+    }
+
+    fn notify_forkchoice_updated(
+        &self,
+        _head_eth1_block_hash: ExecutionBlockHash,
+        _safe_eth1_block_hash: ExecutionBlockHash,
+        _finalized_eth1_block_hash: ExecutionBlockHash,
+        _payload_attributes: Either<Phase, execution_engine::PayloadAttributes<Minimal>>,
+        _sender: Option<futures::channel::oneshot::Sender<Option<execution_engine::PayloadId>>>,
+    ) {
+    }
+
+    fn notify_new_payload(
+        &self,
+        block_root: H256,
+        payload: types::combined::ExecutionPayload<Minimal>,
+        params: Option<ExecutionPayloadParams<Minimal>>,
+        _sender: Option<
+            futures::channel::oneshot::Sender<Result<execution_engine::PayloadStatusV1>>,
+        >,
+    ) -> Result<()> {
+        self.trace.lock().push("notify");
+        self.requests.lock().push(RecordedPayloadSubmission {
+            block_root,
+            payload,
+            params,
+        });
+
+        if self.fail_notification {
+            anyhow::bail!("test-only execution submission failure");
+        }
+        Ok(())
+    }
+
+    fn pow_block(
+        &self,
+        _block_hash: ExecutionBlockHash,
+    ) -> Option<types::nonstandard::TimedPowBlock> {
+        None
+    }
+
+    fn stop(&self) {}
+}
+
+fn payload_validation_fixture() -> PayloadValidationFixture<NoopStorage> {
+    payload_validation_fixture_with_state_bid_commitments(Arc::new(NoopStorage), None, None, None)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the state, bid, and envelope share roots best shown in one fixture"
+)]
+fn payload_validation_fixture_with_state_bid_commitments<S: Storage<Minimal>>(
+    storage: Arc<S>,
+    block_bid_commitments: Option<Vec<KzgCommitment>>,
+    state_bid_commitments: Option<Vec<KzgCommitment>>,
+    validator: Option<Validator>,
+) -> PayloadValidationFixture<S> {
+    let chain_config = Arc::new(ChainConfig::default());
+    let parent_beacon_block_root = H256::repeat_byte(0x33);
+    let execution_requests = ExecutionRequests::<Minimal> {
+        deposits: ProgressiveList::try_from(vec![types::electra::containers::DepositRequest {
+            withdrawal_credentials: H256::repeat_byte(0x91),
+            amount: 32,
+            index: 7,
+            ..Default::default()
+        }])
+        .expect("one execution deposit request fits its bound"),
+        ..Default::default()
+    };
+    let mut bid = ExecutionPayloadBid::<Minimal> {
+        block_hash: ExecutionBlockHash::repeat_byte(0x44),
+        prev_randao: H256::repeat_byte(0x55),
+        gas_limit: 30_000_000,
+        builder_index: BUILDER_INDEX_SELF_BUILD,
+        execution_requests_root: execution_requests.hash_tree_root(),
+        ..Default::default()
+    };
+    bid.blob_kzg_commitments =
+        ProgressiveList::try_from(block_bid_commitments.unwrap_or_else(|| {
+            vec![
+                KzgCommitment::repeat_byte(0x66),
+                KzgCommitment::repeat_byte(0x77),
+            ]
+        }))
+        .expect("fixture block commitments fit the progressive-list bound");
+    let body = GloasBeaconBlockBody::<Minimal> {
+        signed_execution_payload_bid: SignedExecutionPayloadBid {
+            message: bid.clone(),
+            signature: <_>::default(),
+        },
+        ..Default::default()
+    };
+    let mut state_bid = bid.clone();
+    if let Some(commitments) = state_bid_commitments {
+        state_bid.blob_kzg_commitments = ProgressiveList::try_from(commitments)
+            .expect("fixture state commitments fit the progressive-list bound");
+    }
+    let state = Arc::new(BeaconState::from(GloasBeaconState::<Minimal> {
+        validators: validator.into_iter().collect(),
+        latest_block_header: BeaconBlockHeader {
+            parent_root: parent_beacon_block_root,
+            body_root: body.hash_tree_root(),
+            ..Default::default()
+        },
+        latest_execution_payload_bid: state_bid,
+        ..Default::default()
+    }));
+    let block = GloasSignedBeaconBlock {
+        message: Hc::from(GloasBeaconBlock {
+            parent_root: parent_beacon_block_root,
+            state_root: state.hash_tree_root(),
+            body,
+            ..Default::default()
+        }),
+        signature: <_>::default(),
+    };
+    let block_root = block.message.hash_tree_root();
+    assert_eq!(accessors::latest_block_root(&state), block_root);
+    let timestamp = misc::compute_timestamp_at_slot(&chain_config, &state, state.slot())
+        .expect("fixture Gloas timestamp should be computable");
+    let payload_envelope = Arc::new(SignedExecutionPayloadEnvelope {
+        message: ExecutionPayloadEnvelope {
+            payload: GloasExecutionPayload {
+                parent_hash: state
+                    .post_gloas()
+                    .expect("fixture state is Gloas")
+                    .latest_block_hash(),
+                prev_randao: bid.prev_randao,
+                gas_limit: bid.gas_limit,
+                gas_used: 21_000,
+                block_number: 12,
+                timestamp,
+                fee_recipient: types::phase0::primitives::ExecutionAddress::repeat_byte(0x88),
+                block_hash: bid.block_hash,
+                extra_data: Arc::new(
+                    ssz::ByteList::try_from(vec![0x10, 0x20, 0x30])
+                        .expect("fixture extra data fits its bound"),
+                ),
+                transactions: Arc::new(
+                    ProgressiveList::try_from(vec![
+                        types::gloas::primitives::Transaction::<Minimal>::try_from(vec![
+                            0x02, 0x03, 0x04,
+                        ])
+                        .expect("fixture transaction fits its bound"),
+                    ])
+                    .expect("one fixture transaction fits its bound"),
+                ),
+                slot_number: state.slot(),
+                ..Default::default()
+            },
+            execution_requests,
+            builder_index: bid.builder_index,
+            beacon_block_root: block_root,
+            parent_beacon_block_root,
+        },
+        ..Default::default()
+    });
+    let store = Store::new(
+        chain_config,
+        Arc::new(PubkeyCache::default()),
+        StoreConfig::default(),
+        Arc::new(SignedBeaconBlock::<Minimal>::from(block)),
+        state.clone_arc(),
+        storage,
+        false,
+        false,
+        StdHashSet::default(),
+        Arc::new(SccHashMap::new()),
+    );
+
+    (store, state, payload_envelope)
+}
+
+fn recording_payload_engine<S: Storage<Minimal>>(
+    store: &Store<Minimal, S>,
+    fail_notification: bool,
+) -> RecordingPayloadEngine {
+    RecordingPayloadEngine {
+        requests: Arc::default(),
+        trace: store.execution_proof_context_capture_trace.clone_arc(),
+        fail_notification,
+    }
+}
+
+fn recorded_payload_request(
+    engine: &RecordingPayloadEngine,
+    index: usize,
+) -> (H256, NewPayloadRequest<Minimal>) {
+    let submissions = engine.requests.lock();
+    let submission = &submissions[index];
+    (
+        submission.block_root,
+        NewPayloadRequest::new(
+            &submission.payload,
+            submission
+                .params
+                .as_ref()
+                .expect("ordinary Gloas submission has request params"),
+        )
+        .expect("healthy submitted request should satisfy constructor bounds"),
+    )
+}
+
+fn payload_carrier_from_snapshot<S: Storage<Minimal> + Clone>(
+    store: &Store<Minimal, S>,
+    envelope: &Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+    fail_capture: bool,
+) -> AcceptedExecutionPayloadEnvelope<Minimal> {
+    let mut validation_snapshot = store.clone();
+    validation_snapshot.fail_execution_proof_context_capture = fail_capture;
+    let engine = recording_payload_engine(&validation_snapshot, false);
+    accepted_payload_carrier(&validation_snapshot, envelope, &engine)
+}
+
+fn accepted_payload_carrier<S: Storage<Minimal>>(
+    store: &Store<Minimal, S>,
+    envelope: &Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+    engine: &RecordingPayloadEngine,
+) -> AcceptedExecutionPayloadEnvelope<Minimal> {
+    match store
+        .validate_execution_payload_envelope(
+            envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            engine,
+            NullVerifier,
+        )
+        .expect("ordinary payload validation should return an action")
+    {
+        ExecutionPayloadEnvelopeValidationAction::Accept(accepted) => accepted,
+        _ => panic!("fixture payload should be accepted by ordinary validation"),
+    }
+}
+
+fn assert_selected_payload_application<S: Storage<Minimal>>(
+    store: &Store<Minimal, S>,
+    envelope: &Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+    proof_public_input: Option<PublicInput>,
+    is_timely: bool,
+) {
+    let block_root = envelope.block_root();
+    assert!(store.payloads.contains(&block_root));
+    assert_eq!(
+        store.timely_payloads.contains(&block_root),
+        is_timely,
+        "timely marker should follow ordinary deadline handling"
+    );
+    assert!(store.accepted_execution_payload_envelopes.contains(&(
+        envelope.slot(),
+        block_root,
+        envelope.builder_index(),
+    )));
+    assert_eq!(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .expect("ordinary application should select the envelope")
+            .as_ref(),
+        envelope.as_ref(),
+        "the full selected envelope must remain paired with its evidence"
+    );
+    assert_eq!(
+        store.execution_proof_contexts.get(&block_root).copied(),
+        proof_public_input,
+        "proof authority must match the currently selected envelope"
+    );
 }
 
 fn gloas_context_store(
@@ -135,6 +439,32 @@ fn cache_accepted_test_payload(
         .execution_payload_envelope_cache
         .insert(envelope.clone_arc());
     envelope
+}
+
+fn seed_execution_proof_context_for_test(
+    store: &mut Store<Minimal, ContextStorage>,
+    state: &BeaconState<Minimal>,
+    payload_envelope: &ExecutionPayloadEnvelope<Minimal>,
+) {
+    // Successful-preparation fixtures model the paired Store apply result explicitly. Context
+    // loader/replay fixtures intentionally use marker/cache only and do not seed this identity.
+    let post_gloas_state = state
+        .post_gloas()
+        .expect("proof-preparation fixture must use a Gloas state");
+    let public_input = store
+        .execution_proof_public_input_from_parts(
+            payload_envelope,
+            post_gloas_state
+                .latest_execution_payload_bid()
+                .blob_kzg_commitments
+                .iter()
+                .copied()
+                .map(misc::kzg_commitment_to_versioned_hash),
+        )
+        .expect("fixture state and payload should have bindable Gloas context");
+    store
+        .execution_proof_contexts
+        .insert(payload_envelope.beacon_block_root, public_input);
 }
 
 fn context_signed_envelope(block_root: H256) -> SignedExecutionProofEnvelope {
@@ -708,7 +1038,8 @@ fn proof_preparation_fixture(
         Arc::new(SccHashMap::new()),
     );
     if accepted_payload {
-        cache_accepted_test_payload(&mut store, block_root, state.slot());
+        let payload_envelope = cache_accepted_test_payload(&mut store, block_root, state.slot());
+        seed_execution_proof_context_for_test(&mut store, &state, &payload_envelope.message);
     }
 
     let envelope = ExecutionProofEnvelope {
@@ -2193,5 +2524,221 @@ fn execution_proof_preparation_propagates_binding_failures_as_local_errors() {
         error.downcast_ref::<Error<Minimal>>().is_none(),
         "binding failure must not be turned into a peer-invalid Store rejection"
     );
+    assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+}
+
+#[test]
+fn execution_proof_payload_context_capture_failure_is_after_notify_and_does_not_change_acceptance()
+{
+    let (mut store, _, envelope) = payload_validation_fixture();
+    store.fail_execution_proof_context_capture = true;
+    let engine = recording_payload_engine(&store, false);
+    let block_root = envelope.block_root();
+
+    let accepted = accepted_payload_carrier(&store, &envelope, &engine);
+
+    assert_eq!(
+        *store.execution_proof_context_capture_trace.lock(),
+        ["notify", "capture"]
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(engine.requests.lock().len(), 1);
+    assert!(accepted.proof_public_input.is_none());
+    assert!(!store.is_payload_verified(block_root));
+
+    store.apply_execution_payload_envelope(accepted, true);
+
+    assert!(store.is_payload_verified(block_root));
+    assert_selected_payload_application(&store, &envelope, None, true);
+}
+
+#[test]
+fn execution_proof_payload_capture_matches_full_submitted_request_and_trusted_proof_binder() {
+    let (mut store, state, envelope) = payload_validation_fixture();
+    let engine = recording_payload_engine(&store, false);
+    let accepted = accepted_payload_carrier(&store, &envelope, &engine);
+    let captured = accepted
+        .proof_public_input
+        .expect("healthy ordinary validation should capture its statement");
+    let block_root = envelope.block_root();
+    let (notified_root, submitted_request) = recorded_payload_request(&engine, 0);
+    assert_eq!(notified_root, block_root);
+
+    let block = &store
+        .chain_link(block_root)
+        .expect("fixture block is retained")
+        .block;
+    let bid = block
+        .message()
+        .body()
+        .with_payload_bid()
+        .map(|body| &body.signed_execution_payload_bid().message)
+        .expect("fixture block has the selected payload bid");
+    let state_bid = state
+        .post_gloas()
+        .expect("fixture state is Gloas")
+        .latest_execution_payload_bid();
+    assert_eq!(bid, state_bid);
+    assert_eq!(bid.blob_kzg_commitments.len(), 2);
+    assert_eq!(envelope.message.execution_requests.deposits.len(), 1);
+    assert_eq!(envelope.message.payload.transactions.len(), 1);
+    assert_ne!(
+        envelope.message.parent_beacon_block_root,
+        H256::zero(),
+        "fixture parent beacon block root must exercise request binding"
+    );
+    assert_eq!(
+        envelope.message.parent_beacon_block_root,
+        state.latest_block_header().parent_root
+    );
+    let expected_payload =
+        types::combined::ExecutionPayload::Gloas(envelope.message.payload.clone());
+    let expected_params = ExecutionPayloadParams::Gloas {
+        versioned_hashes: bid
+            .blob_kzg_commitments
+            .iter()
+            .copied()
+            .map(misc::kzg_commitment_to_versioned_hash)
+            .collect(),
+        parent_beacon_block_root: state.latest_block_header().parent_root,
+        execution_requests: envelope.message.execution_requests.clone(),
+    };
+    let reconstructed_request = NewPayloadRequest::new(&expected_payload, &expected_params)
+        .expect("selected block bid and Gloas envelope form a request");
+    assert_eq!(
+        submitted_request, reconstructed_request,
+        "capture must use every field from the ordinary submitted request"
+    );
+    assert_eq!(
+        captured.new_payload_request_root,
+        submitted_request.zkboost_compatible_root()
+    );
+
+    let trusted_binding = store
+        .get_execution_proof(
+            &state,
+            &ExecutionProofEnvelope::default(),
+            &envelope.message,
+        )
+        .expect("the trusted PR17 binder should reconstruct the same healthy statement");
+    assert_eq!(captured, trusted_binding.public_input);
+
+    store.apply_execution_payload_envelope(accepted, false);
+    assert_eq!(
+        store.execution_proof_contexts.get(&block_root),
+        Some(&captured)
+    );
+    assert!(store.execution_proof_context_is_applicable(block_root, &captured));
+}
+
+#[test]
+fn execution_proof_payload_context_capture_declines_oversized_binding_without_changing_acceptance()
+{
+    let oversized_commitments = vec![KzgCommitment::repeat_byte(0x66); 4097];
+    let (mut store, _, envelope) = payload_validation_fixture_with_state_bid_commitments(
+        Arc::new(NoopStorage),
+        Some(oversized_commitments),
+        None,
+        None,
+    );
+    let engine = recording_payload_engine(&store, false);
+    let block_root = envelope.block_root();
+
+    let accepted = accepted_payload_carrier(&store, &envelope, &engine);
+
+    assert_eq!(
+        *store.execution_proof_context_capture_trace.lock(),
+        ["notify", "capture"]
+    );
+    assert_eq!(
+        store
+            .execution_proof_context_capture_attempts
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(engine.requests.lock().len(), 1);
+    {
+        let submissions = engine.requests.lock();
+        let submission = &submissions[0];
+        assert_eq!(submission.block_root, block_root);
+        assert!(matches!(
+            &submission.payload,
+            types::combined::ExecutionPayload::Gloas(_)
+        ));
+        let Some(ExecutionPayloadParams::Gloas {
+            versioned_hashes, ..
+        }) = submission.params.as_ref()
+        else {
+            panic!("ordinary oversized submission must preserve its raw Gloas params");
+        };
+        assert_eq!(versioned_hashes.len(), 4097);
+    }
+    assert!(accepted.proof_public_input.is_none());
+    assert!(!store.is_payload_verified(block_root));
+
+    store.apply_execution_payload_envelope(accepted, true);
+
+    assert!(store.is_payload_verified(block_root));
+    assert_selected_payload_application(&store, &envelope, None, true);
+}
+
+#[test]
+fn execution_proof_live_payload_applicability_compares_every_public_input_field() {
+    let (mut store, _, envelope) = payload_validation_fixture();
+    let accepted = payload_carrier_from_snapshot(&store, &envelope, false);
+    let public_input = accepted.proof_public_input.expect("capture should succeed");
+    let block_root = envelope.block_root();
+    store.apply_execution_payload_envelope(accepted, false);
+
+    let different_request_root = H256::repeat_byte(0x99);
+    assert_ne!(
+        different_request_root,
+        public_input.new_payload_request_root
+    );
+    let mismatches = [
+        PublicInput {
+            new_payload_request_root: different_request_root,
+            ..public_input
+        },
+        PublicInput {
+            successful_validation: !public_input.successful_validation,
+            ..public_input
+        },
+        PublicInput {
+            chain_id: public_input.chain_id.wrapping_add(1),
+            ..public_input
+        },
+        PublicInput {
+            schema_id: public_input.schema_id ^ 1,
+            ..public_input
+        },
+    ];
+    for mismatch in mismatches {
+        assert!(!store.execution_proof_context_is_applicable(block_root, &mismatch));
+    }
+    let mut markerless_snapshot = store.clone();
+    markerless_snapshot.payloads.remove(&block_root);
+    assert!(!markerless_snapshot.execution_proof_context_is_applicable(block_root, &public_input));
+    assert!(store.execution_proof_context_is_applicable(block_root, &public_input));
+}
+
+#[test]
+fn execution_proof_preparation_ignores_missing_live_payload_identity() {
+    let (mut store, _, signed_proof) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let block_root = signed_proof.message.beacon_block_root;
+    store.execution_proof_contexts.remove(&block_root);
+    let bookkeeping = execution_proof_bookkeeping(&store);
+
+    assert!(matches!(
+        crate::prepare_execution_proof(&store, &signed_proof),
+        Ok(crate::ExecutionProofPreparation::Ignore(
+            "execution proof's accepted payload context is no longer applicable"
+        ))
+    ));
     assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
 }
