@@ -8,6 +8,11 @@ use crate::engine::ProofEngine;
 /// `execution_proof_valid` drives the happy + reject paths of
 /// [`verify_execution_proof`](ProofEngine::verify_execution_proof) with no
 /// real verifier.
+///
+/// This is a stub for callers whose tests do not depend on proof
+/// contents. It is not zkboost mock verification, which
+/// [`ZkvmProofEngine`](crate::ZkvmProofEngine) performs for proof types
+/// configured as [`BackendSpec::ZkboostMock`](crate::BackendSpec::ZkboostMock).
 #[derive(Clone, Debug, Default)]
 pub struct MockProofEngine {
     execution_proof_valid: bool,

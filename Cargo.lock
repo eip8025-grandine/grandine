@@ -11914,6 +11914,13 @@ dependencies = [
 name = "proof_engine"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "hex-literal 1.1.0",
+ "logging",
+ "panics",
+ "ssz",
+ "thiserror 2.0.18",
+ "tracing",
  "types",
 ]
 
