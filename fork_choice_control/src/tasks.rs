@@ -1229,7 +1229,7 @@ mod tests {
 
     use eth2_libp2p::GossipId;
     use fork_choice_store::{ExecutionProofAction, ExecutionProofOrigin};
-    use proof_engine::{MockProofEngine, NullProofEngine, ProofEngine};
+    use proof_engine::{MockProofEngine, NullProofEngine, ProofEngine, ProofVerdict};
     use pubkey_cache::PubkeyCache;
     use ssz::Hc;
     use types::{
@@ -1288,9 +1288,12 @@ mod tests {
 
     #[test]
     fn stub_pipeline_ignores_against_mock_engine() {
-        for execution_proof_valid in [true, false] {
-            let proof_engine: Arc<dyn ProofEngine> =
-                Arc::new(MockProofEngine::new(execution_proof_valid));
+        for verdict in [
+            ProofVerdict::Valid,
+            ProofVerdict::Invalid,
+            ProofVerdict::Undetermined,
+        ] {
+            let proof_engine: Arc<dyn ProofEngine> = Arc::new(MockProofEngine::new(verdict));
 
             let message = run_stub_task(proof_engine);
 

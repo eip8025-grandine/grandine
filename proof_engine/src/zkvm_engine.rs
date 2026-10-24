@@ -16,7 +16,11 @@ use types::{
 #[cfg(feature = "sp1")]
 use ere_verifier_sp1::{SP1ProgramVk, SP1Verifier, codec::Decode as _};
 
-use crate::{backend::Backend, engine::ProofEngine, zkboost_mock::ZkboostMockBackend};
+use crate::{
+    backend::Backend,
+    engine::{ProofEngine, ProofVerdict},
+    zkboost_mock::ZkboostMockBackend,
+};
 #[cfg(feature = "sp1")]
 use crate::{backend::Binding, ere_backend::EreBackend};
 
@@ -77,6 +81,28 @@ pub enum Rejection {
     Panic(anyhow::Error),
 }
 
+impl Rejection {
+    /// What this rejection says about the proof.
+    ///
+    /// [`ProofVerdict::Invalid`] means that, given the trusted inputs,
+    /// `proof_data` is at fault. Every other cause is local to this node
+    /// and gives [`ProofVerdict::Undetermined`]:
+    /// - an unconfigured type reflects this node's configuration;
+    /// - `public_input` is built by the caller, so a bad one is a caller bug;
+    /// - a panic is a defect in the verifier stack.
+    ///
+    /// A backend's decode or verification error is believed.
+    pub const fn verdict(&self) -> ProofVerdict {
+        match self {
+            Self::Decode(_) | Self::Verify(_) | Self::PublicValuesMismatch => ProofVerdict::Invalid,
+            Self::UnsupportedProofType { .. }
+            | Self::UnsuccessfulValidation
+            | Self::MockOnMainnet
+            | Self::Panic(_) => ProofVerdict::Undetermined,
+        }
+    }
+}
+
 struct Entry {
     backend: Box<dyn Backend>,
     mock: bool,
@@ -98,7 +124,7 @@ pub struct ZkvmProofEngine {
 
 impl ZkvmProofEngine {
     /// Builds an engine that verifies proofs of each given type with its
-    /// backend. Proofs of any other type are rejected.
+    /// backend. Proofs of any other type get [`ProofVerdict::Undetermined`].
     ///
     /// Only `config.deposit_chain_id` is read, to refuse mock backends on
     /// mainnet.
@@ -213,18 +239,33 @@ impl ProofEngine for ZkvmProofEngine {
         false
     }
 
-    fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> bool {
-        match self.check(&execution_proof) {
-            Ok(()) => true,
-            Err(rejection) => {
-                debug_with_peers!(
-                    "execution proof rejected (error: {rejection}, proof_type: {})",
-                    execution_proof.proof_type,
-                );
+    fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> ProofVerdict {
+        let Err(rejection) = self.check(&execution_proof) else {
+            return ProofVerdict::Valid;
+        };
 
-                false
+        let verdict = rejection.verdict();
+        let proof_type = execution_proof.proof_type;
+
+        match rejection {
+            // Unconfigured types are expected on partial configurations.
+            Rejection::UnsupportedProofType { .. }
+            | Rejection::Decode(_)
+            | Rejection::Verify(_)
+            | Rejection::PublicValuesMismatch => debug_with_peers!(
+                "execution proof not accepted \
+                 (verdict: {verdict:?}, error: {rejection}, proof_type: {proof_type})",
+            ),
+            // Caller bugs and verifier defects.
+            Rejection::UnsuccessfulValidation | Rejection::MockOnMainnet | Rejection::Panic(_) => {
+                warn_with_peers!(
+                    "execution proof could not be verified locally \
+                     (verdict: {verdict:?}, error: {rejection}, proof_type: {proof_type})",
+                )
             }
         }
+
+        verdict
     }
 }
 
@@ -343,6 +384,11 @@ mod tests {
                 ..mock_proof(test_public_input())
             };
 
+            assert_eq!(
+                verdict(&mock_engine(), proof.clone()),
+                ProofVerdict::Undetermined,
+            );
+
             assert_rejection(&mock_engine(), proof, |rejection| {
                 matches!(
                     rejection,
@@ -447,6 +493,11 @@ mod tests {
     fn contains_backend_panics() {
         let engine = engine_with_backend(PanickingBackend);
 
+        assert_eq!(
+            verdict(&engine, mock_proof(test_public_input())),
+            ProofVerdict::Undetermined,
+        );
+
         assert_rejection(&engine, mock_proof(test_public_input()), |rejection| {
             matches!(rejection, Rejection::Panic(_))
         });
@@ -455,6 +506,11 @@ mod tests {
     #[test]
     fn reports_backend_verification_failures() {
         let engine = engine_with_backend(FailingBackend);
+
+        assert_eq!(
+            verdict(&engine, mock_proof(test_public_input())),
+            ProofVerdict::Invalid,
+        );
 
         assert_rejection(&engine, mock_proof(test_public_input()), |rejection| {
             matches!(rejection, Rejection::Verify(_))
@@ -492,6 +548,34 @@ mod tests {
         assert_rejection(&mock_engine(), canonical, |rejection| {
             matches!(rejection, Rejection::PublicValuesMismatch)
         });
+    }
+
+    #[test]
+    fn rejections_map_to_verdicts() {
+        let cases = [
+            (
+                Rejection::UnsupportedProofType {
+                    proof_type: MOCK_PROOF_TYPE,
+                },
+                ProofVerdict::Undetermined,
+            ),
+            (
+                Rejection::UnsuccessfulValidation,
+                ProofVerdict::Undetermined,
+            ),
+            (Rejection::MockOnMainnet, ProofVerdict::Undetermined),
+            (Rejection::Decode(anyhow!("decode")), ProofVerdict::Invalid),
+            (Rejection::Verify(anyhow!("verify")), ProofVerdict::Invalid),
+            (Rejection::PublicValuesMismatch, ProofVerdict::Invalid),
+            (
+                Rejection::Panic(anyhow!("panic")),
+                ProofVerdict::Undetermined,
+            ),
+        ];
+
+        for (rejection, expected) in cases {
+            assert_eq!(rejection.verdict(), expected, "{rejection}");
+        }
     }
 
     #[test]
@@ -585,11 +669,19 @@ mod tests {
     // with `check`, as callers hold it.
     fn check(engine: &Arc<ZkvmProofEngine>, proof: ExecutionProof) -> Result<(), Rejection> {
         let result = engine.check(&proof);
-        let dyn_engine: Arc<dyn ProofEngine> = Arc::<ZkvmProofEngine>::clone(engine);
+        let expected = result
+            .as_ref()
+            .map_or_else(Rejection::verdict, |()| ProofVerdict::Valid);
 
-        assert_eq!(dyn_engine.verify_execution_proof(proof), result.is_ok());
+        assert_eq!(verdict(engine, proof), expected);
 
         result
+    }
+
+    fn verdict(engine: &Arc<ZkvmProofEngine>, proof: ExecutionProof) -> ProofVerdict {
+        let dyn_engine: Arc<dyn ProofEngine> = Arc::<ZkvmProofEngine>::clone(engine);
+
+        dyn_engine.verify_execution_proof(proof)
     }
 
     fn assert_rejection(
@@ -741,6 +833,14 @@ mod tests {
 
         #[test]
         fn primary_proof_verifies() {
+            assert_eq!(
+                verdict(
+                    &sp1_engine(ETHREX_VK),
+                    sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
+                ),
+                ProofVerdict::Valid,
+            );
+
             check(
                 &sp1_engine(ETHREX_VK),
                 sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
@@ -750,6 +850,14 @@ mod tests {
 
         #[test]
         fn primary_proof_fails_under_other_vk() {
+            assert_eq!(
+                verdict(
+                    &sp1_engine(RETH_VK),
+                    sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
+                ),
+                ProofVerdict::Invalid,
+            );
+
             assert_rejection(
                 &sp1_engine(RETH_VK),
                 sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
@@ -771,6 +879,11 @@ mod tests {
                 new_payload_request_root: root,
                 ..committed_public_input()
             };
+
+            assert_eq!(
+                verdict(&sp1_engine(ETHREX_VK), sp1_proof(&proof_data, public_input)),
+                ProofVerdict::Invalid,
+            );
 
             assert_rejection(
                 &sp1_engine(ETHREX_VK),
@@ -831,6 +944,14 @@ mod tests {
             ];
 
             for public_input in changed_inputs {
+                assert_eq!(
+                    verdict(
+                        &sp1_engine(ETHREX_VK),
+                        sp1_proof(ETHREX_SP1_PROOF, public_input),
+                    ),
+                    ProofVerdict::Invalid,
+                );
+
                 assert_rejection(
                     &sp1_engine(ETHREX_VK),
                     sp1_proof(ETHREX_SP1_PROOF, public_input),
