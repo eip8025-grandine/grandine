@@ -5,7 +5,13 @@ use types::{
     phase0::primitives::H256,
 };
 
-use crate::{MockProofEngine, NullProofEngine, ProofEngine};
+use crate::{MockProofEngine, NullProofEngine, ProofEngine, ProofVerdict};
+
+pub const VERDICTS: [ProofVerdict; 3] = [
+    ProofVerdict::Valid,
+    ProofVerdict::Invalid,
+    ProofVerdict::Undetermined,
+];
 
 pub fn test_proof() -> ExecutionProof {
     ExecutionProof {
@@ -26,15 +32,17 @@ pub fn test_proof() -> ExecutionProof {
 #[test]
 fn engines_work_behind_a_trait_object() {
     let null: Arc<dyn ProofEngine> = Arc::new(NullProofEngine);
-    let valid: Arc<dyn ProofEngine> = Arc::new(MockProofEngine::new(true));
-    let invalid: Arc<dyn ProofEngine> = Arc::new(MockProofEngine::new(false));
 
     assert!(null.is_null());
-    assert!(!null.verify_execution_proof(test_proof()));
+    assert_eq!(
+        null.verify_execution_proof(test_proof()),
+        ProofVerdict::Undetermined,
+    );
 
-    assert!(!valid.is_null());
-    assert!(valid.verify_execution_proof(test_proof()));
+    for verdict in VERDICTS {
+        let mock: Arc<dyn ProofEngine> = Arc::new(MockProofEngine::new(verdict));
 
-    assert!(!invalid.is_null());
-    assert!(!invalid.verify_execution_proof(test_proof()));
+        assert!(!mock.is_null());
+        assert_eq!(mock.verify_execution_proof(test_proof()), verdict);
+    }
 }

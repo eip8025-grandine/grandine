@@ -1,5 +1,5 @@
 pub use crate::{
-    engine::ProofEngine,
+    engine::{ProofEngine, ProofVerdict},
     mock_engine::MockProofEngine,
     null_engine::NullProofEngine,
     zkvm_engine::{BackendSpec, ConstructionError, Rejection, ZkvmProofEngine},
