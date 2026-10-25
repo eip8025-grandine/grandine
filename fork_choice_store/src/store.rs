@@ -117,11 +117,12 @@ use crate::{
         DifferenceAtLocation, Differences, DissolvedDifference, ExecutionPayloadBidAction,
         ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
         ExecutionPayloadEnvelopeValidationAction, ExecutionProofAdmission,
-        ExecutionProofAdmissionDecline, ExecutionProofVerificationOutcome, LatestMessage, Location,
-        PartialAttestationAction, PartialBlockAction, PayloadAction, PayloadAttestationAction,
-        PayloadAttestationItem, PayloadAttestationValidationError, PayloadPresence,
-        ProposerPreferencesAction, ProposerPreferencesOrigin, Score, SegmentId, Storage,
-        UnfinalizedBlock, ValidAttestation, ValidPayloadAttestation,
+        ExecutionProofAdmissionDecline, ExecutionProofCompletionOutcome, ExecutionProofDiscard,
+        ExecutionProofVerificationOutcome, LatestMessage, Location, PartialAttestationAction,
+        PartialBlockAction, PayloadAction, PayloadAttestationAction, PayloadAttestationItem,
+        PayloadAttestationValidationError, PayloadPresence, ProposerPreferencesAction,
+        ProposerPreferencesOrigin, Score, SegmentId, Storage, UnfinalizedBlock, ValidAttestation,
+        ValidPayloadAttestation,
     },
     prepared_execution_proof::{ExecutionProofContextIdentity, PreparedExecutionProof},
     segment::{Position, Segment},
@@ -192,18 +193,14 @@ pub struct AdmittedExecutionProof {
 
 impl AdmittedExecutionProof {
     /// Passes the owned input to an off-mutator callback and pairs its result with the same context.
-    /// The callback is trusted to verify that input; panics do not produce a completion.
+    /// The callback is trusted to verify the input and report its outcome; panics do not produce a completion.
     pub fn verify_with(
         self,
-        verify: impl FnOnce(ExecutionProof) -> bool,
+        verify: impl FnOnce(ExecutionProof) -> ExecutionProofVerificationOutcome,
     ) -> ExecutionProofCompletion {
         let (signed_envelope, input, context_identity, envelope_root) =
             (*self.prepared).into_parts();
-        let verification_outcome = if verify(input) {
-            ExecutionProofVerificationOutcome::Valid
-        } else {
-            ExecutionProofVerificationOutcome::Invalid
-        };
+        let verification_outcome = verify(input);
 
         ExecutionProofCompletion {
             signed_envelope,
@@ -238,6 +235,14 @@ pub struct ExecutionProofCompletion {
 }
 
 impl ExecutionProofCompletion {
+    /// Moves out the bare message without cloning its proof bytes.
+    fn into_bare_envelope(self) -> ExecutionProofEnvelope {
+        let Self {
+            signed_envelope, ..
+        } = self;
+        signed_envelope.message.into_inner()
+    }
+
     /// Returns the underlying bare message, not its signed `Hc` wrapper.
     #[must_use]
     pub fn envelope(&self) -> &ExecutionProofEnvelope {
@@ -366,7 +371,7 @@ pub struct Store<P: Preset, S: Storage<P>> {
     payload_timeliness_vote: HashMap<H256, BitVector<P::PtcSize>>,
     payload_data_availability_vote: HashMap<H256, BitVector<P::PtcSize>>,
     // [New in EIP8025]
-    execution_proofs: HashMap<H256, HashMap<ProofType, ExecutionProofEnvelope>>,
+    execution_proofs: HashMap<H256, HashMap<ProofType, Arc<ExecutionProofEnvelope>>>,
     // TODO(Grandine Team): Process current slot attestations incrementally to speed up
     //                      `Store::apply_tick`. Update the comment to match the new design.
     //
@@ -5896,7 +5901,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
     // [New in EIP8025]
     pub const fn execution_proofs(
         &self,
-    ) -> &HashMap<H256, HashMap<ProofType, ExecutionProofEnvelope>> {
+    ) -> &HashMap<H256, HashMap<ProofType, Arc<ExecutionProofEnvelope>>> {
         &self.execution_proofs
     }
 
@@ -5979,6 +5984,52 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         self.execution_proof_provers.insert(prover_key);
 
         ExecutionProofAdmission::Admitted(AdmittedExecutionProof { prepared })
+    }
+
+    /// Applies a protected verification report if its target and accepted context are still live.
+    pub fn complete_execution_proof(
+        &mut self,
+        completion: ExecutionProofCompletion,
+    ) -> ExecutionProofCompletionOutcome {
+        let block_root = completion.context_identity().beacon_block_root();
+        let is_retained = block_root == self.last_finalized().block_root
+            || self.unfinalized_locations.contains_key(&block_root);
+        if !is_retained {
+            return ExecutionProofCompletionOutcome::Discarded(ExecutionProofDiscard::Retired);
+        }
+
+        if !self.execution_proof_context_is_applicable(
+            block_root,
+            completion.context_identity().public_input(),
+        ) {
+            return ExecutionProofCompletionOutcome::Discarded(
+                ExecutionProofDiscard::ContextInapplicable,
+            );
+        }
+
+        match completion.verification_outcome() {
+            ExecutionProofVerificationOutcome::Invalid => ExecutionProofCompletionOutcome::Reject,
+            ExecutionProofVerificationOutcome::LocalFault => {
+                ExecutionProofCompletionOutcome::LocalFault
+            }
+            ExecutionProofVerificationOutcome::Valid => {
+                let proof_type = completion.envelope().proof_type;
+                let is_occupied = self
+                    .execution_proofs
+                    .get(&block_root)
+                    .is_some_and(|proofs| proofs.contains_key(&proof_type));
+
+                if !is_occupied {
+                    let envelope = completion.into_bare_envelope();
+                    self.execution_proofs
+                        .entry(block_root)
+                        .or_default()
+                        .insert(proof_type, Arc::new(envelope));
+                }
+
+                ExecutionProofCompletionOutcome::Accept
+            }
+        }
     }
 
     // `Vector` has no `resize` method as of `im` version 15.1.0.
