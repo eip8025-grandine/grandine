@@ -833,14 +833,6 @@ mod tests {
 
         #[test]
         fn primary_proof_verifies() {
-            assert_eq!(
-                verdict(
-                    &sp1_engine(ETHREX_VK),
-                    sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
-                ),
-                ProofVerdict::Valid,
-            );
-
             check(
                 &sp1_engine(ETHREX_VK),
                 sp1_proof(ETHREX_SP1_PROOF, committed_public_input()),
