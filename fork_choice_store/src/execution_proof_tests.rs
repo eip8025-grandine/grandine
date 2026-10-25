@@ -349,11 +349,19 @@ fn accepted_payload_carrier<S: Storage<Minimal>>(
     }
 }
 
+fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
+    retained_unfinalized_payload_fixture_at_slot(1)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the target, descendants, and checkpoint boundary form one topology fixture"
 )]
-fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
+fn retained_unfinalized_payload_fixture_at_slot(slot: Slot) -> RetainedUnfinalizedPayloadFixture {
+    let descendant_slot = slot.checked_add(1).expect("fixture descendant slot fits");
+    let post_checkpoint_slot = slot
+        .checked_add(2)
+        .expect("fixture retained child slot fits");
     let key = proof_signing_key();
     let validator = Validator {
         pubkey: key.to_public_key().into(),
@@ -372,7 +380,6 @@ fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
     store.chain_config = Arc::new(ChainConfig::default().start_and_stay_in(Phase::Gloas));
     assert_eq!(store.phase(), Phase::Gloas);
     let parent_root = store.last_finalized().block_root;
-    let slot = 1;
     let execution_requests = ExecutionRequests::<Minimal>::default();
     let bid = ExecutionPayloadBid::<Minimal> {
         block_hash: ExecutionBlockHash::repeat_byte(0x61),
@@ -474,7 +481,7 @@ fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
     // This child supplies a retained finalization target only; no child state is replayed.
     let descendant_block = GloasSignedBeaconBlock {
         message: Hc::from(GloasBeaconBlock {
-            slot: slot + 1,
+            slot: descendant_slot,
             proposer_index: 0,
             parent_root: target_root,
             state_root: H256::repeat_byte(0x63),
@@ -483,7 +490,7 @@ fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
         signature: <_>::default(),
     };
     let descendant_root = descendant_block.message.hash_tree_root();
-    assert_eq!(descendant_block.message.slot, slot + 1);
+    assert_eq!(descendant_block.message.slot, descendant_slot);
     assert_eq!(descendant_block.message.parent_root, target_root);
     store
         .insert_block(ChainLink {
@@ -503,7 +510,7 @@ fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
         .chain_link(descendant_root)
         .expect("inserted descendant remains addressable");
     assert_eq!(retained_descendant.parent_root(), target_root);
-    assert_eq!(retained_descendant.slot(), slot + 1);
+    assert_eq!(retained_descendant.slot(), descendant_slot);
     assert_eq!(retained_descendant.block_root, descendant_root);
     assert!(retained_descendant.state.is_none());
 
@@ -511,7 +518,7 @@ fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
     // suffix when the target and checkpoint are finalized through their ordinary Store path.
     let post_checkpoint_block = GloasSignedBeaconBlock {
         message: Hc::from(GloasBeaconBlock {
-            slot: slot + 2,
+            slot: post_checkpoint_slot,
             proposer_index: 0,
             parent_root: descendant_root,
             state_root: H256::repeat_byte(0x64),
@@ -542,7 +549,7 @@ fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
         .chain_link(post_checkpoint_root)
         .expect("post-checkpoint child remains addressable");
     assert_eq!(retained_post_checkpoint.parent_root(), descendant_root);
-    assert_eq!(retained_post_checkpoint.slot(), slot + 2);
+    assert_eq!(retained_post_checkpoint.slot(), post_checkpoint_slot);
     assert_eq!(retained_post_checkpoint.block_root, post_checkpoint_root);
     assert!(retained_post_checkpoint.state.is_none());
 
@@ -5436,6 +5443,275 @@ fn execution_proof_admission_is_independent_by_block_root() {
 }
 
 #[test]
+fn execution_proof_skipped_boundary_anchor_keeps_authority_without_payload_bytes() {
+    let boundary_slot = misc::compute_start_slot_at_epoch::<Minimal>(1);
+    let anchor_slot = boundary_slot
+        .checked_sub(1)
+        .expect("epoch one follows genesis");
+    let (mut store, state, envelope, descendant_root, _, key) =
+        retained_unfinalized_payload_fixture_at_slot(anchor_slot);
+    let block_root = envelope.block_root();
+    let signed = signed_execution_proof_for_test(&store, &state, &[0x42], 1, 0, &key);
+    let public_input = store
+        .get_execution_proof(&state, signed.message.as_ref(), &envelope.message)
+        .expect("fixture payload binds to its trusted state")
+        .public_input;
+    store.apply_execution_payload_envelope(
+        AcceptedExecutionPayloadEnvelope::from_validation(envelope.clone_arc(), Some(public_input)),
+        false,
+    );
+    let prepared = prepared_execution_proof_for_test(&store, &signed);
+    let envelope_root = prepared.envelope_root();
+    let expected_input = prepared.execution_proof().clone();
+    let expected_message = prepared.signed_message().clone();
+    assert_eq!(
+        store
+            .chain_link(descendant_root)
+            .expect("boundary child exists")
+            .slot(),
+        boundary_slot
+    );
+
+    store.finalized_checkpoint = Checkpoint {
+        epoch: 1,
+        root: block_root,
+    };
+    store.prune_after_finalization();
+    assert_eq!(store.last_finalized().block_root, block_root);
+    assert_eq!(store.last_finalized().slot(), anchor_slot);
+    assert_eq!(store.finalized_slot(), boundary_slot);
+    assert!(anchor_slot < store.finalized_slot());
+    assert!(!store.unfinalized_locations.contains_key(&block_root));
+    assert!(store.unfinalized_locations.contains_key(&descendant_root));
+    assert!(store.payloads.contains(&block_root));
+    assert_eq!(
+        store.execution_proof_contexts.get(&block_root),
+        Some(&public_input)
+    );
+    assert!(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .is_none()
+    );
+    assert!(store.execution_proof_context_is_applicable(block_root, &public_input));
+
+    let mut expected = execution_proof_bookkeeping(&store);
+    assert!(matches!(
+        crate::prepare_execution_proof(&store, &signed),
+        Ok(crate::ExecutionProofPreparation::Ignore(
+            "execution proof's accepted payload envelope is unavailable"
+        ))
+    ));
+    assert_execution_proof_bookkeeping_unchanged(&store, &expected);
+    expected
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(envelope_root);
+    expected.2.insert((block_root, 1, 0));
+    let admitted = match store.admit_execution_proof(prepared) {
+        ExecutionProofAdmission::Admitted(admitted) => admitted,
+        ExecutionProofAdmission::Declined(reason) => {
+            panic!("retained anchor should admit: {reason:?}")
+        }
+    };
+    assert_eq!(execution_proof_bookkeeping(&store), expected);
+    let completion = admitted.verify_with(|input| {
+        assert_eq!(input, expected_input);
+        ExecutionProofVerificationOutcome::Valid
+    });
+    expected
+        .0
+        .entry(block_root)
+        .or_default()
+        .insert(1, Arc::new(expected_message));
+    assert_eq!(
+        store.complete_execution_proof(completion),
+        ExecutionProofCompletionOutcome::Accept
+    );
+    assert_eq!(execution_proof_bookkeeping(&store), expected);
+    assert!(store.payloads.contains(&block_root));
+    assert_eq!(
+        store.execution_proof_contexts.get(&block_root),
+        Some(&public_input)
+    );
+    assert!(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .is_none()
+    );
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "competing-branch finalization and both stale handoffs share one coherent topology"
+)]
+#[test]
+fn execution_proof_recent_orphan_discards_prepared_and_admitted_work() {
+    let (mut store, state, envelope, descendant_root, post_checkpoint_root, key) =
+        retained_unfinalized_payload_fixture();
+    let block_root = envelope.block_root();
+    let signed = signed_execution_proof_for_test(&store, &state, &[0x42], 1, 0, &key);
+    let fresh_signed = signed_execution_proof_for_test(&store, &state, &[0x43], 2, 0, &key);
+    let public_input = store
+        .get_execution_proof(&state, signed.message.as_ref(), &envelope.message)
+        .expect("fixture payload binds to its trusted state")
+        .public_input;
+    store.apply_execution_payload_envelope(
+        AcceptedExecutionPayloadEnvelope::from_validation(envelope.clone_arc(), Some(public_input)),
+        false,
+    );
+    let prepared = prepared_execution_proof_for_test(&store, &signed);
+    let stale_prepared = prepared_execution_proof_for_test(&store, &fresh_signed);
+    assert_ne!(prepared.envelope_root(), stale_prepared.envelope_root());
+    assert_ne!(
+        prepared.signed_message().proof_type,
+        stale_prepared.signed_message().proof_type
+    );
+    let expected_input = prepared.execution_proof().clone();
+    let unrelated_root = H256::repeat_byte(0xe6);
+    assert_ne!(unrelated_root, block_root);
+    seed_execution_proof_bookkeeping(&mut store, unrelated_root);
+    let mut expected = execution_proof_bookkeeping(&store);
+    expected
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(prepared.envelope_root());
+    expected.2.insert((block_root, 1, 0));
+    let admitted = match store.admit_execution_proof(prepared) {
+        ExecutionProofAdmission::Admitted(admitted) => admitted,
+        ExecutionProofAdmission::Declined(reason) => {
+            panic!("live target should admit: {reason:?}")
+        }
+    };
+    assert_eq!(execution_proof_bookkeeping(&store), expected);
+    let completion = admitted.verify_with(|input| {
+        assert_eq!(input, expected_input);
+        ExecutionProofVerificationOutcome::Valid
+    });
+
+    let checkpoint = store.finalized_checkpoint();
+    let make_link = |slot, parent_root, state_root| {
+        let block = GloasSignedBeaconBlock {
+            message: Hc::from(GloasBeaconBlock {
+                slot,
+                parent_root,
+                state_root,
+                ..Default::default()
+            }),
+            signature: <_>::default(),
+        };
+        ChainLink {
+            block_root: block.message.hash_tree_root(),
+            block: Arc::new(SignedBeaconBlock::<Minimal>::from(block)),
+            state: None,
+            current_justified_checkpoint: checkpoint,
+            finalized_checkpoint: checkpoint,
+            unrealized_justified_checkpoint: checkpoint,
+            unrealized_finalized_checkpoint: checkpoint,
+            payload_status: PayloadStatus::Optimistic,
+            parent_payload_presence: PayloadPresence::default(),
+        }
+    };
+    let competing = make_link(
+        state.slot(),
+        store.last_finalized().block_root,
+        H256::repeat_byte(0xa1),
+    );
+    let competing_root = competing.block_root;
+    assert_ne!(competing_root, block_root);
+    store
+        .insert_block(competing)
+        .expect("competing branch extends initial anchor");
+    let child_slot = state
+        .slot()
+        .checked_add(1)
+        .expect("fixture child slot fits");
+    let child = make_link(child_slot, competing_root, H256::repeat_byte(0xa2));
+    let child_root = child.block_root;
+    store
+        .insert_block(child)
+        .expect("competing branch keeps a post-checkpoint child");
+    store.finalized_checkpoint = Checkpoint {
+        epoch: 0,
+        root: competing_root,
+    };
+    store.prune_after_finalization();
+    assert_eq!(store.last_finalized().block_root, competing_root);
+    assert_eq!(
+        store.last_finalized().slot(),
+        state.slot(),
+        "same-slot roots must have different lifetimes"
+    );
+    assert!(
+        state.slot() >= store.finalized_slot(),
+        "slot-based cache retention does not retire this target"
+    );
+    assert!(store.unfinalized_locations.contains_key(&child_root));
+    for orphan in [block_root, descendant_root, post_checkpoint_root] {
+        assert!(!store.unfinalized_locations.contains_key(&orphan));
+        assert!(!store.finalized_indices.contains_key(&orphan));
+        assert!(store.chain_link(orphan).is_none());
+    }
+    assert!(!store.payloads.contains(&block_root));
+    assert_eq!(
+        store.execution_proof_contexts.get(&block_root),
+        Some(&public_input)
+    );
+    assert!(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .is_some()
+    );
+    store.payloads.insert(block_root);
+    assert!(!store.execution_proof_context_is_applicable(block_root, &public_input));
+    assert_eq!(execution_proof_bookkeeping(&store), expected);
+    let contexts = store.execution_proof_contexts.clone();
+    let markers = store.payloads.clone();
+    let consensus = (
+        store.tick(),
+        store.justified_checkpoint(),
+        store.finalized_checkpoint(),
+        store.head().block_root,
+        store.head_node_payload_status(),
+    );
+    assert_execution_proof_admission_declined_without_writes(
+        &mut store,
+        stale_prepared,
+        ExecutionProofAdmissionDecline::Retired,
+    );
+    assert_eq!(
+        store.complete_execution_proof(completion),
+        ExecutionProofCompletionOutcome::Discarded(ExecutionProofDiscard::Retired)
+    );
+    assert_eq!(execution_proof_bookkeeping(&store), expected);
+    assert!(!store.execution_proofs.contains_key(&block_root));
+    assert_eq!(store.execution_proof_contexts, contexts);
+    assert_eq!(store.payloads, markers);
+    assert!(Arc::ptr_eq(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .expect("orphan bytes remain cached"),
+        &envelope
+    ));
+    assert_eq!(
+        (
+            store.tick(),
+            store.justified_checkpoint(),
+            store.finalized_checkpoint(),
+            store.head().block_root,
+            store.head_node_payload_status()
+        ),
+        consensus
+    );
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "retired topology and malformed-input precedence share the same fixture"
+)]
+#[test]
 fn execution_proof_admission_declines_retired_target_with_or_without_stale_marker() {
     for restore_stale_marker in [false, true] {
         let (mut store, target_state, target_envelope, descendant_root, post_checkpoint_root, key) =
@@ -5509,6 +5785,22 @@ fn execution_proof_admission_declines_retired_target_with_or_without_stale_marke
         assert_eq!(store.payloads.contains(&target_root), restore_stale_marker);
 
         let before = execution_proof_bookkeeping(&store);
+        let mut empty = signed_proof.clone();
+        empty.message.proof_data = ProofData::default();
+        assert_preparation_rejected(&store, &empty, |error| {
+            matches!(error, Error::ExecutionProofEnvelopeEmptyProof)
+        });
+        assert_execution_proof_bookkeeping_unchanged(&store, &before);
+        let mut unsupported = signed_proof;
+        unsupported.message.proof_type = 0;
+        assert!(!unsupported.message.proof_data.as_bytes().is_empty());
+        assert_preparation_rejected(&store, &unsupported, |error| {
+            matches!(
+                error,
+                Error::ExecutionProofEnvelopeUnsupportedProofType { proof_type: 0 }
+            )
+        });
+        assert_execution_proof_bookkeeping_unchanged(&store, &before);
         let admission = store.admit_execution_proof(prepared);
         assert!(matches!(
             admission,
