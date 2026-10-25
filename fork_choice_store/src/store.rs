@@ -116,11 +116,12 @@ use crate::{
         DataAvailabilityPolicy, DataColumnSidecarAction, DataColumnSidecarOrigin, Difference,
         DifferenceAtLocation, Differences, DissolvedDifference, ExecutionPayloadBidAction,
         ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
-        ExecutionPayloadEnvelopeValidationAction, ExecutionProofVerificationOutcome, LatestMessage,
-        Location, PartialAttestationAction, PartialBlockAction, PayloadAction,
-        PayloadAttestationAction, PayloadAttestationItem, PayloadAttestationValidationError,
-        PayloadPresence, ProposerPreferencesAction, ProposerPreferencesOrigin, Score, SegmentId,
-        Storage, UnfinalizedBlock, ValidAttestation, ValidPayloadAttestation,
+        ExecutionPayloadEnvelopeValidationAction, ExecutionProofAdmission,
+        ExecutionProofAdmissionDecline, ExecutionProofVerificationOutcome, LatestMessage, Location,
+        PartialAttestationAction, PartialBlockAction, PayloadAction, PayloadAttestationAction,
+        PayloadAttestationItem, PayloadAttestationValidationError, PayloadPresence,
+        ProposerPreferencesAction, ProposerPreferencesOrigin, Score, SegmentId, Storage,
+        UnfinalizedBlock, ValidAttestation, ValidPayloadAttestation,
     },
     prepared_execution_proof::{ExecutionProofContextIdentity, PreparedExecutionProof},
     segment::{Position, Segment},
@@ -329,13 +330,7 @@ pub struct Store<P: Preset, S: Storage<P>> {
     // implementing the spec rule:
     // [IGNORE] This is the first valid aggregate for this aggregator in this epoch.
     seen_gossip_attestations: Arc<Mutex<SeenGossipAttestations>>,
-    // TODO(eip8025-grandine): PR2 adds live-store admission after PR1 authentication and
-    // binding; PR3 wires it through the mutator before scheduling engine verification.
-    // Snapshot checks alone let concurrent tasks both reach the verifier. Admission must
-    // recheck retention, trusted context, verified-proof storage and both Seen keys, then
-    // atomically insert (block root, bare-envelope root) and (block root, proof type, validator).
-    // Decline duplicates without inserting either key. Keep admitted keys until pruning, even
-    // on engine rejection or local/scheduling failure; Seen tracks attempts, not verified proofs.
+    // Seen tracks admitted attempts; failures do not release either key.
     // [New in EIP8025]
     execution_proof_roots: HashMap<H256, HashSet<H256>>,
     // [New in EIP8025]
@@ -5929,6 +5924,61 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         is_retained
             && self.payloads.contains(&block_root)
             && self.execution_proof_contexts.get(&block_root) == Some(public_input)
+    }
+
+    /// Checks live applicability and consumes both permanent Seen keys, or declines without writes.
+    pub fn admit_execution_proof(
+        &mut self,
+        prepared: Box<PreparedExecutionProof>,
+    ) -> ExecutionProofAdmission {
+        let block_root = prepared.context_identity().beacon_block_root();
+        let is_retained = block_root == self.last_finalized().block_root
+            || self.unfinalized_locations.contains_key(&block_root);
+        if !is_retained {
+            return ExecutionProofAdmission::Declined(ExecutionProofAdmissionDecline::Retired);
+        }
+
+        if !self.execution_proof_context_is_applicable(
+            block_root,
+            prepared.context_identity().public_input(),
+        ) {
+            return ExecutionProofAdmission::Declined(
+                ExecutionProofAdmissionDecline::ContextInapplicable,
+            );
+        }
+
+        let proof_type = prepared.signed_message().proof_type;
+        if self
+            .execution_proofs
+            .get(&block_root)
+            .is_some_and(|proofs| proofs.contains_key(&proof_type))
+        {
+            return ExecutionProofAdmission::Declined(
+                ExecutionProofAdmissionDecline::AlreadyVerified,
+            );
+        }
+
+        let envelope_root = prepared.envelope_root();
+        if self
+            .execution_proof_roots
+            .get(&block_root)
+            .is_some_and(|roots| roots.contains(&envelope_root))
+        {
+            return ExecutionProofAdmission::Declined(ExecutionProofAdmissionDecline::SeenRoot);
+        }
+
+        let prover_key = (block_root, proof_type, prepared.validator_index());
+        if self.execution_proof_provers.contains(&prover_key) {
+            return ExecutionProofAdmission::Declined(ExecutionProofAdmissionDecline::SeenProver);
+        }
+
+        self.execution_proof_roots
+            .entry(block_root)
+            .or_default()
+            .insert(envelope_root);
+        self.execution_proof_provers.insert(prover_key);
+
+        ExecutionProofAdmission::Admitted(AdmittedExecutionProof { prepared })
     }
 
     // `Vector` has no `resize` method as of `im` version 15.1.0.
