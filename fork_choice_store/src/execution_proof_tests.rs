@@ -667,8 +667,8 @@ fn gloas_context_store(
     (store, state, block_root)
 }
 
-fn cache_accepted_test_payload(
-    store: &mut Store<Minimal, ContextStorage>,
+fn cache_accepted_test_payload<S: Storage<Minimal>>(
+    store: &mut Store<Minimal, S>,
     block_root: H256,
     slot: Slot,
 ) -> Arc<SignedExecutionPayloadEnvelope<Minimal>> {
@@ -692,8 +692,8 @@ fn cache_accepted_test_payload(
     envelope
 }
 
-fn seed_execution_proof_context_for_test(
-    store: &mut Store<Minimal, ContextStorage>,
+fn seed_execution_proof_context_for_test<S: Storage<Minimal>>(
+    store: &mut Store<Minimal, S>,
     state: &BeaconState<Minimal>,
     payload_envelope: &ExecutionPayloadEnvelope<Minimal>,
 ) {
@@ -759,15 +759,15 @@ fn assert_execution_proof_bookkeeping_unchanged<S: Storage<Minimal>>(
 ) {
     assert_eq!(
         store.execution_proofs, before.0,
-        "context loading must not store verified proofs"
+        "verified proofs must remain unchanged"
     );
     assert_eq!(
         store.execution_proof_roots, before.1,
-        "context loading must not mark envelope roots Seen"
+        "Seen envelope roots must remain unchanged"
     );
     assert_eq!(
         store.execution_proof_provers, before.2,
-        "context loading must not mark provers Seen"
+        "Seen provers must remain unchanged"
     );
 }
 
@@ -1201,6 +1201,12 @@ fn proof_signing_key() -> SecretKey {
     bytes.try_into().expect("scalar one is a valid secret key")
 }
 
+fn second_proof_signing_key() -> SecretKey {
+    let mut bytes = SecretKeyBytes::default();
+    bytes.as_mut()[31] = 2; // Deterministic scalar-two test key.
+    bytes.try_into().expect("scalar two is a valid secret key")
+}
+
 fn proof_fixture(
     validator_exit_epoch: Epoch,
 ) -> (
@@ -1248,17 +1254,34 @@ fn proof_preparation_fixture(
     Arc<BeaconState<Minimal>>,
     SignedExecutionProofEnvelope,
 ) {
-    let storage = Arc::new(ContextStorage::default());
     let key = proof_signing_key();
+    proof_preparation_fixture_with_keys(validator_exit_epoch, accepted_payload, &[key])
+}
+
+fn proof_preparation_fixture_with_keys(
+    validator_exit_epoch: Epoch,
+    accepted_payload: bool,
+    keys: &[SecretKey],
+) -> (
+    Store<Minimal, ContextStorage>,
+    Arc<BeaconState<Minimal>>,
+    SignedExecutionProofEnvelope,
+) {
+    let storage = Arc::new(ContextStorage::default());
+    let signing_key = keys
+        .first()
+        .expect("proof preparation fixture requires at least one signing key");
     let body = GloasBeaconBlockBody::<Minimal>::default();
     let state = Arc::new(BeaconState::from(GloasBeaconState::<Minimal> {
-        validators: core::iter::once(Validator {
-            pubkey: key.to_public_key().into(),
-            activation_epoch: 0,
-            exit_epoch: validator_exit_epoch,
-            ..Validator::default()
-        })
-        .collect(),
+        validators: keys
+            .iter()
+            .map(|key| Validator {
+                pubkey: key.to_public_key().into(),
+                activation_epoch: 0,
+                exit_epoch: validator_exit_epoch,
+                ..Validator::default()
+            })
+            .collect(),
         latest_block_header: BeaconBlockHeader {
             body_root: body.hash_tree_root(),
             ..Default::default()
@@ -1301,7 +1324,7 @@ fn proof_preparation_fixture(
     };
     // Sign only after the trusted state and its block root are fixed.
     let signature = envelope
-        .sign(&store.chain_config, &state, state.slot(), &key)
+        .sign(&store.chain_config, &state, state.slot(), signing_key)
         .into();
     let signed_proof = SignedExecutionProofEnvelope {
         message: Hc::from(envelope),
@@ -1312,8 +1335,33 @@ fn proof_preparation_fixture(
     (store, state, signed_proof)
 }
 
-fn prepared_execution_proof_for_test(
-    store: &Store<Minimal, ContextStorage>,
+fn signed_execution_proof_for_test<S: Storage<Minimal>>(
+    store: &Store<Minimal, S>,
+    state: &BeaconState<Minimal>,
+    proof_data: &[u8],
+    proof_type: ProofType,
+    validator_index: ValidatorIndex,
+    key: &SecretKey,
+) -> SignedExecutionProofEnvelope {
+    let envelope = ExecutionProofEnvelope {
+        proof_data: ProofData::try_from(proof_data.to_vec())
+            .expect("test proof bytes are within the proof-data bound"),
+        proof_type,
+        beacon_block_root: accessors::latest_block_root(state),
+    };
+    let signature = envelope
+        .sign(&store.chain_config, state, state.slot(), key)
+        .into();
+
+    SignedExecutionProofEnvelope {
+        message: Hc::from(envelope),
+        validator_index,
+        signature,
+    }
+}
+
+fn prepared_execution_proof_for_test<S: Storage<Minimal>>(
+    store: &Store<Minimal, S>,
     signed_envelope: &SignedExecutionProofEnvelope,
 ) -> Box<PreparedExecutionProof> {
     match crate::prepare_execution_proof(store, signed_envelope) {
@@ -2667,6 +2715,1188 @@ fn admitted_execution_proof_local_fault_preserves_association_without_store_muta
     );
     assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
     assert_eq!(store.execution_proof_contexts, proof_contexts);
+}
+
+fn assert_execution_proof_admission_declined_without_writes<S: Storage<Minimal>>(
+    store: &mut Store<Minimal, S>,
+    prepared: Box<PreparedExecutionProof>,
+    expected: ExecutionProofAdmissionDecline,
+) {
+    let bookkeeping = execution_proof_bookkeeping(store);
+    let proof_contexts = store.execution_proof_contexts.clone();
+    let payloads = store.payloads.clone();
+
+    let admission = store.admit_execution_proof(prepared);
+
+    assert!(matches!(
+        admission,
+        ExecutionProofAdmission::Declined(actual) if actual == expected
+    ));
+    assert_execution_proof_bookkeeping_unchanged(store, &bookkeeping);
+    assert_eq!(store.execution_proof_contexts, proof_contexts);
+    assert_eq!(store.payloads, payloads);
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "ownership and unchanged-state assertions share one admission fixture"
+)]
+#[test]
+fn execution_proof_admission_adds_both_seen_keys_and_preserves_prepared_ownership() {
+    let (mut store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+    let block_root = prepared.context_identity().beacon_block_root();
+    let proof_type = prepared.signed_message().proof_type;
+    let validator_index = prepared.validator_index();
+    let envelope_root = prepared.envelope_root();
+    let expected_input = prepared.execution_proof().clone();
+    let expected_message = prepared.signed_message().clone();
+    let expected_context_identity = *prepared.context_identity();
+    let prepared_pointer = core::ptr::from_ref(prepared.as_ref());
+    let input_data_pointer = prepared.execution_proof().proof_data.as_bytes().as_ptr();
+    let message_data_pointer = prepared.signed_message().proof_data.as_bytes().as_ptr();
+    let bookkeeping = execution_proof_bookkeeping(&store);
+    let mut expected_roots = bookkeeping.1.clone();
+    expected_roots
+        .entry(block_root)
+        .or_default()
+        .insert(envelope_root);
+    let mut expected_provers = bookkeeping.2.clone();
+    expected_provers.insert((block_root, proof_type, validator_index));
+    let proof_contexts = store.execution_proof_contexts.clone();
+    let payloads = store.payloads.clone();
+    let tick = store.tick();
+    let justified_checkpoint = store.justified_checkpoint();
+    let finalized_checkpoint = store.finalized_checkpoint();
+    let last_finalized_root = store.last_finalized().block_root;
+    let head_root = store.head().block_root;
+    let head_payload_status = store.head_node_payload_status();
+    let cached_payload_pointer = Arc::as_ptr(
+        store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .expect("prepared proof fixture must retain its accepted payload"),
+    );
+    let trusted_state_pointer = store
+        .chain_link(block_root)
+        .expect("prepared proof fixture must retain its target link")
+        .state
+        .as_ref()
+        .map(Arc::as_ptr);
+
+    let admission = store.admit_execution_proof(prepared);
+    let admitted = match admission {
+        ExecutionProofAdmission::Admitted(admitted) => admitted,
+        ExecutionProofAdmission::Declined(_) => {
+            panic!("fresh authentic proof should be admitted")
+        }
+    };
+
+    assert_eq!(
+        core::ptr::from_ref(admitted.prepared.as_ref()),
+        prepared_pointer
+    );
+    assert_eq!(admitted.prepared.execution_proof(), &expected_input);
+    assert_eq!(
+        admitted
+            .prepared
+            .execution_proof()
+            .proof_data
+            .as_bytes()
+            .as_ptr(),
+        input_data_pointer
+    );
+    assert_eq!(admitted.prepared.signed_message(), &expected_message);
+    assert_eq!(
+        admitted
+            .prepared
+            .signed_message()
+            .proof_data
+            .as_bytes()
+            .as_ptr(),
+        message_data_pointer
+    );
+    assert_eq!(
+        admitted.prepared.context_identity(),
+        &expected_context_identity
+    );
+    assert_eq!(admitted.prepared.envelope_root(), envelope_root);
+    assert_eq!(store.execution_proofs, bookkeeping.0);
+    assert_eq!(store.execution_proof_roots, expected_roots);
+    assert_eq!(store.execution_proof_provers, expected_provers);
+    assert_eq!(store.execution_proof_contexts, proof_contexts);
+    assert_eq!(store.payloads, payloads);
+    assert_eq!(store.tick(), tick);
+    assert_eq!(store.justified_checkpoint(), justified_checkpoint);
+    assert_eq!(store.finalized_checkpoint(), finalized_checkpoint);
+    assert_eq!(store.last_finalized().block_root, last_finalized_root);
+    assert_eq!(store.head().block_root, head_root);
+    assert_eq!(store.head_node_payload_status(), head_payload_status);
+    assert_eq!(
+        Arc::as_ptr(
+            store
+                .cached_execution_payload_envelope_by_root(block_root)
+                .expect("admission must not evict its accepted payload")
+        ),
+        cached_payload_pointer
+    );
+    assert_eq!(
+        store
+            .chain_link(block_root)
+            .expect("admission must not remove its target link")
+            .state
+            .as_ref()
+            .map(Arc::as_ptr),
+        trusted_state_pointer
+    );
+}
+
+#[test]
+fn execution_proof_admission_declines_in_specified_precedence() {
+    for expected in [
+        ExecutionProofAdmissionDecline::Retired,
+        ExecutionProofAdmissionDecline::ContextInapplicable,
+        ExecutionProofAdmissionDecline::AlreadyVerified,
+        ExecutionProofAdmissionDecline::SeenRoot,
+        ExecutionProofAdmissionDecline::SeenProver,
+    ] {
+        let (mut store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+        let block_root = prepared.context_identity().beacon_block_root();
+        let proof_type = prepared.signed_message().proof_type;
+        let validator_index = prepared.validator_index();
+        let envelope_root = prepared.envelope_root();
+        let stored_envelope = prepared.signed_message().clone();
+
+        match expected {
+            ExecutionProofAdmissionDecline::Retired => {
+                let (other_store, _, other_root) =
+                    gloas_context_store(Arc::new(ContextStorage::default()), 7);
+                assert_ne!(block_root, other_root);
+                store.finalized.push_back(other_store.finalized[0].clone());
+                store.finalized_indices.insert(other_root, 1);
+                store.payloads.remove(&block_root);
+                store
+                    .execution_proofs
+                    .entry(block_root)
+                    .or_default()
+                    .insert(proof_type, stored_envelope);
+                store
+                    .execution_proof_roots
+                    .entry(block_root)
+                    .or_default()
+                    .insert(envelope_root);
+                store
+                    .execution_proof_provers
+                    .insert((block_root, proof_type, validator_index));
+            }
+            ExecutionProofAdmissionDecline::ContextInapplicable => {
+                store.payloads.remove(&block_root);
+                store
+                    .execution_proofs
+                    .entry(block_root)
+                    .or_default()
+                    .insert(proof_type, stored_envelope);
+                store
+                    .execution_proof_roots
+                    .entry(block_root)
+                    .or_default()
+                    .insert(envelope_root);
+                store
+                    .execution_proof_provers
+                    .insert((block_root, proof_type, validator_index));
+            }
+            ExecutionProofAdmissionDecline::AlreadyVerified => {
+                store
+                    .execution_proofs
+                    .entry(block_root)
+                    .or_default()
+                    .insert(proof_type, stored_envelope);
+                store
+                    .execution_proof_roots
+                    .entry(block_root)
+                    .or_default()
+                    .insert(envelope_root);
+                store
+                    .execution_proof_provers
+                    .insert((block_root, proof_type, validator_index));
+            }
+            ExecutionProofAdmissionDecline::SeenRoot => {
+                store
+                    .execution_proof_roots
+                    .entry(block_root)
+                    .or_default()
+                    .insert(envelope_root);
+                store
+                    .execution_proof_provers
+                    .insert((block_root, proof_type, validator_index));
+            }
+            ExecutionProofAdmissionDecline::SeenProver => {
+                store
+                    .execution_proof_provers
+                    .insert((block_root, proof_type, validator_index));
+            }
+        }
+
+        assert_execution_proof_admission_declined_without_writes(&mut store, prepared, expected);
+    }
+}
+
+#[test]
+fn execution_proof_admission_checks_seen_keys_independently() {
+    let (mut root_store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let prepared = prepared_execution_proof_for_test(&root_store, &signed_envelope);
+    let block_root = prepared.context_identity().beacon_block_root();
+    root_store
+        .execution_proof_roots
+        .entry(block_root)
+        .or_default()
+        .insert(prepared.envelope_root());
+    assert_execution_proof_admission_declined_without_writes(
+        &mut root_store,
+        prepared,
+        ExecutionProofAdmissionDecline::SeenRoot,
+    );
+
+    let (mut prover_store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let prepared = prepared_execution_proof_for_test(&prover_store, &signed_envelope);
+    let prover_key = (
+        prepared.context_identity().beacon_block_root(),
+        prepared.signed_message().proof_type,
+        prepared.validator_index(),
+    );
+    prover_store.execution_proof_provers.insert(prover_key);
+    assert_execution_proof_admission_declined_without_writes(
+        &mut prover_store,
+        prepared,
+        ExecutionProofAdmissionDecline::SeenProver,
+    );
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "four competing cases share one old-snapshot fixture and full state assertions"
+)]
+#[test]
+fn execution_proof_admission_competing_prepared_attempts_use_live_seen_keys() {
+    let keys = [proof_signing_key(), second_proof_signing_key()];
+    let (base_store, state, first_signed) =
+        proof_preparation_fixture_with_keys(FAR_FUTURE_EPOCH, true, &keys);
+    let block_root = first_signed.message.beacon_block_root;
+    let cases: [(&str, &[u8], ValidatorIndex, bool, bool); 4] = [
+        ("same R, different V", &[0x42], 1, true, false),
+        ("different R, same K", &[0x43], 0, false, true),
+        ("identical R and K", &[0x42], 0, true, true),
+        ("different R and V", &[0x43], 1, false, false),
+    ];
+
+    for (
+        case,
+        second_proof_data,
+        second_validator_index,
+        roots_should_match,
+        prover_keys_should_match,
+    ) in cases
+    {
+        let mut live_store = base_store.clone();
+        seed_execution_proof_bookkeeping(&mut live_store, block_root);
+        let old_snapshot = live_store.clone();
+        let old_bookkeeping = execution_proof_bookkeeping(&old_snapshot);
+        assert!(old_bookkeeping.0[&block_root].contains_key(&2));
+        assert!(old_bookkeeping.1[&block_root].contains(&H256::repeat_byte(0x92)));
+        assert!(old_bookkeeping.2.contains(&(block_root, 2, 7)));
+        assert!(!old_bookkeeping.0[&block_root].contains_key(&1));
+        assert!(!old_bookkeeping.2.contains(&(block_root, 1, 0)));
+
+        let signer_index =
+            usize::try_from(second_validator_index).expect("fixture validator index fits in usize");
+        let second_signed = signed_execution_proof_for_test(
+            &old_snapshot,
+            &state,
+            second_proof_data,
+            1,
+            second_validator_index,
+            &keys[signer_index],
+        );
+        let first_prepared = prepared_execution_proof_for_test(&old_snapshot, &first_signed);
+        let second_prepared = prepared_execution_proof_for_test(&old_snapshot, &second_signed);
+
+        assert_eq!(
+            first_prepared.context_identity().beacon_block_root(),
+            block_root
+        );
+        assert_eq!(
+            second_prepared.context_identity().beacon_block_root(),
+            block_root
+        );
+        assert_eq!(first_prepared.signed_message().proof_type, 1);
+        assert_eq!(second_prepared.signed_message().proof_type, 1);
+        assert_eq!(first_prepared.validator_index(), 0);
+        assert_eq!(second_prepared.validator_index(), second_validator_index);
+        assert_eq!(
+            first_prepared.context_identity(),
+            second_prepared.context_identity(),
+            "competing attempts share the same trusted context"
+        );
+        assert_eq!(
+            first_prepared.envelope_root() == second_prepared.envelope_root(),
+            roots_should_match,
+            "unexpected R relation for {case}"
+        );
+        let first_prover_key = (
+            first_prepared.context_identity().beacon_block_root(),
+            first_prepared.signed_message().proof_type,
+            first_prepared.validator_index(),
+        );
+        let second_prover_key = (
+            second_prepared.context_identity().beacon_block_root(),
+            second_prepared.signed_message().proof_type,
+            second_prepared.validator_index(),
+        );
+        assert_eq!(
+            first_prover_key == second_prover_key,
+            prover_keys_should_match,
+            "unexpected K relation for {case}"
+        );
+        assert_execution_proof_bookkeeping_unchanged(&old_snapshot, &old_bookkeeping);
+
+        let mut expected_after_first = old_bookkeeping.clone();
+        expected_after_first
+            .1
+            .entry(block_root)
+            .or_default()
+            .insert(first_prepared.envelope_root());
+        expected_after_first.2.insert(first_prover_key);
+        assert!(matches!(
+            live_store.admit_execution_proof(first_prepared),
+            ExecutionProofAdmission::Admitted(_)
+        ));
+        assert_eq!(
+            execution_proof_bookkeeping(&live_store),
+            expected_after_first,
+            "first admission must add only its two Seen keys for {case}"
+        );
+        assert_execution_proof_bookkeeping_unchanged(&old_snapshot, &old_bookkeeping);
+
+        if !roots_should_match && !prover_keys_should_match {
+            let mut expected_after_second = expected_after_first;
+            expected_after_second
+                .1
+                .entry(block_root)
+                .or_default()
+                .insert(second_prepared.envelope_root());
+            expected_after_second.2.insert(second_prover_key);
+            assert!(matches!(
+                live_store.admit_execution_proof(second_prepared),
+                ExecutionProofAdmission::Admitted(_)
+            ));
+            assert_eq!(
+                execution_proof_bookkeeping(&live_store),
+                expected_after_second,
+                "distinct R and K must add exactly two more Seen keys"
+            );
+        } else {
+            let before_loser = execution_proof_bookkeeping(&live_store);
+            let expected_decline = if roots_should_match {
+                ExecutionProofAdmissionDecline::SeenRoot
+            } else {
+                ExecutionProofAdmissionDecline::SeenProver
+            };
+            assert!(matches!(
+                live_store.admit_execution_proof(second_prepared),
+                ExecutionProofAdmission::Declined(actual) if actual == expected_decline
+            ));
+            assert_eq!(
+                execution_proof_bookkeeping(&live_store),
+                before_loser,
+                "a losing attempt must add neither key for {case}"
+            );
+        }
+        assert_eq!(
+            live_store.execution_proofs, old_bookkeeping.0,
+            "admission must not store a verified proof for {case}"
+        );
+        assert_execution_proof_bookkeeping_unchanged(&old_snapshot, &old_bookkeeping);
+    }
+}
+
+#[test]
+fn execution_proof_admission_declines_each_live_public_input_field_mismatch() {
+    for field in [
+        "new_payload_request_root",
+        "successful_validation",
+        "chain_id",
+        "schema_id",
+    ] {
+        let (mut store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+        let block_root = prepared.context_identity().beacon_block_root();
+        let prepared_input = *prepared.context_identity().public_input();
+        assert!(store.payloads.contains(&block_root));
+        assert_eq!(
+            store.execution_proof_contexts.get(&block_root),
+            Some(&prepared_input),
+            "fixture Q must match the authentic prepared input before changing {field}"
+        );
+
+        let mismatch = match field {
+            "new_payload_request_root" => PublicInput {
+                new_payload_request_root: H256::repeat_byte(0x99),
+                ..prepared_input
+            },
+            "successful_validation" => PublicInput {
+                successful_validation: !prepared_input.successful_validation,
+                ..prepared_input
+            },
+            "chain_id" => PublicInput {
+                chain_id: prepared_input.chain_id ^ 1,
+                ..prepared_input
+            },
+            "schema_id" => PublicInput {
+                schema_id: prepared_input.schema_id ^ 1,
+                ..prepared_input
+            },
+            _ => unreachable!(),
+        };
+        let changed_fields = (
+            mismatch.new_payload_request_root != prepared_input.new_payload_request_root,
+            mismatch.successful_validation != prepared_input.successful_validation,
+            mismatch.chain_id != prepared_input.chain_id,
+            mismatch.schema_id != prepared_input.schema_id,
+        );
+        let only_expected_field_changed = match field {
+            "new_payload_request_root" => (true, false, false, false),
+            "successful_validation" => (false, true, false, false),
+            "chain_id" => (false, false, true, false),
+            "schema_id" => (false, false, false, true),
+            _ => unreachable!(),
+        };
+        assert_eq!(changed_fields, only_expected_field_changed);
+
+        store.execution_proof_contexts.insert(block_root, mismatch);
+        assert!(store.payloads.contains(&block_root));
+        assert_eq!(
+            store.execution_proof_contexts.get(&block_root),
+            Some(&mismatch)
+        );
+        assert_execution_proof_admission_declined_without_writes(
+            &mut store,
+            prepared,
+            ExecutionProofAdmissionDecline::ContextInapplicable,
+        );
+    }
+}
+
+#[test]
+fn execution_proof_admission_declines_when_payload_marker_or_q_is_missing() {
+    for missing in ["accepted-payload marker", "Q evidence"] {
+        let (mut store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+        let block_root = prepared.context_identity().beacon_block_root();
+        let prepared_input = *prepared.context_identity().public_input();
+        assert!(store.payloads.contains(&block_root));
+        assert_eq!(
+            store.execution_proof_contexts.get(&block_root),
+            Some(&prepared_input)
+        );
+
+        match missing {
+            "accepted-payload marker" => {
+                store.payloads.remove(&block_root);
+                assert!(!store.payloads.contains(&block_root));
+                assert_eq!(
+                    store.execution_proof_contexts.get(&block_root),
+                    Some(&prepared_input)
+                );
+            }
+            "Q evidence" => {
+                store.execution_proof_contexts.remove(&block_root);
+                assert!(store.payloads.contains(&block_root));
+                assert!(store.execution_proof_contexts.get(&block_root).is_none());
+            }
+            _ => unreachable!(),
+        }
+
+        assert_execution_proof_admission_declined_without_writes(
+            &mut store,
+            prepared,
+            ExecutionProofAdmissionDecline::ContextInapplicable,
+        );
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "three live-applicability cases share authentic preparation and exact admission assertions"
+)]
+#[test]
+fn execution_proof_admission_accepts_equivalent_q_unrelated_updates_and_cache_eviction() {
+    for update in [
+        "equal Q reinsertion",
+        "unrelated Seen bookkeeping",
+        "cache eviction",
+    ] {
+        let (mut store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+        let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+        let block_root = prepared.context_identity().beacon_block_root();
+        let prepared_input = *prepared.context_identity().public_input();
+        let proof_type = prepared.signed_message().proof_type;
+        let validator_index = prepared.validator_index();
+        let envelope_root = prepared.envelope_root();
+        let marker_before = store.payloads.contains(&block_root);
+        let context_before = store.execution_proof_contexts.get(&block_root).copied();
+        assert!(marker_before);
+        assert_eq!(context_before, Some(prepared_input));
+        let cached_payload = store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .expect("preparation fixture retains accepted payload bytes");
+        let cached_payload_pointer = Arc::as_ptr(cached_payload);
+        let cached_payload_slot = cached_payload.slot();
+
+        match update {
+            "equal Q reinsertion" => {
+                // PublicInput is inline; remove/reinsert publishes an equal-Q map version.
+                let previous_contexts = store.execution_proof_contexts.clone();
+                let removed_context = store.execution_proof_contexts.remove(&block_root);
+                assert_eq!(removed_context, Some(prepared_input));
+                assert_eq!(previous_contexts.get(&block_root), Some(&prepared_input));
+                store
+                    .execution_proof_contexts
+                    .insert(block_root, prepared_input);
+            }
+            "unrelated Seen bookkeeping" => {
+                let unrelated_block_root = H256::repeat_byte(0xa1);
+                let unrelated_envelope_root = H256::repeat_byte(0xa2);
+                assert_ne!(unrelated_block_root, block_root);
+                assert_ne!(unrelated_envelope_root, envelope_root);
+                assert!(
+                    !store
+                        .execution_proof_roots
+                        .contains_key(&unrelated_block_root)
+                );
+                let unrelated_prover_key = (unrelated_block_root, proof_type, validator_index);
+                assert!(
+                    !store
+                        .execution_proof_provers
+                        .contains(&unrelated_prover_key)
+                );
+                store
+                    .execution_proof_roots
+                    .entry(unrelated_block_root)
+                    .or_default()
+                    .insert(unrelated_envelope_root);
+                store.execution_proof_provers.insert(unrelated_prover_key);
+            }
+            "cache eviction" => {
+                assert!(
+                    store
+                        .cached_execution_payload_envelope_by_root(block_root)
+                        .is_some()
+                );
+                store
+                    .execution_payload_envelope_cache
+                    .prune_finalized(cached_payload_slot.saturating_add(1));
+                assert!(
+                    store
+                        .cached_execution_payload_envelope_by_root(block_root)
+                        .is_none()
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        assert_eq!(store.payloads.contains(&block_root), marker_before);
+        assert_eq!(
+            store.execution_proof_contexts.get(&block_root).copied(),
+            context_before
+        );
+        let prover_key = (block_root, proof_type, validator_index);
+        assert!(
+            !store
+                .execution_proof_roots
+                .get(&block_root)
+                .is_some_and(|roots| roots.contains(&envelope_root))
+        );
+        assert!(!store.execution_proof_provers.contains(&prover_key));
+        assert!(
+            !store
+                .execution_proofs
+                .get(&block_root)
+                .is_some_and(|proofs| proofs.contains_key(&proof_type))
+        );
+
+        let mut expected_roots = store.execution_proof_roots.clone();
+        expected_roots
+            .entry(block_root)
+            .or_default()
+            .insert(envelope_root);
+        let mut expected_provers = store.execution_proof_provers.clone();
+        expected_provers.insert(prover_key);
+        let expected_proofs = store.execution_proofs.clone();
+
+        let admission = store.admit_execution_proof(prepared);
+        assert!(
+            matches!(admission, ExecutionProofAdmission::Admitted(_)),
+            "{update}"
+        );
+        assert_eq!(store.execution_proof_roots, expected_roots, "{update}");
+        assert_eq!(store.execution_proof_provers, expected_provers, "{update}");
+        assert_eq!(
+            store.execution_proofs, expected_proofs,
+            "no verified proof is inserted"
+        );
+        assert_eq!(store.payloads.contains(&block_root), marker_before);
+        assert_eq!(
+            store.execution_proof_contexts.get(&block_root).copied(),
+            context_before
+        );
+        match update {
+            "cache eviction" => assert!(
+                store
+                    .cached_execution_payload_envelope_by_root(block_root)
+                    .is_none()
+            ),
+            _ => assert_eq!(
+                Arc::as_ptr(
+                    store
+                        .cached_execution_payload_envelope_by_root(block_root)
+                        .expect("admission preserves resident accepted payload bytes"),
+                ),
+                cached_payload_pointer,
+                "{update}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn execution_proof_admission_is_independent_by_proof_type() {
+    let (mut store, state, signed_type_1) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let key = proof_signing_key();
+    let signed_type_2 = signed_execution_proof_for_test(&store, &state, &[0x42], 2, 0, &key);
+    let prepared_type_1 = prepared_execution_proof_for_test(&store, &signed_type_1);
+    let prepared_type_2 = prepared_execution_proof_for_test(&store, &signed_type_2);
+    let block_root = prepared_type_1.context_identity().beacon_block_root();
+    assert_eq!(
+        prepared_type_2.context_identity().beacon_block_root(),
+        block_root
+    );
+    assert_eq!(prepared_type_1.signed_message().proof_type, 1);
+    assert_eq!(prepared_type_2.signed_message().proof_type, 2);
+    assert_eq!(prepared_type_1.validator_index(), 0);
+    assert_eq!(prepared_type_2.validator_index(), 0);
+    assert_eq!(
+        prepared_type_1.signed_message().proof_data.as_bytes(),
+        prepared_type_2.signed_message().proof_data.as_bytes()
+    );
+    assert_ne!(
+        prepared_type_1.envelope_root(),
+        prepared_type_2.envelope_root(),
+        "proof_type is part of the bare signed message"
+    );
+
+    let before = execution_proof_bookkeeping(&store);
+    assert!(before.0.is_empty() && before.1.is_empty() && before.2.is_empty());
+    let mut expected_after_type_1 = before.clone();
+    expected_after_type_1
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(prepared_type_1.envelope_root());
+    expected_after_type_1.2.insert((block_root, 1, 0));
+    let mut expected_after_both = expected_after_type_1.clone();
+    expected_after_both
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(prepared_type_2.envelope_root());
+    expected_after_both.2.insert((block_root, 2, 0));
+
+    assert!(matches!(
+        store.admit_execution_proof(prepared_type_1),
+        ExecutionProofAdmission::Admitted(_)
+    ));
+    assert_eq!(execution_proof_bookkeeping(&store), expected_after_type_1);
+    assert!(matches!(
+        store.admit_execution_proof(prepared_type_2),
+        ExecutionProofAdmission::Admitted(_)
+    ));
+    assert_eq!(execution_proof_bookkeeping(&store), expected_after_both);
+    assert_eq!(store.execution_proofs, before.0);
+}
+
+#[test]
+fn execution_proof_admission_other_type_survives_verified_occupancy() {
+    let (mut store, state, signed_type_1) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let key = proof_signing_key();
+    let signed_type_2 = signed_execution_proof_for_test(&store, &state, &[0x42], 2, 0, &key);
+    let prepared_type_1 = prepared_execution_proof_for_test(&store, &signed_type_1);
+    let prepared_type_2 = prepared_execution_proof_for_test(&store, &signed_type_2);
+    let block_root = prepared_type_1.context_identity().beacon_block_root();
+    assert_eq!(
+        prepared_type_2.context_identity().beacon_block_root(),
+        block_root
+    );
+    assert_eq!(
+        prepared_type_1.signed_message().proof_data.as_bytes(),
+        &[0x42]
+    );
+    assert_eq!(
+        prepared_type_2.signed_message().proof_data.as_bytes(),
+        &[0x42]
+    );
+    assert_ne!(
+        prepared_type_1.envelope_root(),
+        prepared_type_2.envelope_root(),
+        "proof_type is part of the bare signed message"
+    );
+    assert!(store.execution_proof_roots.is_empty());
+    assert!(store.execution_proof_provers.is_empty());
+    assert!(!store.execution_proofs.contains_key(&block_root));
+
+    // Both authentic candidates are prepared before the fixture seeds verified type 1.
+    let stored_type_1 = prepared_type_1.signed_message().clone();
+    store
+        .execution_proofs
+        .entry(block_root)
+        .or_default()
+        .insert(1, stored_type_1.clone());
+    let before_type_1_decline = execution_proof_bookkeeping(&store);
+    assert!(matches!(
+        store.admit_execution_proof(prepared_type_1),
+        ExecutionProofAdmission::Declined(ExecutionProofAdmissionDecline::AlreadyVerified)
+    ));
+    assert_eq!(execution_proof_bookkeeping(&store), before_type_1_decline);
+    assert_eq!(
+        store
+            .execution_proofs
+            .get(&block_root)
+            .and_then(|proofs| proofs.get(&1)),
+        Some(&stored_type_1),
+        "the existing bare type-1 envelope is preserved exactly"
+    );
+
+    let mut expected_after_type_2 = before_type_1_decline;
+    expected_after_type_2
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(prepared_type_2.envelope_root());
+    expected_after_type_2.2.insert((block_root, 2, 0));
+    assert!(matches!(
+        store.admit_execution_proof(prepared_type_2),
+        ExecutionProofAdmission::Admitted(_)
+    ));
+    assert_eq!(execution_proof_bookkeeping(&store), expected_after_type_2);
+    assert_eq!(
+        store
+            .execution_proofs
+            .get(&block_root)
+            .and_then(|proofs| proofs.get(&1)),
+        Some(&stored_type_1)
+    );
+}
+
+fn assert_independent_block_scope_admissions(
+    store: &mut Store<Minimal, NoopStorage>,
+    prepared_anchor: Box<PreparedExecutionProof>,
+    prepared_target: Box<PreparedExecutionProof>,
+) {
+    let anchor_root = prepared_anchor.context_identity().beacon_block_root();
+    let target_root = prepared_target.context_identity().beacon_block_root();
+    assert_ne!(anchor_root, target_root);
+    assert_eq!(prepared_anchor.signed_message().proof_type, 1);
+    assert_eq!(prepared_target.signed_message().proof_type, 1);
+    assert_eq!(prepared_anchor.validator_index(), 0);
+    assert_eq!(prepared_target.validator_index(), 0);
+    assert_eq!(
+        prepared_anchor.signed_message().proof_data.as_bytes(),
+        prepared_target.signed_message().proof_data.as_bytes()
+    );
+    assert_ne!(
+        prepared_anchor.envelope_root(),
+        prepared_target.envelope_root()
+    );
+    let anchor_prover = (
+        anchor_root,
+        prepared_anchor.signed_message().proof_type,
+        prepared_anchor.validator_index(),
+    );
+    let target_prover = (
+        target_root,
+        prepared_target.signed_message().proof_type,
+        prepared_target.validator_index(),
+    );
+    assert_ne!(anchor_prover, target_prover);
+
+    let anchor_q = *store
+        .execution_proof_contexts
+        .get(&anchor_root)
+        .expect("anchor accepted-payload setup preserves Q");
+    let target_q = *store
+        .execution_proof_contexts
+        .get(&target_root)
+        .expect("target accepted-payload setup preserves Q");
+    assert!(store.execution_proof_context_is_applicable(anchor_root, &anchor_q));
+    assert!(store.execution_proof_context_is_applicable(target_root, &target_q));
+    let contexts_before = store.execution_proof_contexts.clone();
+    let before = execution_proof_bookkeeping(store);
+    let mut expected_after_anchor = before.clone();
+    expected_after_anchor
+        .1
+        .entry(anchor_root)
+        .or_default()
+        .insert(prepared_anchor.envelope_root());
+    expected_after_anchor.2.insert(anchor_prover);
+    let mut expected_after_both = expected_after_anchor.clone();
+    expected_after_both
+        .1
+        .entry(target_root)
+        .or_default()
+        .insert(prepared_target.envelope_root());
+    expected_after_both.2.insert(target_prover);
+
+    assert!(matches!(
+        store.admit_execution_proof(prepared_anchor),
+        ExecutionProofAdmission::Admitted(_)
+    ));
+    assert_eq!(execution_proof_bookkeeping(store), expected_after_anchor);
+    assert!(matches!(
+        store.admit_execution_proof(prepared_target),
+        ExecutionProofAdmission::Admitted(_)
+    ));
+    assert_eq!(execution_proof_bookkeeping(store), expected_after_both);
+    assert_eq!(store.execution_proofs, before.0);
+    assert_eq!(store.execution_proof_contexts, contexts_before);
+    assert!(store.execution_proof_context_is_applicable(anchor_root, &anchor_q));
+    assert!(store.execution_proof_context_is_applicable(target_root, &target_q));
+}
+
+#[test]
+fn execution_proof_admission_is_independent_by_block_root() {
+    let (mut store, fixture_target_state, target_envelope, _, _, key) =
+        retained_unfinalized_payload_fixture();
+    let anchor_root = store.last_finalized().block_root;
+    let target_root = target_envelope.block_root();
+    let target_state = store
+        .chain_link(target_root)
+        .and_then(|link| link.state.as_ref())
+        .expect("retained target has its trusted state")
+        .clone_arc();
+    assert!(Arc::ptr_eq(&target_state, &fixture_target_state));
+    let anchor_state = store
+        .chain_link(anchor_root)
+        .and_then(|link| link.state.as_ref())
+        .expect("retained fixture anchor has its trusted state")
+        .clone_arc();
+    assert_eq!(accessors::latest_block_root(&anchor_state), anchor_root);
+    assert_eq!(accessors::latest_block_root(&target_state), target_root);
+    for state in [&anchor_state, &target_state] {
+        assert_eq!(state.validators().len_u64(), 1);
+        assert_eq!(
+            state
+                .validators()
+                .get(0)
+                .expect("both rooted fixture states contain validator 0")
+                .pubkey,
+            key.to_public_key().into()
+        );
+    }
+
+    let anchor_payload = cache_accepted_test_payload(&mut store, anchor_root, anchor_state.slot());
+    seed_execution_proof_context_for_test(&mut store, &anchor_state, &anchor_payload.message);
+    // This synthetic target envelope is explicitly applied as accepted Store fixture data;
+    // it makes no execution-layer validity claim.
+    let target_bid = store
+        .chain_link(target_root)
+        .expect("target remains retained")
+        .block
+        .message()
+        .body()
+        .with_payload_bid()
+        .map(|body| &body.signed_execution_payload_bid().message)
+        .expect("target block contains a bid");
+    let target_q = store
+        .execution_proof_public_input_from_parts(
+            &target_envelope.message,
+            target_bid
+                .blob_kzg_commitments
+                .iter()
+                .copied()
+                .map(misc::kzg_commitment_to_versioned_hash),
+        )
+        .expect("synthetic target payload and its trusted bid bind in the fixture");
+    store.apply_execution_payload_envelope(
+        AcceptedExecutionPayloadEnvelope::from_validation(
+            target_envelope.clone_arc(),
+            Some(target_q),
+        ),
+        false,
+    );
+
+    let anchor_q = *store
+        .execution_proof_contexts
+        .get(&anchor_root)
+        .expect("anchor accepted-payload setup seeds Q");
+    assert!(store.payloads.contains(&anchor_root));
+    assert!(store.payloads.contains(&target_root));
+    assert_eq!(
+        store
+            .cached_execution_payload_envelope_by_root(anchor_root)
+            .expect("anchor accepted payload is cached")
+            .as_ref(),
+        anchor_payload.as_ref()
+    );
+    assert_eq!(
+        store
+            .cached_execution_payload_envelope_by_root(target_root)
+            .expect("target fixture envelope is cached")
+            .as_ref(),
+        target_envelope.as_ref()
+    );
+    assert_eq!(
+        store.execution_proof_contexts.get(&anchor_root),
+        Some(&anchor_q)
+    );
+    assert_eq!(
+        store.execution_proof_contexts.get(&target_root),
+        Some(&target_q)
+    );
+
+    let signed_anchor = signed_execution_proof_for_test(&store, &anchor_state, &[0x42], 1, 0, &key);
+    let signed_target = signed_execution_proof_for_test(&store, &target_state, &[0x42], 1, 0, &key);
+    let prepared_anchor = prepared_execution_proof_for_test(&store, &signed_anchor);
+    let prepared_target = prepared_execution_proof_for_test(&store, &signed_target);
+    assert_independent_block_scope_admissions(&mut store, prepared_anchor, prepared_target);
+}
+
+#[test]
+fn execution_proof_admission_declines_retired_target_with_or_without_stale_marker() {
+    for restore_stale_marker in [false, true] {
+        let (mut store, target_state, target_envelope, descendant_root, post_checkpoint_root, key) =
+            retained_unfinalized_payload_fixture();
+        let target_root = target_envelope.block_root();
+        let target_bid = store
+            .chain_link(target_root)
+            .expect("target remains retained")
+            .block
+            .message()
+            .body()
+            .with_payload_bid()
+            .map(|body| &body.signed_execution_payload_bid().message)
+            .expect("target block contains a bid");
+        let target_q = store
+            .execution_proof_public_input_from_parts(
+                &target_envelope.message,
+                target_bid
+                    .blob_kzg_commitments
+                    .iter()
+                    .copied()
+                    .map(misc::kzg_commitment_to_versioned_hash),
+            )
+            .expect("target request should bind");
+        store.apply_execution_payload_envelope(
+            AcceptedExecutionPayloadEnvelope::from_validation(
+                target_envelope.clone_arc(),
+                Some(target_q),
+            ),
+            false,
+        );
+
+        assert_selected_payload_application(&store, &target_envelope, Some(target_q), false);
+
+        let signed_proof =
+            signed_execution_proof_for_test(&store, &target_state, &[0x42], 1, 0, &key);
+        let prepared = prepared_execution_proof_for_test(&store, &signed_proof);
+        let target_context = *prepared.context_identity().public_input();
+        assert_eq!(target_context, target_q);
+
+        store.finalized_checkpoint = Checkpoint {
+            epoch: 0,
+            root: descendant_root,
+        };
+        store.prune_after_finalization();
+        assert_eq!(store.last_finalized().block_root, descendant_root);
+        assert_ne!(store.last_finalized().block_root, target_root);
+        assert!(!store.unfinalized_locations.contains_key(&target_root));
+        assert!(store.chain_link(target_root).is_some());
+        assert!(
+            store
+                .unfinalized_locations
+                .contains_key(&post_checkpoint_root)
+        );
+        assert_eq!(
+            store
+                .chain_link(post_checkpoint_root)
+                .expect("post-checkpoint child remains in the live segment")
+                .parent_root(),
+            descendant_root
+        );
+        assert_eq!(
+            store.execution_proof_contexts.get(&target_root),
+            Some(&target_context),
+            "retirement must leave stale Q available for the admission check"
+        );
+        if restore_stale_marker {
+            // Isolate the stale-metadata case without applying a late payload that clears Q.
+            store.payloads.insert(target_root);
+        }
+        assert_eq!(store.payloads.contains(&target_root), restore_stale_marker);
+
+        let before = execution_proof_bookkeeping(&store);
+        let admission = store.admit_execution_proof(prepared);
+        assert!(matches!(
+            admission,
+            ExecutionProofAdmission::Declined(ExecutionProofAdmissionDecline::Retired)
+        ));
+        assert_eq!(
+            execution_proof_bookkeeping(&store),
+            before,
+            "retired admission must preserve all proof maps"
+        );
+        assert_eq!(
+            store.execution_proof_contexts.get(&target_root),
+            Some(&target_context)
+        );
+        assert_eq!(store.payloads.contains(&target_root), restore_stale_marker);
+    }
+}
+
+#[test]
+fn execution_proof_admission_forged_signature_does_not_consume_seen_keys() {
+    let (mut store, _, signed_proof) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let bookkeeping = execution_proof_bookkeeping(&store);
+    let mut forged_proof = signed_proof.clone();
+    forged_proof.signature = SignedExecutionProofEnvelope::default().signature;
+
+    assert_preparation_rejected(&store, &forged_proof, |error| {
+        matches!(error, Error::ExecutionProofEnvelopeInvalidSignature { .. })
+    });
+    assert_execution_proof_bookkeeping_unchanged(&store, &bookkeeping);
+
+    let prepared = prepared_execution_proof_for_test(&store, &signed_proof);
+    let block_root = prepared.context_identity().beacon_block_root();
+    let proof_type = prepared.signed_message().proof_type;
+    let envelope_root = prepared.envelope_root();
+    let prover_key = (block_root, proof_type, prepared.validator_index());
+    let mut expected = bookkeeping;
+    expected
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(envelope_root);
+    expected.2.insert(prover_key);
+
+    assert!(matches!(
+        store.admit_execution_proof(prepared),
+        ExecutionProofAdmission::Admitted(_)
+    ));
+    assert_eq!(execution_proof_bookkeeping(&store), expected);
+}
+
+#[test]
+fn execution_proof_admission_dropped_work_keeps_seen_keys_permanently() {
+    let (mut store, state, signed_proof) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let first = prepared_execution_proof_for_test(&store, &signed_proof);
+    let same_carrier = prepared_execution_proof_for_test(&store, &signed_proof);
+    let changed_bytes =
+        signed_execution_proof_for_test(&store, &state, &[0x43], 1, 0, &proof_signing_key());
+    let same_prover = prepared_execution_proof_for_test(&store, &changed_bytes);
+    let block_root = first.context_identity().beacon_block_root();
+    let envelope_root = first.envelope_root();
+    let prover_key = (
+        block_root,
+        first.signed_message().proof_type,
+        first.validator_index(),
+    );
+    assert_eq!(same_carrier.envelope_root(), envelope_root);
+    assert_eq!(
+        (
+            same_prover.context_identity().beacon_block_root(),
+            same_prover.signed_message().proof_type,
+            same_prover.validator_index(),
+        ),
+        prover_key
+    );
+    assert_ne!(same_prover.envelope_root(), envelope_root);
+
+    let before = execution_proof_bookkeeping(&store);
+    let mut expected_after_admission = before.clone();
+    expected_after_admission
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(envelope_root);
+    expected_after_admission.2.insert(prover_key);
+    let admitted = match store.admit_execution_proof(first) {
+        ExecutionProofAdmission::Admitted(admitted) => admitted,
+        ExecutionProofAdmission::Declined(_) => {
+            panic!("first authentic attempt should be admitted")
+        }
+    };
+    drop(admitted);
+    assert_eq!(
+        execution_proof_bookkeeping(&store),
+        expected_after_admission,
+        "dropping never-started work must retain both Seen keys"
+    );
+    assert_eq!(store.execution_proofs, before.0);
+
+    assert_execution_proof_admission_declined_without_writes(
+        &mut store,
+        same_carrier,
+        ExecutionProofAdmissionDecline::SeenRoot,
+    );
+    assert_execution_proof_admission_declined_without_writes(
+        &mut store,
+        same_prover,
+        ExecutionProofAdmissionDecline::SeenProver,
+    );
+    assert_eq!(
+        execution_proof_bookkeeping(&store),
+        expected_after_admission
+    );
+    assert_eq!(store.execution_proofs, before.0);
+}
+
+#[test]
+fn execution_proof_admission_scopes_root_seen_buckets_by_block() {
+    let (mut store, _, signed_envelope) = proof_preparation_fixture(FAR_FUTURE_EPOCH, true);
+    let prepared = prepared_execution_proof_for_test(&store, &signed_envelope);
+    let block_root = prepared.context_identity().beacon_block_root();
+    let envelope_root = prepared.envelope_root();
+    let other_block_root = H256::repeat_byte(0xa7);
+    assert_ne!(other_block_root, block_root);
+    assert!(!store.execution_proof_roots.contains_key(&block_root));
+    assert!(!store.execution_proof_roots.contains_key(&other_block_root));
+
+    // Synthetic bucket placement isolates B scoping; it is not a real hash collision.
+    store
+        .execution_proof_roots
+        .entry(other_block_root)
+        .or_default()
+        .insert(envelope_root);
+    assert!(!store.execution_proof_roots.contains_key(&block_root));
+    let before = execution_proof_bookkeeping(&store);
+    let mut expected = before.clone();
+    expected
+        .1
+        .entry(block_root)
+        .or_default()
+        .insert(envelope_root);
+    expected.2.insert((
+        block_root,
+        prepared.signed_message().proof_type,
+        prepared.validator_index(),
+    ));
+
+    assert!(matches!(
+        store.admit_execution_proof(prepared),
+        ExecutionProofAdmission::Admitted(_)
+    ));
+    assert_eq!(execution_proof_bookkeeping(&store), expected);
+    assert!(store.execution_proof_roots[&other_block_root].contains(&envelope_root));
+    assert!(store.execution_proof_roots[&block_root].contains(&envelope_root));
+    assert_eq!(store.execution_proofs, before.0);
 }
 
 #[test]
