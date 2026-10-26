@@ -5707,10 +5707,6 @@ fn execution_proof_recent_orphan_discards_prepared_and_admitted_work() {
     );
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "retired topology and malformed-input precedence share the same fixture"
-)]
 #[test]
 fn execution_proof_admission_declines_retired_target_with_or_without_stale_marker() {
     for restore_stale_marker in [false, true] {
