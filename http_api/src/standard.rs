@@ -2918,11 +2918,9 @@ pub async fn proposer_preferences<P: Preset, W: Wait>(
     let min_slot = controller.slot().max(gloas_fork_slot);
     let phase = chain_config.phase_at_slot::<P>(min_slot);
 
-    let proposer_preferences = ProgressiveList::<_>::try_from(controller.accepted_proposer_preferences(
-        min_slot,
-        slot,
-        dependent_root,
-    ))
+    let proposer_preferences = ProgressiveList::<_>::try_from(
+        controller.accepted_proposer_preferences(min_slot, slot, dependent_root),
+    )
     .map_err(AnyhowError::new)?;
 
     Ok(EthResponse::json_or_ssz(proposer_preferences, &headers)?
