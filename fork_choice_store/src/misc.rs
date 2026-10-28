@@ -1360,20 +1360,23 @@ pub enum ExecutionProofVerificationOutcome {
     LocalFault,
 }
 
-/// Why a completion report no longer applies to the live Store.
+/// Why a completion is locally ignored because it is no longer applicable or no longer needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionProofDiscard {
     Retired,
     ContextInapplicable,
+    /// A verified proof already occupies this block/type pair.
+    AlreadyVerified,
 }
 
 /// The live completion decision after checking target retention and context applicability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionProofCompletionOutcome {
-    /// An applicable valid attempt is accepted, whether or not another valid attempt stored first.
+    /// A valid attempt stored the first verified envelope for its block and proof type.
     Accept,
     Reject,
     LocalFault,
+    /// Locally ignore a completion that is no longer applicable or no longer needed.
     Discarded(ExecutionProofDiscard),
 }
 

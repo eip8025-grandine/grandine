@@ -353,11 +353,18 @@ fn retained_unfinalized_payload_fixture() -> RetainedUnfinalizedPayloadFixture {
     retained_unfinalized_payload_fixture_at_slot(1)
 }
 
+fn retained_unfinalized_payload_fixture_at_slot(slot: Slot) -> RetainedUnfinalizedPayloadFixture {
+    retained_unfinalized_payload_fixture_at_slot_with_second_validator(slot, None)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the target, descendants, and checkpoint boundary form one topology fixture"
 )]
-fn retained_unfinalized_payload_fixture_at_slot(slot: Slot) -> RetainedUnfinalizedPayloadFixture {
+fn retained_unfinalized_payload_fixture_at_slot_with_second_validator(
+    slot: Slot,
+    second_validator_key: Option<&SecretKey>,
+) -> RetainedUnfinalizedPayloadFixture {
     let descendant_slot = slot.checked_add(1).expect("fixture descendant slot fits");
     let post_checkpoint_slot = slot
         .checked_add(2)
@@ -403,6 +410,12 @@ fn retained_unfinalized_payload_fixture_at_slot(slot: Slot) -> RetainedUnfinaliz
             exit_epoch: FAR_FUTURE_EPOCH,
             ..Default::default()
         })
+        .chain(second_validator_key.into_iter().map(|key| Validator {
+            pubkey: key.to_public_key().into(),
+            activation_epoch: 0,
+            exit_epoch: FAR_FUTURE_EPOCH,
+            ..Default::default()
+        }))
         .collect(),
         slot,
         latest_block_header: BeaconBlockHeader {
@@ -452,7 +465,10 @@ fn retained_unfinalized_payload_fixture_at_slot(slot: Slot) -> RetainedUnfinaliz
         &bid
     );
     let validators = target_state.validators();
-    assert_eq!(validators.len_u64(), 1);
+    assert_eq!(
+        validators.len_u64(),
+        if second_validator_key.is_some() { 2 } else { 1 }
+    );
     assert_eq!(
         validators
             .get(0)
@@ -460,6 +476,15 @@ fn retained_unfinalized_payload_fixture_at_slot(slot: Slot) -> RetainedUnfinaliz
             .pubkey,
         key.to_public_key().into()
     );
+    if let Some(second_key) = second_validator_key {
+        assert_eq!(
+            validators
+                .get(1)
+                .expect("target state has validator 1")
+                .pubkey,
+            second_key.to_public_key().into()
+        );
+    }
     assert_eq!(accessors::latest_block_root(&target_state), target_root);
 
     let checkpoint = store.finalized_checkpoint;
@@ -3880,20 +3905,12 @@ fn execution_proof_completion_overlapping_verdicts_preserve_first_valid_in_both_
                 ExecutionProofVerificationOutcome::Valid,
                 ExecutionProofVerificationOutcome::Valid,
             ],
-            [
-                ExecutionProofCompletionOutcome::Accept,
-                ExecutionProofCompletionOutcome::Accept,
-            ],
         ),
         (
             "valid/invalid",
             [
                 ExecutionProofVerificationOutcome::Valid,
                 ExecutionProofVerificationOutcome::Invalid,
-            ],
-            [
-                ExecutionProofCompletionOutcome::Accept,
-                ExecutionProofCompletionOutcome::Reject,
             ],
         ),
         (
@@ -3902,10 +3919,6 @@ fn execution_proof_completion_overlapping_verdicts_preserve_first_valid_in_both_
                 ExecutionProofVerificationOutcome::Invalid,
                 ExecutionProofVerificationOutcome::Invalid,
             ],
-            [
-                ExecutionProofCompletionOutcome::Reject,
-                ExecutionProofCompletionOutcome::Reject,
-            ],
         ),
         (
             "valid/local-fault",
@@ -3913,14 +3926,10 @@ fn execution_proof_completion_overlapping_verdicts_preserve_first_valid_in_both_
                 ExecutionProofVerificationOutcome::Valid,
                 ExecutionProofVerificationOutcome::LocalFault,
             ],
-            [
-                ExecutionProofCompletionOutcome::Accept,
-                ExecutionProofCompletionOutcome::LocalFault,
-            ],
         ),
     ];
 
-    for (case, verdicts, expected_outcomes) in cases {
+    for (case, verdicts) in cases {
         for order in [[0_usize, 1], [1, 0]] {
             let keys = [proof_signing_key(), second_proof_signing_key()];
             // Both keys are registered before the fixture constructs its state and block root.
@@ -4074,10 +4083,27 @@ fn execution_proof_completion_overlapping_verdicts_preserve_first_valid_in_both_
                     verdicts[attempt_index],
                     "typed callback report ({case}, {order:?})"
                 );
+                let expected_outcome = if first_valid_index.is_some() {
+                    ExecutionProofCompletionOutcome::Discarded(
+                        ExecutionProofDiscard::AlreadyVerified,
+                    )
+                } else {
+                    match verdicts[attempt_index] {
+                        ExecutionProofVerificationOutcome::Valid => {
+                            ExecutionProofCompletionOutcome::Accept
+                        }
+                        ExecutionProofVerificationOutcome::Invalid => {
+                            ExecutionProofCompletionOutcome::Reject
+                        }
+                        ExecutionProofVerificationOutcome::LocalFault => {
+                            ExecutionProofCompletionOutcome::LocalFault
+                        }
+                    }
+                };
                 assert_eq!(
                     store.complete_execution_proof(completion),
-                    expected_outcomes[attempt_index],
-                    "each applicable verdict is independent of occupancy ({case}, {order:?})"
+                    expected_outcome,
+                    "applicability and existing storage govern each serialized completion ({case}, {order:?})"
                 );
 
                 if verdicts[attempt_index] == ExecutionProofVerificationOutcome::Valid
@@ -4153,6 +4179,237 @@ fn execution_proof_completion_overlapping_verdicts_preserve_first_valid_in_both_
                 );
             }
         }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "occupied storage must not bypass either live applicability gate"
+)]
+#[test]
+fn execution_proof_completion_checks_applicability_before_occupied_storage() {
+    for retire_target in [false, true] {
+        let second_key = second_proof_signing_key();
+        let (mut store, target_state, target_envelope, descendant_root, _, first_key) =
+            retained_unfinalized_payload_fixture_at_slot_with_second_validator(
+                1,
+                Some(&second_key),
+            );
+        let target_root = target_envelope.block_root();
+        let target_bid = store
+            .chain_link(target_root)
+            .expect("fixture target remains retained")
+            .block
+            .message()
+            .body()
+            .with_payload_bid()
+            .map(|body| &body.signed_execution_payload_bid().message)
+            .expect("fixture target block contains a bid");
+        let target_q = store
+            .execution_proof_public_input_from_parts(
+                &target_envelope.message,
+                target_bid
+                    .blob_kzg_commitments
+                    .iter()
+                    .copied()
+                    .map(misc::kzg_commitment_to_versioned_hash),
+            )
+            .expect("fixture target payload and trusted bid bind");
+        store.apply_execution_payload_envelope(
+            AcceptedExecutionPayloadEnvelope::from_validation(
+                target_envelope.clone_arc(),
+                Some(target_q),
+            ),
+            false,
+        );
+
+        let first_signed =
+            signed_execution_proof_for_test(&store, &target_state, &[0x42], 1, 0, &first_key);
+        let second_signed =
+            signed_execution_proof_for_test(&store, &target_state, &[0x43], 1, 1, &second_key);
+        let first = prepared_execution_proof_for_test(&store, &first_signed);
+        let second = prepared_execution_proof_for_test(&store, &second_signed);
+        let proof_type = first.signed_message().proof_type;
+        let envelope_roots = [first.envelope_root(), second.envelope_root()];
+        let prover_keys = [
+            (target_root, proof_type, first.validator_index()),
+            (target_root, proof_type, second.validator_index()),
+        ];
+        let first_message_pointer = first.signed_message().proof_data.as_bytes().as_ptr();
+        let expected_first_message = first.signed_message().clone();
+        let expected_first_bytes = expected_first_message.proof_data.as_bytes().to_vec();
+        let first_input = first.execution_proof().clone();
+        let first_input_pointer = first.execution_proof().proof_data.as_bytes().as_ptr();
+        let second_input = second.execution_proof().clone();
+        let second_input_pointer = second.execution_proof().proof_data.as_bytes().as_ptr();
+        assert_eq!(first.context_identity(), second.context_identity());
+        assert_eq!(proof_type, 1);
+        assert_eq!(second.signed_message().proof_type, proof_type);
+        assert_ne!(envelope_roots[0], envelope_roots[1]);
+        assert_ne!(prover_keys[0], prover_keys[1]);
+
+        let unrelated_root = H256::repeat_byte(0xe5);
+        assert_ne!(unrelated_root, target_root);
+        seed_execution_proof_bookkeeping(&mut store, unrelated_root);
+        let sentinel_arc = Arc::clone(
+            store.execution_proofs[&unrelated_root]
+                .get(&2)
+                .expect("unrelated sentinel stores a bare proof"),
+        );
+        let mut expected_after_admission = execution_proof_bookkeeping(&store);
+        expected_after_admission
+            .1
+            .entry(target_root)
+            .or_default()
+            .extend(envelope_roots);
+        expected_after_admission.2.extend(prover_keys);
+
+        let admitted_first = match store.admit_execution_proof(first) {
+            ExecutionProofAdmission::Admitted(admitted) => admitted,
+            ExecutionProofAdmission::Declined(reason) => {
+                panic!("first authentic attempt should admit: {reason:?}")
+            }
+        };
+        let admitted_second = match store.admit_execution_proof(second) {
+            ExecutionProofAdmission::Admitted(admitted) => admitted,
+            ExecutionProofAdmission::Declined(reason) => {
+                panic!("distinct authentic attempt should overlap: {reason:?}")
+            }
+        };
+        assert_eq!(
+            execution_proof_bookkeeping(&store),
+            expected_after_admission
+        );
+
+        let first_completion = report_admitted_execution_proof_for_test(
+            admitted_first,
+            &first_input,
+            first_input_pointer,
+            ExecutionProofVerificationOutcome::Valid,
+        );
+        assert_eq!(
+            store.complete_execution_proof(first_completion),
+            ExecutionProofCompletionOutcome::Accept
+        );
+        let first_stored_arc = Arc::clone(
+            store.execution_proofs[&target_root]
+                .get(&proof_type)
+                .expect("the first valid report stores its proof"),
+        );
+        assert_eq!(
+            first_stored_arc.proof_data.as_bytes(),
+            expected_first_bytes.as_slice()
+        );
+        assert_eq!(
+            first_stored_arc.proof_data.as_bytes().as_ptr(),
+            first_message_pointer
+        );
+
+        let second_completion = report_admitted_execution_proof_for_test(
+            admitted_second,
+            &second_input,
+            second_input_pointer,
+            ExecutionProofVerificationOutcome::Invalid,
+        );
+        let expected_outcome = if retire_target {
+            store.finalized_checkpoint = Checkpoint {
+                epoch: 0,
+                root: descendant_root,
+            };
+            store.prune_after_finalization();
+            assert_eq!(store.last_finalized().block_root, descendant_root);
+            assert!(!store.unfinalized_locations.contains_key(&target_root));
+            assert!(
+                store.execution_proofs[&target_root].contains_key(&proof_type),
+                "physical cleanup is deferred, so occupancy remains after retirement"
+            );
+            ExecutionProofCompletionOutcome::Discarded(ExecutionProofDiscard::Retired)
+        } else {
+            let changed_q = PublicInput {
+                chain_id: target_q.chain_id ^ 1,
+                ..target_q
+            };
+            assert_ne!(changed_q, target_q);
+            store
+                .execution_proof_contexts
+                .insert(target_root, changed_q);
+            assert!(!store.execution_proof_context_is_applicable(target_root, &target_q));
+            ExecutionProofCompletionOutcome::Discarded(ExecutionProofDiscard::ContextInapplicable)
+        };
+
+        let bookkeeping_before_second_completion = execution_proof_bookkeeping(&store);
+        assert_eq!(
+            bookkeeping_before_second_completion.0[&target_root][&proof_type],
+            first_stored_arc
+        );
+        let seen_roots_before = store.execution_proof_roots.clone();
+        let seen_provers_before = store.execution_proof_provers.clone();
+        assert!(seen_roots_before[&target_root].contains(&envelope_roots[0]));
+        assert!(seen_roots_before[&target_root].contains(&envelope_roots[1]));
+        assert!(seen_provers_before.contains(&prover_keys[0]));
+        assert!(seen_provers_before.contains(&prover_keys[1]));
+        let unrelated_state_before = (
+            store.execution_proof_contexts.clone(),
+            store.payloads.clone(),
+            store.timely_payloads.clone(),
+            store.accepted_execution_payload_envelopes.clone(),
+            store
+                .cached_execution_payload_envelope_by_root(target_root)
+                .map(Arc::as_ptr),
+            store.tick(),
+            store.justified_checkpoint(),
+            store.finalized_checkpoint(),
+            store.last_finalized().block_root,
+            store.head().block_root,
+            store.head_node_payload_status(),
+        );
+
+        assert_eq!(
+            store.complete_execution_proof(second_completion),
+            expected_outcome,
+            "live applicability must win over occupied storage (retired={retire_target})"
+        );
+        assert_eq!(
+            execution_proof_bookkeeping(&store),
+            bookkeeping_before_second_completion
+        );
+        assert_eq!(store.execution_proof_roots, seen_roots_before);
+        assert_eq!(store.execution_proof_provers, seen_provers_before);
+        let stored_after = &store.execution_proofs[&target_root][&proof_type];
+        assert!(Arc::ptr_eq(&first_stored_arc, stored_after));
+        assert_eq!(
+            stored_after.proof_data.as_bytes(),
+            expected_first_bytes.as_slice()
+        );
+        assert_eq!(
+            stored_after.proof_data.as_bytes().as_ptr(),
+            first_message_pointer
+        );
+        assert!(Arc::ptr_eq(
+            &sentinel_arc,
+            store.execution_proofs[&unrelated_root]
+                .get(&2)
+                .expect("unrelated sentinel remains untouched")
+        ));
+        assert_eq!(
+            (
+                store.execution_proof_contexts.clone(),
+                store.payloads.clone(),
+                store.timely_payloads.clone(),
+                store.accepted_execution_payload_envelopes.clone(),
+                store
+                    .cached_execution_payload_envelope_by_root(target_root)
+                    .map(Arc::as_ptr),
+                store.tick(),
+                store.justified_checkpoint(),
+                store.finalized_checkpoint(),
+                store.last_finalized().block_root,
+                store.head().block_root,
+                store.head_node_payload_status(),
+            ),
+            unrelated_state_before,
+            "occupied completion does not mutate unrelated Store observables"
+        );
     }
 }
 

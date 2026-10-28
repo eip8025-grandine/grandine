@@ -5987,6 +5987,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
     }
 
     /// Applies a protected verification report if its target and accepted context are still live.
+    /// Existing verified storage takes precedence over every report after applicability checks.
     pub fn complete_execution_proof(
         &mut self,
         completion: ExecutionProofCompletion,
@@ -6007,25 +6008,28 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
             );
         }
 
+        let proof_type = completion.envelope().proof_type;
+        if self
+            .execution_proofs
+            .get(&block_root)
+            .is_some_and(|proofs| proofs.contains_key(&proof_type))
+        {
+            return ExecutionProofCompletionOutcome::Discarded(
+                ExecutionProofDiscard::AlreadyVerified,
+            );
+        }
+
         match completion.verification_outcome() {
             ExecutionProofVerificationOutcome::Invalid => ExecutionProofCompletionOutcome::Reject,
             ExecutionProofVerificationOutcome::LocalFault => {
                 ExecutionProofCompletionOutcome::LocalFault
             }
             ExecutionProofVerificationOutcome::Valid => {
-                let proof_type = completion.envelope().proof_type;
-                let is_occupied = self
-                    .execution_proofs
-                    .get(&block_root)
-                    .is_some_and(|proofs| proofs.contains_key(&proof_type));
-
-                if !is_occupied {
-                    let envelope = completion.into_bare_envelope();
-                    self.execution_proofs
-                        .entry(block_root)
-                        .or_default()
-                        .insert(proof_type, Arc::new(envelope));
-                }
+                let envelope = completion.into_bare_envelope();
+                self.execution_proofs
+                    .entry(block_root)
+                    .or_default()
+                    .insert(proof_type, Arc::new(envelope));
 
                 ExecutionProofCompletionOutcome::Accept
             }
