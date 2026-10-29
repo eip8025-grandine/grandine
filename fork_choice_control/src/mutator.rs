@@ -2799,11 +2799,19 @@ where
                 );
                 Ok(ValidationOutcomeWithReason::Accept)
             }
-            ExecutionProofCompletionOutcome::Reject => Err(anyhow!("invalid execution proof")),
+            ExecutionProofCompletionOutcome::Reject => {
+                trace_with_peers!(
+                    "execution proof rejected (block_root: {beacon_block_root:?}, proof_type: {proof_type}, validator_index: {validator_index}, outcome: REJECT, reason: invalid execution proof)",
+                );
+                Err(anyhow!("invalid execution proof"))
+            }
             ExecutionProofCompletionOutcome::LocalFault => Ok(ValidationOutcomeWithReason::Ignore(
                 "local execution proof verification failure",
             )),
             ExecutionProofCompletionOutcome::Discarded(reason) => {
+                trace_with_peers!(
+                    "execution proof ignored (block_root: {beacon_block_root:?}, proof_type: {proof_type}, validator_index: {validator_index}, outcome: IGNORE, reason: {reason:?})",
+                );
                 debug_with_peers!("execution proof completion discarded (reason: {reason:?})");
                 Ok(ValidationOutcomeWithReason::Ignore(
                     "execution proof completion is no longer applicable or needed",
