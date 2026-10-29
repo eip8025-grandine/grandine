@@ -91,7 +91,7 @@ fn describe(backend_spec: BackendSpec) -> String {
     format!("{backend_spec:?}")
 }
 
-#[derive(Debug, Error)]
+#[derive(PartialEq, Eq, Debug, Error)]
 pub enum Error {
     #[error("expected TYPE=BACKEND")]
     MissingBackend,
@@ -136,19 +136,19 @@ mod tests {
         assert_eq!(backend_spec, BackendSpec::ZkboostMock);
     }
 
-    #[test_case("0=mock"; "type 0")]
-    #[test_case("4=mock"; "type 4")]
-    #[test_case("256=mock"; "type 256")]
-    #[test_case("-1=mock"; "negative type")]
-    #[test_case("0x01=mock"; "hex type")]
-    #[test_case("1=foo"; "unknown backend")]
-    #[test_case("1=sp1"; "sp1 without VK separator")]
-    #[test_case("1="; "empty backend")]
-    #[test_case("1"; "no backend")]
-    #[test_case("=mock"; "no type")]
-    #[test_case(""; "empty")]
-    fn rejects(string: &str) {
-        parse_execution_proof_type(string).expect_err("value should be rejected");
+    #[test_case("0=mock" => Error::UnsupportedProofType { proof_type: 0 }; "type 0")]
+    #[test_case("4=mock" => Error::UnsupportedProofType { proof_type: 4 }; "type 4")]
+    #[test_case("256=mock" => Error::InvalidProofType; "type 256")]
+    #[test_case("-1=mock" => Error::InvalidProofType; "negative type")]
+    #[test_case("0x01=mock" => Error::InvalidProofType; "hex type")]
+    #[test_case("1=foo" => Error::UnknownBackend; "unknown backend")]
+    #[test_case("1=sp1" => Error::UnknownBackend; "sp1 without VK separator")]
+    #[test_case("1=" => Error::UnknownBackend; "empty backend")]
+    #[test_case("1" => Error::MissingBackend; "no backend")]
+    #[test_case("=mock" => Error::InvalidProofType; "no type")]
+    #[test_case("" => Error::MissingBackend; "empty")]
+    fn rejects(string: &str) -> Error {
+        parse_execution_proof_type(string).expect_err("value should be rejected")
     }
 
     #[test_case("2=sp1:"; "empty")]
@@ -159,7 +159,13 @@ mod tests {
     #[test_case("2=sp1:0xzz662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b"; "non-hex")]
     #[test_case("2=sp1:0X00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b"; "upper-case prefix")]
     fn rejects_malformed_verifying_key(string: &str) {
-        parse_execution_proof_type(string).expect_err("value should be rejected");
+        let error = parse_execution_proof_type(string).expect_err("value should be rejected");
+
+        // Without the feature every `sp1:` value is refused before its key is read.
+        #[cfg(feature = "execution-proof-sp1")]
+        assert_eq!(error, Error::InvalidVerifyingKey);
+        #[cfg(not(feature = "execution-proof-sp1"))]
+        assert_eq!(error, Error::Sp1NotBuilt);
     }
 
     #[cfg(not(feature = "execution-proof-sp1"))]
@@ -168,7 +174,7 @@ mod tests {
         let error = parse_execution_proof_type(&format!("2={}", sp1(ETHREX_VK)))
             .expect_err("sp1 should be refused without the feature");
 
-        assert!(matches!(error, Error::Sp1NotBuilt));
+        assert_eq!(error, Error::Sp1NotBuilt);
     }
 
     #[cfg(feature = "execution-proof-sp1")]

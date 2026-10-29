@@ -100,6 +100,11 @@ jobs:
       - name: Run SP1 proof engine tests (Linux)
         if: runner.os == 'Linux'
         run: cargo test --release -p proof_engine -p bls --features bls/blst,proof_engine/sp1 --lib
+      - name: Build and test runtime with SP1 execution-proof verification (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release -p grandine --features default-networks,execution-proof-sp1
+          cargo test --release -p runtime --features default-networks,bls/blst,kzg_utils/blst,execution-proof-sp1 --lib
       - name: Run other kzg backend tests
         if: matrix.test_kzg_backends != ''
         run: ${{ matrix.test_kzg_backends }}

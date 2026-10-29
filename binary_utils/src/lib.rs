@@ -118,6 +118,7 @@ pub fn initialize_tracing_logger(
         .add_directive("operation_pools=info".parse()?)
         .add_directive("p2p=info".parse()?)
         .add_directive("prometheus_metrics=info".parse()?)
+        .add_directive("proof_engine=info".parse()?)
         .add_directive("pubkey_cache=info".parse()?)
         .add_directive("runtime=info".parse()?)
         .add_directive("signer=info".parse()?)

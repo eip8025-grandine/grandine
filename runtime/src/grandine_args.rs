@@ -3416,19 +3416,37 @@ mod tests {
         );
     }
 
-    #[test_case("0=mock"; "type 0")]
-    #[test_case("4=mock"; "type 4")]
-    #[test_case("256=mock"; "type 256")]
-    #[test_case("1=foo"; "unknown backend")]
-    #[test_case("1"; "no backend")]
-    #[test_case("=mock"; "no type")]
-    #[test_case("1=mock,2=mock"; "no comma splitting")]
+    #[test_case("0=mock", &execution_proofs::Error::UnsupportedProofType { proof_type: 0 }; "type 0")]
+    #[test_case("4=mock", &execution_proofs::Error::UnsupportedProofType { proof_type: 4 }; "type 4")]
+    #[test_case("256=mock", &execution_proofs::Error::InvalidProofType; "type 256")]
+    #[test_case("1=foo", &execution_proofs::Error::UnknownBackend; "unknown backend")]
+    #[test_case("1", &execution_proofs::Error::MissingBackend; "no backend")]
+    #[test_case("=mock", &execution_proofs::Error::InvalidProofType; "no type")]
+    #[test_case("1=mock,2=mock", &execution_proofs::Error::UnknownBackend; "no comma splitting")]
+    fn execution_proof_type_rejected_at_parse_time(
+        value: &str,
+        expected_error: &execution_proofs::Error,
+    ) {
+        let error = try_config_from_args(["--network", "sepolia", "--execution-proof-type", value])
+            .expect_err("GrandineArgs::try_into_config should fail");
+
+        assert_eq!(execution_proof_type_error(&error), Some(expected_error));
+    }
+
     #[test_case("2=sp1:0x00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c8"; "31-byte VK")]
     #[test_case("2=sp1:0x00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b00"; "33-byte VK")]
     #[test_case("2=sp1:0xzz662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b"; "non-hex VK")]
-    fn execution_proof_type_rejected_at_parse_time(value: &str) {
-        try_config_from_args(["--network", "sepolia", "--execution-proof-type", value])
+    fn execution_proof_type_malformed_verifying_key_rejected_at_parse_time(value: &str) {
+        let error = try_config_from_args(["--network", "sepolia", "--execution-proof-type", value])
             .expect_err("GrandineArgs::try_into_config should fail");
+
+        // Without the feature every `sp1:` value is refused before its key is read.
+        #[cfg(feature = "execution-proof-sp1")]
+        let expected_error = execution_proofs::Error::InvalidVerifyingKey;
+        #[cfg(not(feature = "execution-proof-sp1"))]
+        let expected_error = execution_proofs::Error::Sp1NotBuilt;
+
+        assert_eq!(execution_proof_type_error(&error), Some(&expected_error));
     }
 
     #[cfg(not(feature = "execution-proof-sp1"))]
@@ -3502,6 +3520,11 @@ mod tests {
             error.downcast_ref(),
             Some(proof_engine::ConstructionError::MockOnMainnet { proof_type: 1 }),
         ));
+    }
+
+    /// The parser's error, which clap keeps as the source of its own.
+    fn execution_proof_type_error(error: &anyhow::Error) -> Option<&execution_proofs::Error> {
+        error.chain().find_map(|source| source.downcast_ref())
     }
 
     fn proof_engine(config: &GrandineConfig) -> Result<Arc<dyn proof_engine::ProofEngine>> {
