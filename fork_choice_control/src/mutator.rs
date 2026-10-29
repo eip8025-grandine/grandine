@@ -39,11 +39,11 @@ use fork_choice_store::{
     AttesterSlashingOrigin, BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockItem,
     BlockOrigin, ChainLink, DataColumnSidecarAction, DataColumnSidecarOrigin, Error,
     ExecutionPayloadBidAction, ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeOrigin,
-    ExecutionPayloadEnvelopeValidationAction, ExecutionProofAdmission, ExecutionProofCompletion,
-    ExecutionProofCompletionOutcome, ExecutionProofOrigin, ExecutionProofPreparation,
-    PayloadAction, PayloadAttestationAction, PayloadAttestationItem, PayloadPresence,
-    ProposerPreferencesAction, ProposerPreferencesOrigin, StateCacheProcessor, Store,
-    ValidAttestation, ValidPayloadAttestation,
+    ExecutionPayloadEnvelopeValidationAction, ExecutionProofAdmission,
+    ExecutionProofAdmissionDecline, ExecutionProofCompletion, ExecutionProofCompletionOutcome,
+    ExecutionProofOrigin, ExecutionProofPreparation, PayloadAction, PayloadAttestationAction,
+    PayloadAttestationItem, PayloadPresence, ProposerPreferencesAction, ProposerPreferencesOrigin,
+    StateCacheProcessor, Store, ValidAttestation, ValidPayloadAttestation,
 };
 use futures::channel::{mpsc::Sender as MultiSender, oneshot::Sender as OneshotSender};
 use helper_functions::{accessors, misc, predicates, verifier::NullVerifier};
@@ -2752,8 +2752,17 @@ where
             }
         };
 
+        let beacon_block_root = prepared.signed_message().beacon_block_root;
+        let proof_type = prepared.signed_message().proof_type;
+        let validator_index = prepared.validator_index();
+
         match self.store_mut().admit_execution_proof(prepared) {
             ExecutionProofAdmission::Declined(reason) => {
+                if reason == ExecutionProofAdmissionDecline::AlreadyVerified {
+                    trace_with_peers!(
+                        "execution proof ignored (block_root: {beacon_block_root:?}, proof_type: {proof_type}, validator_index: {validator_index}, outcome: IGNORE, reason: {reason:?})",
+                    );
+                }
                 debug_with_peers!("execution proof admission declined (reason: {reason:?})");
                 self.handle_execution_proof(
                     Ok(ValidationOutcomeWithReason::Ignore(

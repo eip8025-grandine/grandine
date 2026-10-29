@@ -22,7 +22,7 @@ use helper_functions::{
     accessors, deposit_signatures, misc,
     verifier::{MultiVerifier, NullVerifier},
 };
-use logging::{debug_with_peers, warn_with_peers};
+use logging::{debug_with_peers, trace_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
 use proof_engine::{ProofEngine, ProofVerdict};
 use pubkey_cache::PubkeyCache;
@@ -762,6 +762,15 @@ impl<P: Preset, W> Run for ProcessExecutionProofTask<P, W> {
             &store_snapshot,
             &signed_proof,
         ));
+
+        if let Ok(ExecutionProofPreparation::Ignore(reason)) = &result {
+            let beacon_block_root = signed_proof.message.beacon_block_root;
+            let proof_type = signed_proof.message.proof_type;
+            let validator_index = signed_proof.validator_index;
+            trace_with_peers!(
+                "execution proof ignored (block_root: {beacon_block_root:?}, proof_type: {proof_type}, validator_index: {validator_index}, outcome: IGNORE, reason: {reason})",
+            );
+        }
 
         // The worker exits rather than waiting for live admission. A snapshot can
         // authenticate input, but cannot authorize an engine invocation.
