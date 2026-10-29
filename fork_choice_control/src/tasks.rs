@@ -1622,6 +1622,10 @@ mod tests {
             .0;
         let block = Arc::new(genesis::beacon_block(&state));
         let (controller, _mutator_handle) = TestController::quiet(config, block, state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("API response test runtime should build");
 
         for (null, empty) in [(true, true), (false, true), (false, false)] {
             let mut proof = (*test_signed_proof()).clone();
@@ -1639,8 +1643,12 @@ mod tests {
                 origin: ExecutionProofOrigin::Api(sender),
             }
             .run();
-            let result = futures::executor::block_on(receiver)
-                .expect("live mutator should send a terminal API response");
+            let result = runtime.block_on(async {
+                tokio::time::timeout(TEST_RESPONSE_TIMEOUT, receiver)
+                    .await
+                    .expect("live mutator should reply before the API response timeout")
+                    .expect("live mutator should not cancel the terminal API response")
+            });
             if !null && empty {
                 assert!(result.is_err(), "active empty proof should reject");
             } else {
