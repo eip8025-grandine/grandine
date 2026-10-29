@@ -58,6 +58,7 @@ use logging::{info_with_peers, warn_with_peers};
 use metrics::{MetricsServerConfig, MetricsServiceConfig};
 use p2p::{Enr, Multiaddr, NetworkConfig};
 use prometheus_metrics::{METRICS, Metrics};
+use proof_engine::BackendSpec;
 use reqwest::header::HeaderValue;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -73,6 +74,7 @@ use tracing::Level;
 use types::{
     bellatrix::primitives::{Difficulty, Gas},
     config::Config as ChainConfig,
+    eip8025::primitives::ProofType,
     nonstandard::{
         CustodyMode, DEFAULT_BUILDER_MAX_SKIPPED_SLOTS,
         DEFAULT_BUILDER_MAX_SKIPPED_SLOTS_PER_EPOCH, Phase, PublishedDuty, StorageMode,
@@ -96,6 +98,7 @@ use crate::{
     },
     default_network_config,
     defaults::DEFAULT_RECONSTRUCTION_DELAY_MS,
+    execution_proofs,
     grandine_config::{BeaconNodeConfig, GrandineConfig, Mode, ValidatorClientConfig},
     predefined_network::PredefinedNetwork,
     validators::Validators,
@@ -387,6 +390,14 @@ pub struct BeaconNodeOptions {
     #[clap(long)]
     no_custody_groups_backfill: bool,
 
+    /// Verify EIP-8025 execution proofs of proof type TYPE with BACKEND, which is mock or sp1:<VK>.
+    /// Repeat once per proof type. Without this option the node verifies no execution proofs.
+    /// mock is zkboost mock verification, not a test stub: it checks only the public values a proof claims and performs no cryptographic check. It is refused on mainnet.
+    /// sp1:<VK> verifies SP1 proofs against the 32-byte guest verifying key VK, in hex as `cargo prove vkey` prints it. It requires a build with the execution-proof-sp1 feature.
+    /// [default: disabled]
+    #[clap(long, value_name = "TYPE=BACKEND", value_parser = execution_proofs::parse_execution_proof_type)]
+    execution_proof_type: Vec<(ProofType, BackendSpec)>,
+
     #[clap(flatten)]
     http_api_options: HttpApiOptions,
 
@@ -491,6 +502,7 @@ impl BeaconNodeOptions {
             semi_supernode,
             subscribe_all_subnets,
             no_custody_groups_backfill,
+            execution_proof_type,
             http_api_options,
             mut network_config_options,
             slasher_options,
@@ -652,6 +664,7 @@ impl BeaconNodeOptions {
             backfill_custody_groups: !no_custody_groups_backfill,
             custody_mode,
             builder_config,
+            execution_proof_backends: execution_proof_type,
         })
     }
 }
@@ -2359,6 +2372,7 @@ mod tests {
 
     use ssz::Uint256;
     use tempfile::NamedTempFile;
+    use test_case::test_case;
 
     use crate::commands::InterchangeCommand;
 
@@ -3317,6 +3331,184 @@ mod tests {
             configuration_file,
         ])
         .expect_err("GrandineArgs::try_into_config should fail");
+    }
+
+    #[test]
+    fn execution_proof_type_absent_gives_null_engine() {
+        let config = config_from_args([]);
+
+        assert_eq!(beacon_node(&config).execution_proof_backends, []);
+        assert!(
+            proof_engine(&config)
+                .expect("engine should build")
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn execution_proof_type_mock_on_custom_network() {
+        let mut configuration_file =
+            NamedTempFile::new().expect("creating a named temporary file should succeed");
+
+        writeln!(configuration_file, "DEPOSIT_CHAIN_ID: 1337")
+            .expect("writing the configuration file should succeed");
+
+        let configuration_file = configuration_file
+            .path()
+            .to_str()
+            .expect("temporary file path should be a valid UTF-8 string");
+
+        let config = config_from_args([
+            "--network",
+            "custom",
+            "--configuration-file",
+            configuration_file,
+            "--eth1-rpc-urls",
+            "http://localhost:8545",
+            "--execution-proof-type",
+            "1=mock",
+        ]);
+
+        assert_eq!(
+            beacon_node(&config).execution_proof_backends,
+            [(1, BackendSpec::ZkboostMock)],
+        );
+        assert!(
+            !proof_engine(&config)
+                .expect("engine should build")
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn execution_proof_type_repeated() {
+        let config = config_from_args([
+            "--network",
+            "sepolia",
+            "--execution-proof-type",
+            "3=mock",
+            "--execution-proof-type",
+            "1=mock",
+        ]);
+
+        assert_eq!(
+            beacon_node(&config).execution_proof_backends,
+            [(3, BackendSpec::ZkboostMock), (1, BackendSpec::ZkboostMock)],
+        );
+        assert!(
+            !proof_engine(&config)
+                .expect("engine should build")
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn execution_proof_type_from_args_file() {
+        let config = try_config_from_args_and_file(
+            ["--network", "sepolia"],
+            "execution_proof_type: ['1=mock', '2=mock']",
+        )
+        .expect("GrandineArgs should be successfully parsed from arguments");
+
+        assert_eq!(
+            beacon_node(&config).execution_proof_backends,
+            [(1, BackendSpec::ZkboostMock), (2, BackendSpec::ZkboostMock)],
+        );
+    }
+
+    #[test_case("0=mock"; "type 0")]
+    #[test_case("4=mock"; "type 4")]
+    #[test_case("256=mock"; "type 256")]
+    #[test_case("1=foo"; "unknown backend")]
+    #[test_case("1"; "no backend")]
+    #[test_case("=mock"; "no type")]
+    #[test_case("1=mock,2=mock"; "no comma splitting")]
+    #[test_case("2=sp1:0x00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c8"; "31-byte VK")]
+    #[test_case("2=sp1:0x00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b00"; "33-byte VK")]
+    #[test_case("2=sp1:0xzz662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b"; "non-hex VK")]
+    fn execution_proof_type_rejected_at_parse_time(value: &str) {
+        try_config_from_args(["--network", "sepolia", "--execution-proof-type", value])
+            .expect_err("GrandineArgs::try_into_config should fail");
+    }
+
+    #[cfg(not(feature = "execution-proof-sp1"))]
+    #[test]
+    fn execution_proof_type_sp1_without_feature() {
+        let error = try_config_from_args([
+            "--network",
+            "sepolia",
+            "--execution-proof-type",
+            "2=sp1:0x00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b",
+        ])
+        .expect_err("sp1 should be refused without the feature");
+
+        assert!(
+            error
+                .to_string()
+                .contains("built without `execution-proof-sp1`"),
+        );
+    }
+
+    #[test]
+    fn execution_proof_type_mock_on_sepolia_builds() {
+        let config = config_from_args(["--network", "sepolia", "--execution-proof-type", "1=mock"]);
+
+        assert!(
+            !proof_engine(&config)
+                .expect("engine should build")
+                .is_null()
+        );
+    }
+
+    #[cfg(feature = "execution-proof-sp1")]
+    #[test_case("sepolia")]
+    #[test_case("mainnet")]
+    fn execution_proof_type_sp1_builds(network: &str) {
+        let config = config_from_args([
+            "--network",
+            network,
+            "--execution-proof-type",
+            "2=sp1:0x00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b",
+        ]);
+
+        assert_eq!(
+            beacon_node(&config).execution_proof_backends,
+            [(
+                2,
+                BackendSpec::Sp1 {
+                    program_vk: hex_literal::hex!(
+                        "00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b"
+                    ),
+                },
+            )],
+        );
+        assert!(
+            !proof_engine(&config)
+                .expect("engine should build")
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn execution_proof_type_mock_on_mainnet_fails_at_startup() {
+        // Mainnet is refused by the engine, not the parser.
+        let config = config_from_args(["--network", "mainnet", "--execution-proof-type", "1=mock"]);
+
+        let error = proof_engine(&config)
+            .err()
+            .expect("mock should be refused on mainnet");
+
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(proof_engine::ConstructionError::MockOnMainnet { proof_type: 1 }),
+        ));
+    }
+
+    fn proof_engine(config: &GrandineConfig) -> Result<Arc<dyn proof_engine::ProofEngine>> {
+        execution_proofs::build_proof_engine(
+            &config.chain_config,
+            &beacon_node(config).execution_proof_backends,
+        )
     }
 
     #[test]

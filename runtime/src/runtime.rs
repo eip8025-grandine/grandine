@@ -72,7 +72,7 @@ use p2p::{
     SubnetService,
 };
 use prometheus_client::registry::Registry;
-use proof_engine::NullProofEngine;
+use proof_engine::{NullProofEngine, ProofEngine};
 use pubkey_cache::PubkeyCache;
 use reqwest::{Client, ClientBuilder, redirect::Policy};
 use scc::HashMap as SccHashMap;
@@ -109,7 +109,7 @@ use validator_statistics::ValidatorStatistics;
 
 use crate::{
     commands::{GrandineCommand, InterchangeCommand},
-    db_info, db_stats,
+    db_info, db_stats, execution_proofs,
     grandine_args::GrandineArgs,
     grandine_config::{BeaconNodeConfig, GrandineConfig, Mode, ValidatorClientConfig},
     initialize_schema,
@@ -129,6 +129,7 @@ use tokio::signal::unix::SignalKind;
 /// What one run builds the built-in beacon node from.
 struct LocalNodeConfig<P: Preset> {
     beacon_node: BeaconNodeConfig,
+    proof_engine: Arc<dyn ProofEngine>,
     pubkey_cache: Arc<PubkeyCache>,
     client: Client,
     eth1_config: Arc<Eth1Config>,
@@ -218,6 +219,9 @@ async fn build_local_node<P: Preset>(
                 builder_config,
                 ..
             },
+        // TODO(feature/eip8025): Pass to `Controller::new` once P1 adds its `proof_engine`
+        //                        parameter (design 0011, Hand-off to P1).
+        proof_engine: _proof_engine,
         pubkey_cache,
         client,
         eth1_config,
@@ -1452,6 +1456,12 @@ async fn run_beacon_node<P: Preset>(
         .inspect_err(|error| error!("error occurred while executing command: {error:?}"));
     }
 
+    // Built before the anchor, so a misconfiguration is reported before any slow startup work.
+    let proof_engine = execution_proofs::build_proof_engine(
+        &config.chain_config,
+        &beacon_node.execution_proof_backends,
+    )?;
+
     let anchor_checkpoint_provider = load_anchor_checkpoint_provider().await?;
     let genesis = anchor_genesis(&config.chain_config, &anchor_checkpoint_provider);
 
@@ -1460,6 +1470,7 @@ async fn run_beacon_node<P: Preset>(
     let (chain, services) = build_local_node(
         LocalNodeConfig {
             beacon_node,
+            proof_engine,
             pubkey_cache,
             client,
             eth1_config,
