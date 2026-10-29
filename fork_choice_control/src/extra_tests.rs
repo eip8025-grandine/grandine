@@ -3991,3 +3991,642 @@ fn execution_payload_some_none_and_submission_failure_preserve_control_observabl
         }
     );
 }
+
+#[cfg(test)]
+mod execution_proof_tests {
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex, Weak, mpsc},
+    };
+
+    use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
+    use eth2_libp2p::{GossipId, MessageId, PeerId};
+    use execution_engine::MockExecutionEngine;
+    use fork_choice_store::{Storage, Store};
+    use helper_functions::{
+        accessors, misc,
+        signing::{SignForSingleFork as _, SignForSingleForkAtSlot},
+    };
+    use proof_engine::{BackendSpec, ProofEngine, ProofVerdict, ZkvmProofEngine};
+    use pubkey_cache::PubkeyCache;
+    use ssz::{ByteList, Hc, ProgressiveList, Ssz, SszHash as _, SszList as _, SszWrite as _};
+    use std_ext::ArcExt as _;
+    use types::{
+        config::Config,
+        deneb::primitives::KzgCommitment,
+        eip8025::{
+            containers::{
+                ExecutionProof, ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope,
+            },
+            primitives::{MaxProofSize, get_supported_proof_types},
+        },
+        gloas::{
+            beacon_state::BeaconState as GloasBeaconState,
+            consts::BUILDER_INDEX_SELF_BUILD,
+            containers::{
+                BeaconBlock as GloasBeaconBlock, BeaconBlockBody as GloasBeaconBlockBody,
+                ExecutionPayload as GloasExecutionPayload, ExecutionPayloadBid,
+                ExecutionPayloadEnvelope, ExecutionRequests,
+                SignedBeaconBlock as GloasSignedBeaconBlock, SignedExecutionPayloadBid,
+                SignedExecutionPayloadEnvelope,
+            },
+        },
+        nonstandard::Phase,
+        phase0::{
+            consts::FAR_FUTURE_EPOCH,
+            containers::{BeaconBlockHeader, Validator},
+            primitives::{ExecutionBlockHash, H256},
+        },
+        preset::{Minimal, Preset},
+        traits::BeaconState as _,
+    };
+
+    use crate::{
+        events::EventChannels,
+        messages::P2pMessage,
+        specialized::{TestController, TestExecutionEngine},
+        unbounded_sink::UnboundedSink,
+    };
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    const CONFIGURED_PROOF_TYPE: u8 = 1;
+    const SUPPORTED_UNCONFIGURED_PROOF_TYPE: u8 = 2;
+    const TEST_VALIDATOR_INDEX: u64 = 0;
+
+    #[derive(Ssz)]
+    #[ssz(derive_hash = false)]
+    struct ZkboostMockProofForTest {
+        public_values: ByteList<MaxProofSize>,
+        proof: ByteList<MaxProofSize>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    struct StoreObservation {
+        seen_roots: HashMap<H256, HashSet<H256>>,
+        seen_provers: HashSet<(H256, u8, u64)>,
+        execution_proofs: HashMap<H256, HashMap<u8, ExecutionProofEnvelope>>,
+    }
+
+    impl StoreObservation {
+        fn capture<P: Preset, S: Storage<P>>(store: &Store<P, S>) -> Self {
+            Self {
+                seen_roots: store
+                    .execution_proof_roots()
+                    .iter()
+                    .map(|(root, roots)| (*root, roots.iter().copied().collect()))
+                    .collect(),
+                seen_provers: store.execution_proof_provers().iter().copied().collect(),
+                execution_proofs: store
+                    .execution_proofs()
+                    .iter()
+                    .map(|(root, proofs)| {
+                        (
+                            *root,
+                            proofs
+                                .iter()
+                                .map(|(proof_type, envelope)| {
+                                    (*proof_type, envelope.as_ref().clone())
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    type ControllerSlot = Arc<Mutex<Option<Weak<TestController<Minimal>>>>>;
+    type ExpectedProofSlot = Arc<Mutex<Option<ExpectedProof>>>;
+
+    #[derive(Clone)]
+    struct ExpectedProof {
+        block_root: H256,
+        envelope_root: H256,
+        proof_type: u8,
+        validator_index: u64,
+        envelope: ExecutionProofEnvelope,
+        gossip_source: PeerId,
+        gossip_message_id: MessageId,
+    }
+
+    enum EngineEvent {
+        Entered {
+            invocation: usize,
+            execution_proof: ExecutionProof,
+            published_store: Option<Box<StoreObservation>>,
+        },
+        Returned {
+            invocation: usize,
+            verdict: ProofVerdict,
+        },
+    }
+
+    struct ObservingProofEngine {
+        concrete: ZkvmProofEngine,
+        controller: ControllerSlot,
+        events: mpsc::Sender<EngineEvent>,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl ProofEngine for ObservingProofEngine {
+        fn is_null(&self) -> bool {
+            self.concrete.is_null()
+        }
+
+        fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> ProofVerdict {
+            let invocation = self
+                .invocations
+                .fetch_add(1, Ordering::SeqCst)
+                .checked_add(1)
+                .expect("test verifier invocation count should not overflow");
+            // Capture the published paired Seen state before announcing engine entry and before
+            // delegating. The wrapper never substitutes or changes the concrete verdict.
+            let published_store = capture_controller_store(&self.controller).map(Box::new);
+            drop(self.events.send(EngineEvent::Entered {
+                invocation,
+                execution_proof: execution_proof.clone(),
+                published_store,
+            }));
+
+            let verdict = self.concrete.verify_execution_proof(execution_proof);
+            drop(self.events.send(EngineEvent::Returned {
+                invocation,
+                verdict,
+            }));
+            verdict
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum P2pResult {
+        Accept,
+        Ignore,
+        Reject,
+        Other,
+    }
+
+    struct P2pObservation {
+        result: P2pResult,
+        gossip_identity: Option<(PeerId, MessageId)>,
+        is_proof_response: bool,
+        store_at_send: Option<StoreObservation>,
+    }
+
+    #[derive(Clone)]
+    struct ObservingP2pSink {
+        sender: mpsc::Sender<P2pObservation>,
+        controller: ControllerSlot,
+        expected_proof: ExpectedProofSlot,
+    }
+
+    impl UnboundedSink<P2pMessage<Minimal>> for ObservingP2pSink {
+        fn clone(&self) -> Self {
+            Clone::clone(self)
+        }
+
+        fn unbounded_send(&self, message: P2pMessage<Minimal>) -> Result<(), P2pMessage<Minimal>> {
+            let (result, gossip_identity) = match &message {
+                P2pMessage::Accept(gossip_id) => {
+                    (P2pResult::Accept, Some(gossip_identity(gossip_id)))
+                }
+                P2pMessage::Ignore(gossip_id) => {
+                    (P2pResult::Ignore, Some(gossip_identity(gossip_id)))
+                }
+                P2pMessage::IgnoreWithReason(gossip_id, _) => {
+                    (P2pResult::Ignore, gossip_id.as_ref().map(gossip_identity))
+                }
+                P2pMessage::Reject(gossip_id, _) => {
+                    (P2pResult::Reject, gossip_id.as_ref().map(gossip_identity))
+                }
+                _ => (P2pResult::Other, None),
+            };
+            let is_proof_response = gossip_identity
+                .as_ref()
+                .is_some_and(|(source, message_id)| {
+                    self.expected_proof
+                        .lock()
+                        .expect("expected-proof observer mutex should not be poisoned")
+                        .as_ref()
+                        .is_some_and(|expected| {
+                            source == &expected.gossip_source
+                                && message_id == &expected.gossip_message_id
+                        })
+                });
+            // Observe publication synchronously at the actual proof terminal send, rather than
+            // looking at a later test-thread snapshot.
+            let store_at_send = is_proof_response
+                .then(|| capture_controller_store(&self.controller))
+                .flatten();
+
+            self.sender
+                .send(P2pObservation {
+                    result,
+                    gossip_identity,
+                    is_proof_response,
+                    store_at_send,
+                })
+                .map_err(|_| message)
+        }
+    }
+
+    fn gossip_identity(gossip_id: &GossipId) -> (PeerId, MessageId) {
+        (gossip_id.source, gossip_id.message_id.clone())
+    }
+
+    fn capture_controller_store(controller: &ControllerSlot) -> Option<StoreObservation> {
+        let controller = controller
+            .lock()
+            .expect("weak-controller observer mutex should not be poisoned")
+            .as_ref()?
+            .upgrade()?;
+        let store = controller.store_snapshot();
+        Some(StoreObservation::capture(&store))
+    }
+
+    fn test_gossip_id(seed: u8) -> GossipId {
+        // A valid non-default sha2-256 multihash and non-empty message id make origin preservation
+        // observable without depending on random peer identity generation.
+        let mut peer_id_bytes = vec![0x12, 0x20];
+        peer_id_bytes.resize(34, seed);
+        GossipId {
+            source: PeerId::from_bytes(&peer_id_bytes).expect("test peer id should decode"),
+            message_id: MessageId::new(&[seed, 0xc2]),
+        }
+    }
+
+    fn assert_gossip_identity(actual: Option<(PeerId, MessageId)>, expected: &GossipId) {
+        let (actual_source, actual_message_id) =
+            actual.expect("terminal response should preserve the submitted gossip identity");
+        assert_eq!(actual_source, expected.source);
+        assert_eq!(actual_message_id, expected.message_id);
+
+        let default = GossipId::default();
+        assert_ne!(actual_source, default.source);
+        assert_ne!(actual_message_id, default.message_id);
+    }
+
+    fn expected_store(expected: &ExpectedProof, include_proof: bool) -> StoreObservation {
+        StoreObservation {
+            seen_roots: HashMap::from([(
+                expected.block_root,
+                HashSet::from([expected.envelope_root]),
+            )]),
+            seen_provers: HashSet::from([(
+                expected.block_root,
+                expected.proof_type,
+                expected.validator_index,
+            )]),
+            execution_proofs: if include_proof {
+                HashMap::from([(
+                    expected.block_root,
+                    HashMap::from([(expected.proof_type, expected.envelope.clone())]),
+                )])
+            } else {
+                HashMap::new()
+            },
+        }
+    }
+
+    fn mock_proof_data(public_values: Vec<u8>, proof_byte: u8) -> ProofData {
+        let mock_proof = ZkboostMockProofForTest {
+            public_values: ByteList::try_from(public_values)
+                .expect("serialized public values should fit the mock wire field"),
+            proof: ByteList::try_from(vec![proof_byte])
+                .expect("one mock proof byte should fit the mock wire field"),
+        };
+        let encoded = mock_proof
+            .to_ssz()
+            .expect("test mirror of the mock wire shape should serialize");
+        ProofData::try_from(encoded).expect("encoded mock proof should fit ProofData")
+    }
+
+    fn receive_p2p_response(
+        receiver: &mpsc::Receiver<P2pObservation>,
+        expected_result: P2pResult,
+        expected_gossip_id: &GossipId,
+        expected_is_proof_response: bool,
+    ) -> P2pObservation {
+        let observation = receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("timed out waiting for P2P validation response");
+        assert_eq!(observation.result, expected_result);
+        assert_gossip_identity(observation.gossip_identity.clone(), expected_gossip_id);
+        assert_eq!(observation.is_proof_response, expected_is_proof_response);
+        observation
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProofCase {
+        MatchingMock,
+        MalformedMock,
+        MismatchedPublicValues,
+        SupportedUnconfigured,
+    }
+
+    fn run_execution_proof_case(case: ProofCase) {
+        let mut chain_config = Config::minimal().start_and_stay_in(Phase::Gloas);
+        chain_config.deposit_chain_id = 1337;
+        let config = Arc::new(chain_config);
+
+        let mut key_bytes = SecretKeyBytes::default();
+        key_bytes.as_mut()[31] = 1;
+        let key: SecretKey = key_bytes
+            .try_into()
+            .expect("scalar one is a valid active validator key");
+        let execution_requests = ExecutionRequests::<Minimal>::default();
+        let mut bid = ExecutionPayloadBid::<Minimal> {
+            block_hash: ExecutionBlockHash::repeat_byte(0x44),
+            prev_randao: H256::repeat_byte(0x55),
+            gas_limit: 30_000_000,
+            builder_index: BUILDER_INDEX_SELF_BUILD,
+            execution_requests_root: execution_requests.hash_tree_root(),
+            ..Default::default()
+        };
+        bid.blob_kzg_commitments = ProgressiveList::try_from(vec![
+            KzgCommitment::repeat_byte(0x66),
+            KzgCommitment::repeat_byte(0x66),
+        ])
+        .expect("fixture commitments fit the progressive-list container");
+        let body = GloasBeaconBlockBody::<Minimal> {
+            signed_execution_payload_bid: SignedExecutionPayloadBid {
+                message: bid.clone(),
+                signature: <_>::default(),
+            },
+            ..Default::default()
+        };
+        let state = types::combined::BeaconState::from(GloasBeaconState::<Minimal> {
+            genesis_time: config.min_genesis_time,
+            validators: core::iter::once(Validator {
+                pubkey: key.to_public_key().into(),
+                activation_epoch: 0,
+                exit_epoch: FAR_FUTURE_EPOCH,
+                ..Default::default()
+            })
+            .collect(),
+            latest_block_header: BeaconBlockHeader {
+                body_root: body.hash_tree_root(),
+                ..Default::default()
+            },
+            latest_execution_payload_bid: bid.clone(),
+            ..Default::default()
+        });
+        let anchor_block = GloasSignedBeaconBlock {
+            message: Hc::from(GloasBeaconBlock {
+                state_root: state.hash_tree_root(),
+                body,
+                ..Default::default()
+            }),
+            signature: <_>::default(),
+        };
+        let block_root = anchor_block.message.hash_tree_root();
+        assert_eq!(accessors::latest_block_root(&state), block_root);
+        let timestamp = misc::compute_timestamp_at_slot(&config, &state, state.slot())
+            .expect("fixture timestamp should be computable");
+        let post_gloas_state = state.post_gloas().expect("fixture state is Gloas");
+        let payload_message = ExecutionPayloadEnvelope {
+            payload: GloasExecutionPayload {
+                parent_hash: post_gloas_state.latest_block_hash(),
+                prev_randao: bid.prev_randao,
+                gas_limit: bid.gas_limit,
+                timestamp,
+                withdrawals: ProgressiveList::try_from(
+                    post_gloas_state
+                        .payload_expected_withdrawals()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>(),
+                )
+                .expect("expected withdrawals fit in the payload progressive list"),
+                block_hash: bid.block_hash,
+                slot_number: state.slot(),
+                ..Default::default()
+            },
+            execution_requests,
+            builder_index: bid.builder_index,
+            beacon_block_root: block_root,
+            parent_beacon_block_root: state.latest_block_header().parent_root,
+        };
+        let payload = Arc::new(SignedExecutionPayloadEnvelope {
+            signature: payload_message.sign(&config, &state, &key).into(),
+            message: payload_message,
+        });
+
+        let controller_slot: ControllerSlot = Arc::new(Mutex::new(None));
+        let expected_proof: ExpectedProofSlot = Arc::new(Mutex::new(None));
+        let (p2p_sender, p2p_receiver) = mpsc::channel();
+        let (engine_sender, engine_receiver) = mpsc::channel();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let concrete_engine =
+            ZkvmProofEngine::new(&config, [(CONFIGURED_PROOF_TYPE, BackendSpec::ZkboostMock)])
+                .expect("one configured zkBoost mock backend is valid on this non-mainnet chain");
+        let proof_engine: Arc<dyn ProofEngine> = Arc::new(ObservingProofEngine {
+            concrete: concrete_engine,
+            controller: controller_slot.clone_arc(),
+            events: engine_sender,
+            invocations: invocations.clone_arc(),
+        });
+        let p2p_sink = ObservingP2pSink {
+            sender: p2p_sender,
+            controller: controller_slot.clone_arc(),
+            expected_proof: expected_proof.clone_arc(),
+        };
+        let execution_engine: TestExecutionEngine<Minimal> =
+            Arc::new(Mutex::new(MockExecutionEngine::new(true, false, None)));
+        let anchor_block = Arc::new(types::combined::SignedBeaconBlock::<Minimal>::from(
+            anchor_block,
+        ));
+        let state = Arc::new(state);
+        let (controller, _mutator_handle) = TestController::with_p2p_tx_and_proof_engine(
+            config.clone_arc(),
+            Arc::new(PubkeyCache::default()),
+            anchor_block,
+            state.clone_arc(),
+            execution_engine,
+            proof_engine,
+            p2p_sink,
+            Arc::new(EventChannels::new(32)),
+            Some(1),
+        );
+        *controller_slot
+            .lock()
+            .expect("weak-controller observer mutex should not be poisoned") =
+            Some(Arc::downgrade(&controller));
+
+        let payload_gossip_id = test_gossip_id(0x31);
+        controller.on_gossip_execution_payload(payload.clone_arc(), payload_gossip_id.clone());
+        // This wait is for ordinary payload setup only. Proof completion below is observed through
+        // the engine/P2P channels and is deliberately not put in the wait group.
+        controller.wait_for_tasks();
+        receive_p2p_response(&p2p_receiver, P2pResult::Accept, &payload_gossip_id, false);
+
+        let accepted_store = controller.store_snapshot();
+        assert!(accepted_store.is_payload_verified(block_root));
+        let selected_payload = accepted_store
+            .cached_execution_payload_envelope_by_root(block_root)
+            .expect("accepted payload envelope should remain selected");
+        assert_eq!(selected_payload.as_ref(), payload.as_ref());
+
+        let proof_type = match case {
+            ProofCase::SupportedUnconfigured => SUPPORTED_UNCONFIGURED_PROOF_TYPE,
+            ProofCase::MatchingMock
+            | ProofCase::MalformedMock
+            | ProofCase::MismatchedPublicValues => CONFIGURED_PROOF_TYPE,
+        };
+        assert!(get_supported_proof_types().contains(&proof_type));
+        let mut envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("non-empty placeholder proof data should fit"),
+            proof_type,
+            beacon_block_root: block_root,
+        };
+        let expected_public_input = accepted_store
+            .get_execution_proof(state.as_ref(), &envelope, &selected_payload.message)
+            .expect("accepted payload and its selected post-state should bind")
+            .public_input;
+        assert!(expected_public_input.successful_validation);
+        assert_eq!(expected_public_input.chain_id, config.deposit_chain_id);
+        assert_eq!(expected_public_input.chain_id, 1337);
+
+        let mut public_values = expected_public_input
+            .to_ssz()
+            .expect("trusted public input should serialize");
+        assert_eq!(public_values.len(), 43);
+        match case {
+            ProofCase::MatchingMock | ProofCase::SupportedUnconfigured => {
+                envelope.proof_data = mock_proof_data(public_values, 0xa1);
+            }
+            ProofCase::MalformedMock => {
+                // Non-empty, but too short to encode the mock's two SSZ variable-field offsets.
+                envelope.proof_data =
+                    ProofData::try_from(vec![0x42]).expect("malformed bytes still fit ProofData");
+            }
+            ProofCase::MismatchedPublicValues => {
+                public_values[0] ^= 1;
+                envelope.proof_data = mock_proof_data(public_values, 0xa2);
+            }
+        }
+
+        // Sign the exact final bare envelope after any proof/public-value mutation, using the
+        // real active validator in the accepted target state and that state's slot.
+        let signature = SignForSingleForkAtSlot::<Minimal>::sign(
+            &envelope,
+            &config,
+            state.as_ref(),
+            state.slot(),
+            &key,
+        )
+        .into();
+        let signed_proof = Arc::new(SignedExecutionProofEnvelope {
+            message: Hc::from(envelope.clone()),
+            validator_index: TEST_VALIDATOR_INDEX,
+            signature,
+        });
+        let proof_gossip_id = test_gossip_id(0x52);
+        let expected = ExpectedProof {
+            block_root,
+            envelope_root: envelope.hash_tree_root(),
+            proof_type,
+            validator_index: TEST_VALIDATOR_INDEX,
+            envelope: envelope.clone(),
+            gossip_source: proof_gossip_id.source,
+            gossip_message_id: proof_gossip_id.message_id.clone(),
+        };
+        *expected_proof
+            .lock()
+            .expect("expected-proof observer mutex should not be poisoned") =
+            Some(expected.clone());
+
+        controller.on_gossip_execution_proof(signed_proof, proof_gossip_id.clone());
+
+        let (invocation, actual_input, store_at_entry) = match engine_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("timed out waiting for concrete proof-engine entry")
+        {
+            EngineEvent::Entered {
+                invocation,
+                execution_proof,
+                published_store,
+            } => (
+                invocation,
+                execution_proof,
+                published_store.map(|store| *store),
+            ),
+            EngineEvent::Returned { .. } => {
+                panic!("proof engine returned before publishing its entry observation")
+            }
+        };
+        assert_eq!(
+            invocation, 1,
+            "the fresh fixture should invoke one verifier"
+        );
+        assert_eq!(
+            actual_input,
+            ExecutionProof {
+                proof_data: envelope.proof_data,
+                proof_type,
+                public_input: expected_public_input,
+            },
+            "the live service must bind exactly the accepted payload context"
+        );
+        assert_eq!(store_at_entry, Some(expected_store(&expected, false)));
+
+        let actual_verdict = match engine_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("timed out waiting for concrete proof-engine verdict")
+        {
+            EngineEvent::Returned {
+                invocation: returned_invocation,
+                verdict,
+            } => {
+                assert_eq!(returned_invocation, invocation);
+                verdict
+            }
+            EngineEvent::Entered { .. } => {
+                panic!("unexpected additional proof-engine invocation in fresh fixture")
+            }
+        };
+        let (expected_verdict, expected_response, store_has_proof) = match case {
+            ProofCase::MatchingMock => (ProofVerdict::Valid, P2pResult::Accept, true),
+            ProofCase::MalformedMock | ProofCase::MismatchedPublicValues => {
+                (ProofVerdict::Invalid, P2pResult::Reject, false)
+            }
+            ProofCase::SupportedUnconfigured => {
+                (ProofVerdict::Undetermined, P2pResult::Ignore, false)
+            }
+        };
+        assert_eq!(actual_verdict, expected_verdict);
+
+        let response =
+            receive_p2p_response(&p2p_receiver, expected_response, &proof_gossip_id, true);
+        assert_eq!(
+            response.store_at_send,
+            Some(expected_store(&expected, store_has_proof)),
+            "terminal P2P send must synchronously observe exact storage and paired Seen state"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn execution_proof_accepts_matching_zkboost_mock_for_accepted_payload() {
+        run_execution_proof_case(ProofCase::MatchingMock);
+    }
+
+    #[test]
+    fn execution_proof_rejects_nonempty_malformed_zkboost_mock() {
+        run_execution_proof_case(ProofCase::MalformedMock);
+    }
+
+    #[test]
+    fn execution_proof_rejects_mismatched_mock_public_values() {
+        run_execution_proof_case(ProofCase::MismatchedPublicValues);
+    }
+
+    #[test]
+    fn execution_proof_ignores_supported_unconfigured_type_two() {
+        run_execution_proof_case(ProofCase::SupportedUnconfigured);
+    }
+}
