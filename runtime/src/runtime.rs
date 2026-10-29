@@ -72,6 +72,7 @@ use p2p::{
     SubnetService,
 };
 use prometheus_client::registry::Registry;
+use proof_engine::NullProofEngine;
 use pubkey_cache::PubkeyCache;
 use reqwest::{Client, ClientBuilder, redirect::Policy};
 use scc::HashMap as SccHashMap;
@@ -397,6 +398,7 @@ async fn build_local_node<P: Preset>(
         current_tick,
         event_channels.clone_arc(),
         execution_engine.clone_arc(),
+        Arc::new(NullProofEngine),
         metrics.clone(),
         fork_choice_to_attestation_verifier_tx,
         fork_choice_to_p2p_tx,

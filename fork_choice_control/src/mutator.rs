@@ -39,7 +39,8 @@ use fork_choice_store::{
     AttesterSlashingOrigin, BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockItem,
     BlockOrigin, ChainLink, DataColumnSidecarAction, DataColumnSidecarOrigin, Error,
     ExecutionPayloadBidAction, ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeOrigin,
-    ExecutionPayloadEnvelopeValidationAction, ExecutionProofAction, ExecutionProofOrigin,
+    ExecutionPayloadEnvelopeValidationAction, ExecutionProofAdmission, ExecutionProofCompletion,
+    ExecutionProofCompletionOutcome, ExecutionProofOrigin, ExecutionProofPreparation,
     PayloadAction, PayloadAttestationAction, PayloadAttestationItem, PayloadPresence,
     ProposerPreferencesAction, ProposerPreferencesOrigin, StateCacheProcessor, Store,
     ValidAttestation, ValidPayloadAttestation,
@@ -52,6 +53,7 @@ use logging::{
 };
 use num_traits::identities::Zero as _;
 use prometheus_metrics::Metrics;
+use proof_engine::ProofEngine;
 use pubkey_cache::PubkeyCache;
 use spec_test_utils::BlsSetting;
 use ssz::SszHash as _;
@@ -100,7 +102,7 @@ use crate::{
         ExecutionPayloadEnvelopeTask, PayloadAttestationTask, PersistBlobSidecarsTask,
         PersistDataColumnSidecarsTask, PersistExecutionPayloadEnvelopesTask,
         PersistPubkeyCacheTask, PreprocessStateTask, ProposerPreferencesTask, PruneStateCacheTask,
-        RetryDataColumnSidecarTask,
+        RetryDataColumnSidecarTask, VerifyExecutionProofTask,
     },
     thread_pool::{Spawn, ThreadPool},
     unbounded_sink::UnboundedSink,
@@ -381,6 +383,14 @@ where
                 ),
                 MutatorMessage::PayloadBid { result, origin } => {
                     self.handle_payload_bid(result, origin)
+                }
+                MutatorMessage::ExecutionProofPrepared {
+                    result,
+                    proof_engine,
+                    origin,
+                } => self.handle_prepared_execution_proof(result, proof_engine, origin),
+                MutatorMessage::ExecutionProofCompleted { completion, origin } => {
+                    self.handle_completed_execution_proof(completion, origin)
                 }
                 MutatorMessage::ExecutionProof { result, origin } => {
                     self.handle_execution_proof(result, origin)
@@ -2720,22 +2730,96 @@ where
         }
     }
 
-    // Skeleton stub: no store insert yet. Signals p2p per `origin.split()`
-    // so peer scoring stays wired while the pipeline lands.
+    fn handle_prepared_execution_proof(
+        &mut self,
+        result: Result<ExecutionProofPreparation>,
+        proof_engine: Arc<dyn ProofEngine>,
+        origin: ExecutionProofOrigin,
+    ) {
+        let prepared = match result {
+            Ok(ExecutionProofPreparation::Prepared(prepared)) => prepared,
+            Ok(ExecutionProofPreparation::Ignore(reason)) => {
+                self.handle_execution_proof(
+                    Ok(ValidationOutcomeWithReason::Ignore(reason)),
+                    origin,
+                );
+                return;
+            }
+            Err(error) => {
+                // Preparation tasks allow only typed peer-invalid envelope errors here.
+                self.handle_execution_proof(Err(error), origin);
+                return;
+            }
+        };
+
+        match self.store_mut().admit_execution_proof(prepared) {
+            ExecutionProofAdmission::Declined(reason) => {
+                debug_with_peers!("execution proof admission declined (reason: {reason:?})");
+                self.handle_execution_proof(
+                    Ok(ValidationOutcomeWithReason::Ignore(
+                        "execution proof admission declined",
+                    )),
+                    origin,
+                );
+            }
+            ExecutionProofAdmission::Admitted(admitted) => {
+                // Publish BOTH Seen writes before any verifier can enter. Live
+                // admission, not the snapshot, remains the authority to dispatch.
+                self.update_store_snapshot();
+                let task = VerifyExecutionProofTask {
+                    admitted,
+                    proof_engine,
+                    mutator_tx: self.owned_mutator_tx(),
+                    origin,
+                };
+                if let Err(task) = self.thread_pool.try_spawn_execution_proof(task) {
+                    let VerifyExecutionProofTask {
+                        admitted, origin, ..
+                    } = *task;
+                    self.handle_completed_execution_proof(admitted.into_local_fault(), origin);
+                }
+            }
+        }
+    }
+
+    fn handle_completed_execution_proof(
+        &mut self,
+        completion: ExecutionProofCompletion,
+        origin: ExecutionProofOrigin,
+    ) {
+        let beacon_block_root = completion.envelope().beacon_block_root;
+        let proof_type = completion.envelope().proof_type;
+        let validator_index = completion.validator_index();
+
+        let result = match self.store_mut().complete_execution_proof(completion) {
+            ExecutionProofCompletionOutcome::Accept => {
+                self.update_store_snapshot();
+                trace_with_peers!(
+                    "execution proof accepted (block_root: {beacon_block_root:?}, proof_type: {proof_type}, validator_index: {validator_index})",
+                );
+                Ok(ValidationOutcomeWithReason::Accept)
+            }
+            ExecutionProofCompletionOutcome::Reject => Err(anyhow!("invalid execution proof")),
+            ExecutionProofCompletionOutcome::LocalFault => Ok(ValidationOutcomeWithReason::Ignore(
+                "local execution proof verification failure",
+            )),
+            ExecutionProofCompletionOutcome::Discarded(reason) => {
+                debug_with_peers!("execution proof completion discarded (reason: {reason:?})");
+                Ok(ValidationOutcomeWithReason::Ignore(
+                    "execution proof completion is no longer applicable or needed",
+                ))
+            }
+        };
+        self.handle_execution_proof(result, origin);
+    }
+
     fn handle_execution_proof(
         &self,
-        result: Result<ExecutionProofAction>,
+        result: Result<ValidationOutcomeWithReason>,
         origin: ExecutionProofOrigin,
     ) {
         match result {
-            Ok(ExecutionProofAction::Accept(signed_proof)) => {
-                trace_with_peers!(
-                    "execution proof accepted (block_root: {:?}, proof_type: {}, validator_index: {})",
-                    signed_proof.message.beacon_block_root,
-                    signed_proof.message.proof_type,
-                    signed_proof.validator_index,
-                );
-
+            Ok(ValidationOutcomeWithReason::Accept) => {
                 let (gossip_id, sender) = origin.split();
 
                 if let Some(gossip_id) = gossip_id {
@@ -2746,11 +2830,8 @@ where
                     sender,
                     Ok(ValidationOutcomeWithReason::Accept),
                 );
-
-                // TODO(eip8025-grandine): store bare `.message` per spec
-                // `on_execution_proof` once the pipeline lands.
             }
-            Ok(ExecutionProofAction::Ignore(message)) => {
+            Ok(ValidationOutcomeWithReason::Ignore(message)) => {
                 debug_with_peers!("execution proof ignored (reason: {message})");
 
                 let (gossip_id, sender) = origin.split();

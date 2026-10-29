@@ -56,6 +56,7 @@ p2p = { workspace = true }
 predefined_chains = { workspace = true }
 prometheus_metrics = { workspace = true }
 prometheus-client = { workspace = true }
+proof_engine = { workspace = true }
 pubkey_cache = { workspace = true }
 rayon = { workspace = true }
 reqwest = { workspace = true }

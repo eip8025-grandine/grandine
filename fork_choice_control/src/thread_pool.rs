@@ -32,7 +32,7 @@ use crate::{
         PayloadAttestationTask, PersistBlobSidecarsTask, PersistDataColumnSidecarsTask,
         PersistExecutionPayloadEnvelopesTask, PersistPubkeyCacheTask, PreprocessStateTask,
         ProcessExecutionProofTask, ProposerPreferencesTask, PruneStateCacheTask,
-        RetryDataColumnSidecarTask, Run, StateAtSlotCacheFlushTask,
+        RetryDataColumnSidecarTask, Run, StateAtSlotCacheFlushTask, VerifyExecutionProofTask,
     },
     wait::Wait,
 };
@@ -72,6 +72,22 @@ impl<P: Preset, E, W> ThreadPool<P, E, W> {
     pub fn spawn(&self, task: impl Spawn<P, E, W>) {
         task.spawn(&mut self.shared.critical.lock());
         self.shared.condvar.notify_one();
+    }
+
+    // Unlike generic fire-and-forget work, admitted proof authority must be
+    // returned on a controlled scheduling failure so its origin can finish.
+    pub(crate) fn try_spawn_execution_proof(
+        &self,
+        task: VerifyExecutionProofTask<P, W>,
+    ) -> Result<(), Box<VerifyExecutionProofTask<P, W>>> {
+        let mut critical = self.shared.critical.lock();
+        if critical.done {
+            return Err(Box::new(task));
+        }
+        critical.low_priority_tasks.push_back(task.into());
+        drop(critical);
+        self.shared.condvar.notify_one();
+        Ok(())
     }
 
     pub fn task_counts(&self) -> (usize, usize, usize) {
@@ -161,6 +177,7 @@ enum LowPriorityTask<P: Preset, W> {
     // Proofs up to 4 MiB plus BLS plus a potentially slow external
     // verification never run on the critical path.
     ExecutionProof(ProcessExecutionProofTask<P, W>),
+    VerifyExecutionProof(VerifyExecutionProofTask<P, W>),
     PayloadAttestation(PayloadAttestationTask<P, W>),
     PayloadAttestationBatch(PayloadAttestationBatchTask<P, W>),
     ProposerPreferences(ProposerPreferencesTask<P, W>),
@@ -183,6 +200,7 @@ impl<P: Preset, W> Run for LowPriorityTask<P, W> {
             Self::AttesterSlashing(task) => task.run(),
             Self::PayloadBid(task) => task.run(),
             Self::ExecutionProof(task) => task.run(),
+            Self::VerifyExecutionProof(task) => task.run(),
             Self::PayloadAttestation(task) => task.run(),
             Self::PayloadAttestationBatch(task) => task.run(),
             Self::ProposerPreferences(task) => task.run(),
