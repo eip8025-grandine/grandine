@@ -6757,6 +6757,7 @@ mod tests {
                 Arc, Mutex,
                 mpsc::{self, Receiver, SyncSender},
             },
+            time::Instant,
         };
 
         use arc_swap::ArcSwap;
@@ -6803,7 +6804,7 @@ mod tests {
                     SignedExecutionPayloadEnvelope,
                 },
             },
-            nonstandard::{PayloadStatus, Phase, StorageMode},
+            nonstandard::{PayloadStatus, Phase, StorageMode, ValidationOutcomeWithReason},
             phase0::{
                 consts::FAR_FUTURE_EPOCH,
                 containers::{BeaconBlockHeader, Checkpoint, Validator},
@@ -6820,7 +6821,7 @@ mod tests {
                 AttestationVerifierMessage, MutatorMessage, P2pMessage, PoolMessage, SubnetMessage,
                 SyncMessage, ValidatorMessage,
             },
-            misc::ProcessingTimings,
+            misc::{MutatorRejectionReason, ProcessingTimings},
             mutator::Mutator,
             specialized::TestExecutionEngine,
             state_at_slot_cache::StateAtSlotCache,
@@ -6850,6 +6851,214 @@ mod tests {
         const EFFECTIVE_BALANCE: u64 = 32_000_000_000;
         const PROOF_TYPE: u8 = 1;
         const TARGET_FLAG: u8 = 1 << TIMELY_TARGET_FLAG_INDEX;
+
+        type ApiValidationResult = anyhow::Result<ValidationOutcomeWithReason>;
+        type ApiResponseReceiver = futures::channel::oneshot::Receiver<ApiValidationResult>;
+
+        #[derive(Clone, Copy)]
+        enum ProofOriginKind {
+            Gossip,
+            Api,
+        }
+
+        #[derive(Clone, Copy)]
+        enum VerificationScenario {
+            Verdict(ProofVerdict),
+            StoppedPool,
+        }
+
+        fn make_proof_origin(
+            kind: ProofOriginKind,
+            gossip_id: &GossipId,
+        ) -> (ExecutionProofOrigin, Option<ApiResponseReceiver>) {
+            match kind {
+                ProofOriginKind::Gossip => (ExecutionProofOrigin::Gossip(gossip_id.clone()), None),
+                ProofOriginKind::Api => {
+                    let (sender, receiver) = futures::channel::oneshot::channel();
+                    (ExecutionProofOrigin::Api(sender), Some(receiver))
+                }
+            }
+        }
+
+        fn assert_proof_origin(
+            origin: &ExecutionProofOrigin,
+            kind: ProofOriginKind,
+            attempt: &ProofAttempt,
+        ) {
+            match kind {
+                ProofOriginKind::Gossip => {
+                    assert_gossip_identity(origin.gossip_id_ref(), &attempt.gossip_id);
+                }
+                ProofOriginKind::Api => {
+                    assert!(matches!(origin, ExecutionProofOrigin::Api(_)));
+                    assert!(origin.gossip_id_ref().is_none());
+                }
+            }
+        }
+
+        fn assert_prepared_origin(
+            message: &MutatorMessage<Minimal, ()>,
+            kind: ProofOriginKind,
+            attempt: &ProofAttempt,
+        ) {
+            match message {
+                MutatorMessage::ExecutionProofPrepared {
+                    result: Ok(ExecutionProofPreparation::Prepared(_)),
+                    origin,
+                    ..
+                } => assert_proof_origin(origin, kind, attempt),
+                _ => panic!("detached task must return genuine prepared proof authority"),
+            }
+        }
+
+        const fn expected_proof_p2p(execution: VerificationScenario) -> (P2pOutcome, bool) {
+            match execution {
+                VerificationScenario::Verdict(ProofVerdict::Valid) => (P2pOutcome::Accept, false),
+                VerificationScenario::Verdict(ProofVerdict::Invalid) => (P2pOutcome::Reject, true),
+                VerificationScenario::Verdict(ProofVerdict::Undetermined)
+                | VerificationScenario::StoppedPool => (P2pOutcome::Ignore, false),
+            }
+        }
+
+        fn assert_proof_p2p_observation(
+            observation: &P2pObservation,
+            attempt: &ProofAttempt,
+            execution: VerificationScenario,
+        ) {
+            let (expected_outcome, expected_rejection) = expected_proof_p2p(execution);
+            assert_eq!(observation.outcome, expected_outcome);
+            assert_gossip_identity(observation.gossip_id.as_ref(), &attempt.gossip_id);
+            assert_eq!(
+                observation.is_invalid_execution_proof_rejection,
+                expected_rejection,
+            );
+            let stored_attempt = matches!(
+                execution,
+                VerificationScenario::Verdict(ProofVerdict::Valid),
+            )
+            .then_some(attempt);
+            assert_observation(&observation.store, &[attempt], stored_attempt);
+            assert_eq!(
+                observation.stored_envelope.as_deref(),
+                stored_attempt.map(|stored| &stored.envelope),
+            );
+        }
+
+        fn assert_api_response(
+            receiver: &mut ApiResponseReceiver,
+            execution: VerificationScenario,
+        ) {
+            let response = receiver
+                .try_recv()
+                .expect("terminal API sender must not be canceled")
+                .expect("closed proof batch must have one ready API response");
+            match execution {
+                VerificationScenario::Verdict(ProofVerdict::Valid) => {
+                    assert!(matches!(response, Ok(ValidationOutcomeWithReason::Accept)));
+                }
+                VerificationScenario::Verdict(ProofVerdict::Invalid) => {
+                    let Err(error) = response else {
+                        panic!("invalid proof must produce the API error terminal");
+                    };
+                    assert_eq!(error.to_string(), "invalid execution proof");
+                }
+                VerificationScenario::Verdict(ProofVerdict::Undetermined)
+                | VerificationScenario::StoppedPool => {
+                    let Ok(ValidationOutcomeWithReason::Ignore(reason)) = response else {
+                        panic!("local proof fault must produce the API Ignore terminal");
+                    };
+                    assert_eq!(reason, "local execution proof verification failure");
+                }
+            }
+        }
+
+        fn run_proof_service_case(kind: ProofOriginKind, execution: VerificationScenario) {
+            let mut harness = ProofServiceHarness::new();
+            harness.accept_anchor_payload();
+            let snapshot = harness.store_snapshot.load_full();
+            let attempt = build_proof_attempt(&harness.anchor, &snapshot, 0, 0xd1, 0x71);
+            let (origin, mut api_receiver) = make_proof_origin(kind, &attempt.gossip_id);
+            let prepared = harness.prepare_detached_with_origin(snapshot, &attempt, origin);
+            assert_prepared_origin(&prepared, kind, &attempt);
+
+            assert_eq!(harness.mutator.thread_pool.task_counts(), (0, 0, 0));
+            assert!(matches!(
+                harness.mutator.mutator_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty),
+            ));
+            assert_eq!(harness.engine.invocation_count(), 0);
+            assert!(harness.engine_events.try_recv().is_err());
+            let pool_stopped = matches!(execution, VerificationScenario::StoppedPool);
+            if pool_stopped {
+                // ThreadPool::drop sets the shared done bit and wakes workers; live dispatch below
+                // still owns authentic admitted authority and observes try_spawn's real failure.
+                drop(harness.mutator.thread_pool.clone());
+            } else {
+                harness.releases.register(
+                    &harness.engine,
+                    AttemptId::A,
+                    attempt.execution_proof.clone(),
+                );
+            }
+            harness.deliver_prepared(prepared);
+
+            if pool_stopped {
+                assert_eq!(harness.engine.invocation_count(), 0);
+                assert_eq!(harness.mutator.thread_pool.task_counts(), (0, 0, 0));
+            } else {
+                harness.observe_entry(AttemptId::A, &attempt, &[&attempt]);
+                assert_eq!(harness.engine.invocation_count(), 1);
+            }
+
+            harness.seal_completion_batch();
+            if let VerificationScenario::Verdict(verdict) = execution {
+                harness.releases.release(AttemptId::A, verdict);
+            }
+            let completion_count = harness.drain_closed_batch(&attempt, kind);
+            let expected_worker_count = usize::from(!pool_stopped);
+            assert_eq!(completion_count, expected_worker_count);
+            assert_eq!(harness.engine.invocation_count(), expected_worker_count);
+            assert!(harness.engine_events.try_recv().is_err());
+            assert_eq!(harness.mutator.thread_pool.task_counts(), (0, 0, 0));
+
+            let stored_attempt = matches!(
+                execution,
+                VerificationScenario::Verdict(ProofVerdict::Valid),
+            )
+            .then_some(&attempt);
+            assert_observation(
+                &StoreObservation::capture(&harness.mutator.store),
+                &[&attempt],
+                stored_attempt,
+            );
+            assert_observation(
+                &StoreObservation::capture(&harness.store_snapshot.load_full()),
+                &[&attempt],
+                stored_attempt,
+            );
+
+            let p2p_observations = harness.drain_p2p_observations();
+            match kind {
+                ProofOriginKind::Gossip => {
+                    assert_eq!(p2p_observations.len(), 1);
+                    let observation = p2p_observations
+                        .into_iter()
+                        .next()
+                        .expect("one exact gossip terminal was observed");
+                    assert_proof_p2p_observation(&observation, &attempt, execution);
+                }
+                ProofOriginKind::Api => assert!(p2p_observations.is_empty()),
+            }
+            match kind {
+                ProofOriginKind::Gossip => assert!(api_receiver.is_none()),
+                ProofOriginKind::Api => assert_api_response(
+                    api_receiver
+                        .as_mut()
+                        .expect("API origin retains its one-shot receiver"),
+                    execution,
+                ),
+            }
+        }
 
         #[derive(Clone, Debug, Default, PartialEq, Eq)]
         struct StoreObservation {
@@ -6897,6 +7106,7 @@ mod tests {
         struct P2pObservation {
             outcome: P2pOutcome,
             gossip_id: Option<GossipId>,
+            is_invalid_execution_proof_rejection: bool,
             store: StoreObservation,
             stored_envelope: Option<Arc<ExecutionProofEnvelope>>,
         }
@@ -6929,6 +7139,10 @@ mod tests {
                 let observation = P2pObservation {
                     outcome,
                     gossip_id,
+                    is_invalid_execution_proof_rejection: matches!(
+                        &message,
+                        P2pMessage::Reject(_, MutatorRejectionReason::InvalidExecutionProof,),
+                    ),
                     store: StoreObservation::capture(&store),
                     stored_envelope: store
                         .execution_proofs()
@@ -7713,7 +7927,7 @@ mod tests {
             assert_gossip_identity(Some(actual), expected);
         }
 
-        struct RetirementHarness {
+        struct ProofServiceHarness {
             anchor: AnchorFixture,
             pubkey_cache: Arc<PubkeyCache>,
             store_snapshot: Arc<ArcSwap<ControlStore>>,
@@ -7725,14 +7939,14 @@ mod tests {
             releases: GateReleaseGuard,
         }
 
-        impl Drop for RetirementHarness {
+        impl Drop for ProofServiceHarness {
             fn drop(&mut self) {
                 // Unblock verifier workers before the Mutator-owned pool is dropped.
                 drop(core::mem::take(&mut self.releases));
             }
         }
 
-        impl RetirementHarness {
+        impl ProofServiceHarness {
             fn new() -> Self {
                 let anchor = AnchorFixture::new();
                 let pubkey_cache = Arc::new(PubkeyCache::default());
@@ -7912,6 +8126,26 @@ mod tests {
                     .expect("independent preparation uses the accepted pre-transition snapshot")
             }
 
+            fn prepare_detached_with_origin(
+                &self,
+                snapshot: Arc<ControlStore>,
+                attempt: &ProofAttempt,
+                origin: ExecutionProofOrigin,
+            ) -> MutatorMessage<Minimal, ()> {
+                let (sender, receiver) = mpsc::channel();
+                ProcessExecutionProofTask {
+                    store_snapshot: snapshot,
+                    proof_engine: self.proof_engine.clone_arc(),
+                    mutator_tx: sender,
+                    signed_proof: attempt.signed_proof.clone_arc(),
+                    origin,
+                }
+                .run();
+                receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("genuine detached preparation returns before live dispatch")
+            }
+
             fn deliver_prepared(&mut self, message: MutatorMessage<Minimal, ()>) {
                 match message {
                     MutatorMessage::ExecutionProofPrepared {
@@ -7938,6 +8172,57 @@ mod tests {
                 assert_eq!(event.id, id);
                 assert_eq!(event.execution_proof, attempt.execution_proof);
                 assert_observation(&event.published_store, expected_attempts, None);
+            }
+
+            fn seal_completion_batch(&mut self) {
+                // This receiver is intentionally discarded; replacing the root sender closes only
+                // the original completion channel once every real verifier task drops its sender.
+                let (replacement_sender, replacement_receiver) = mpsc::channel();
+                drop(replacement_receiver);
+                drop(core::mem::replace(
+                    &mut self.mutator.mutator_tx,
+                    replacement_sender,
+                ));
+            }
+
+            fn drain_closed_batch(
+                &mut self,
+                attempt: &ProofAttempt,
+                kind: ProofOriginKind,
+            ) -> usize {
+                let deadline = Instant::now()
+                    .checked_add(TEST_TIMEOUT)
+                    .expect("sealed proof batch deadline must be representable");
+                let mut completion_count = 0_usize;
+
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "sealed proof batch did not disconnect before deadline"
+                    );
+                    match self.mutator.mutator_rx.recv_timeout(remaining) {
+                        Ok(MutatorMessage::ExecutionProofCompleted { completion, origin }) => {
+                            assert_proof_origin(&origin, kind, attempt);
+                            self.mutator
+                                .handle_completed_execution_proof(completion, origin);
+                            completion_count = completion_count
+                                .checked_add(1)
+                                .expect("sealed proof batch completion count must not overflow");
+                        }
+                        Ok(_) => panic!("unexpected message on sealed proof completion channel"),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            panic!("sealed proof batch timed out before producer disconnection");
+                        }
+                    }
+                }
+
+                completion_count
+            }
+
+            fn drain_p2p_observations(&self) -> Vec<P2pObservation> {
+                core::iter::from_fn(|| self.p2p_events.try_recv().ok()).collect()
             }
 
             fn receive_completion(
@@ -8106,7 +8391,7 @@ mod tests {
         }
 
         fn prepare_retired_probe_pair(
-            harness: &RetirementHarness,
+            harness: &ProofServiceHarness,
             anchor: &AnchorFixture,
             accepted_snapshot: Arc<ControlStore>,
         ) -> RetiredProbePair {
@@ -8145,7 +8430,7 @@ mod tests {
         }
 
         fn gate_initial_attempts(
-            harness: &mut RetirementHarness,
+            harness: &mut ProofServiceHarness,
             accepted_snapshot: Arc<ControlStore>,
             attempts: &mut InFlightAttempts,
         ) {
@@ -8190,7 +8475,7 @@ mod tests {
         }
 
         fn finish_retired_attempts(
-            harness: &mut RetirementHarness,
+            harness: &mut ProofServiceHarness,
             topology: &RetirementTopology,
             attempts: &InFlightAttempts,
             probes: RetiredProbePair,
@@ -8264,7 +8549,7 @@ mod tests {
         }
 
         fn run_retired_late_completion(verdict: ProofVerdict, occupied: bool) {
-            let mut harness = RetirementHarness::new();
+            let mut harness = ProofServiceHarness::new();
             // Build and assert all C/E/D state, root, payload and FFG inputs before gating workers.
             let topology = RetirementTopology::build(&harness.anchor, &harness.pubkey_cache);
             harness.accept_anchor_payload();
@@ -8311,6 +8596,64 @@ mod tests {
         #[test]
         fn execution_proof_retired_late_undetermined_occupied() {
             run_retired_late_completion(ProofVerdict::Undetermined, true);
+        }
+
+        #[test]
+        fn execution_proof_service_gossip_valid() {
+            run_proof_service_case(
+                ProofOriginKind::Gossip,
+                VerificationScenario::Verdict(ProofVerdict::Valid),
+            );
+        }
+
+        #[test]
+        fn execution_proof_service_gossip_invalid() {
+            run_proof_service_case(
+                ProofOriginKind::Gossip,
+                VerificationScenario::Verdict(ProofVerdict::Invalid),
+            );
+        }
+
+        #[test]
+        fn execution_proof_service_gossip_undetermined() {
+            run_proof_service_case(
+                ProofOriginKind::Gossip,
+                VerificationScenario::Verdict(ProofVerdict::Undetermined),
+            );
+        }
+
+        #[test]
+        fn execution_proof_service_api_valid() {
+            run_proof_service_case(
+                ProofOriginKind::Api,
+                VerificationScenario::Verdict(ProofVerdict::Valid),
+            );
+        }
+
+        #[test]
+        fn execution_proof_service_api_invalid() {
+            run_proof_service_case(
+                ProofOriginKind::Api,
+                VerificationScenario::Verdict(ProofVerdict::Invalid),
+            );
+        }
+
+        #[test]
+        fn execution_proof_service_api_undetermined() {
+            run_proof_service_case(
+                ProofOriginKind::Api,
+                VerificationScenario::Verdict(ProofVerdict::Undetermined),
+            );
+        }
+
+        #[test]
+        fn execution_proof_service_gossip_stopped_pool_dispatch() {
+            run_proof_service_case(ProofOriginKind::Gossip, VerificationScenario::StoppedPool);
+        }
+
+        #[test]
+        fn execution_proof_service_api_stopped_pool_dispatch() {
+            run_proof_service_case(ProofOriginKind::Api, VerificationScenario::StoppedPool);
         }
     }
 }
