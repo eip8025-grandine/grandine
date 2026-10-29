@@ -105,6 +105,16 @@ jobs:
         run: |
           cargo build --release -p grandine --features default-networks,execution-proof-sp1
           cargo test --release -p runtime --features default-networks,bls/blst,kzg_utils/blst,execution-proof-sp1 --lib
+      # `scripts/ci/clippy.bash` passes its arguments to Clippy rather than Cargo, so it cannot enable the feature.
+      # `proof_engine` and `runtime` hold the SP1-gated code, and `grandine` turns it on.
+      # Keep the lint options in sync with the script.
+      - name: Run Clippy with SP1 execution-proof verification (Linux)
+        if: runner.os == 'Linux'
+        run: >-
+          cargo clippy --all-targets --profile test --no-deps
+          -p grandine -p runtime -p proof_engine
+          --features default-networks,bls/blst,kzg_utils/blst,execution-proof-sp1
+          -- --deny warnings --allow clippy::lint_groups_priority --allow clippy::large-stack-arrays
       - name: Run other kzg backend tests
         if: matrix.test_kzg_backends != ''
         run: ${{ matrix.test_kzg_backends }}
