@@ -6742,4 +6742,1575 @@ mod tests {
 
         Ok(())
     }
+
+    // Controlled service-stage fixture: these coherent links model already-validated ChainLink
+    // outputs. They exercise public FFG and Store lifecycle APIs, not full block-import reachability.
+    #[cfg(feature = "eth2-cache")]
+    mod execution_proof_tests {
+        use core::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+        use std::{
+            collections::{HashMap, HashSet},
+            sync::{
+                Arc, Mutex,
+                mpsc::{self, Receiver, SyncSender},
+            },
+        };
+
+        use arc_swap::ArcSwap;
+        use bls::{SecretKey, SecretKeyBytes, SignatureBytes, traits::SecretKey as _};
+        use clock::Tick;
+        use database::Database;
+        use eth2_libp2p::{GossipId, MessageId, PeerId};
+        use execution_engine::MockExecutionEngine;
+        use fork_choice_store::{
+            ChainLink, ExecutionPayloadEnvelopeOrigin, ExecutionPayloadEnvelopeValidationAction,
+            ExecutionProofAdmission, ExecutionProofAdmissionDecline, ExecutionProofOrigin,
+            ExecutionProofPreparation, PayloadPresence, Store, StoreConfig,
+        };
+        use futures::sink::Drain;
+        use helper_functions::{
+            accessors, misc,
+            signing::{SignForSingleFork as _, SignForSingleForkAtSlot},
+            verifier::MultiVerifier,
+        };
+        use proof_engine::{ProofEngine, ProofVerdict};
+        use pubkey_cache::PubkeyCache;
+        use scc::HashMap as SccHashMap;
+        use ssz::{Hc, ProgressiveList, SszHash as _, SszList as _, SszListMut as _};
+        use std_ext::ArcExt;
+        use transition_functions::combined;
+        use types::{
+            altair::consts::TIMELY_TARGET_FLAG_INDEX,
+            combined::{BeaconState, SignedBeaconBlock},
+            config::Config,
+            eip8025::{
+                containers::{
+                    ExecutionProof, ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope,
+                },
+                primitives::get_supported_proof_types,
+            },
+            gloas::{
+                beacon_state::BeaconState as GloasBeaconState,
+                consts::BUILDER_INDEX_SELF_BUILD,
+                containers::{
+                    BeaconBlock as GloasBeaconBlock, BeaconBlockBody as GloasBeaconBlockBody,
+                    ExecutionPayload as GloasExecutionPayload, ExecutionPayloadBid,
+                    ExecutionPayloadEnvelope, ExecutionRequests,
+                    SignedBeaconBlock as GloasSignedBeaconBlock, SignedExecutionPayloadBid,
+                    SignedExecutionPayloadEnvelope,
+                },
+            },
+            nonstandard::{PayloadStatus, Phase, StorageMode},
+            phase0::{
+                consts::FAR_FUTURE_EPOCH,
+                containers::{BeaconBlockHeader, Checkpoint, Validator},
+                primitives::{ExecutionBlockHash, H256, Slot},
+            },
+            preset::Minimal,
+            traits::{BeaconState as _, SignedBeaconBlock as _},
+        };
+
+        use crate::{
+            block_processor::BlockProcessor,
+            events::EventChannels,
+            messages::{
+                AttestationVerifierMessage, MutatorMessage, P2pMessage, PoolMessage, SubnetMessage,
+                SyncMessage, ValidatorMessage,
+            },
+            misc::ProcessingTimings,
+            mutator::Mutator,
+            specialized::TestExecutionEngine,
+            state_at_slot_cache::StateAtSlotCache,
+            storage::{DEFAULT_ARCHIVAL_EPOCH_INTERVAL, DEFAULT_ZSTD_COMPRESSION_LEVEL, Storage},
+            tasks::{ProcessExecutionProofTask, Run},
+            thread_pool::ThreadPool,
+            unbounded_sink::UnboundedSink,
+        };
+
+        type ControlStore = Store<Minimal, Storage<Minimal>>;
+        type TestMutator = Mutator<
+            Minimal,
+            TestExecutionEngine<Minimal>,
+            (),
+            Drain<AttestationVerifierMessage<Minimal, ()>>,
+            ObservingP2pSink,
+            Drain<PoolMessage<Minimal, ()>>,
+            Drain<SubnetMessage<()>>,
+            Drain<SyncMessage<Minimal>>,
+            Drain<ValidatorMessage<Minimal, ()>>,
+        >;
+
+        const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+        // Minimal has eight slots per epoch; real PTC processing needs a nonempty
+        // committee in each slot. Validators 0/1/2 remain the proof signers.
+        const VALIDATOR_COUNT: usize = 8;
+        const EFFECTIVE_BALANCE: u64 = 32_000_000_000;
+        const PROOF_TYPE: u8 = 1;
+        const TARGET_FLAG: u8 = 1 << TIMELY_TARGET_FLAG_INDEX;
+
+        #[derive(Clone, Debug, Default, PartialEq, Eq)]
+        struct StoreObservation {
+            seen_roots: HashMap<H256, HashSet<H256>>,
+            seen_provers: HashSet<(H256, u8, u64)>,
+            execution_proofs: HashMap<H256, HashMap<u8, ExecutionProofEnvelope>>,
+        }
+
+        impl StoreObservation {
+            fn capture(store: &ControlStore) -> Self {
+                Self {
+                    seen_roots: store
+                        .execution_proof_roots()
+                        .iter()
+                        .map(|(root, roots)| (*root, roots.iter().copied().collect()))
+                        .collect(),
+                    seen_provers: store.execution_proof_provers().iter().copied().collect(),
+                    execution_proofs: store
+                        .execution_proofs()
+                        .iter()
+                        .map(|(root, proofs)| {
+                            (
+                                *root,
+                                proofs
+                                    .iter()
+                                    .map(|(proof_type, envelope)| {
+                                        (*proof_type, envelope.as_ref().clone())
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                }
+            }
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum P2pOutcome {
+            Accept,
+            Ignore,
+            Reject,
+            Other,
+        }
+
+        struct P2pObservation {
+            outcome: P2pOutcome,
+            gossip_id: Option<GossipId>,
+            store: StoreObservation,
+            stored_envelope: Option<Arc<ExecutionProofEnvelope>>,
+        }
+
+        #[derive(Clone)]
+        struct ObservingP2pSink {
+            store_snapshot: Arc<ArcSwap<ControlStore>>,
+            sender: SyncSender<P2pObservation>,
+        }
+
+        impl UnboundedSink<P2pMessage<Minimal>> for ObservingP2pSink {
+            fn clone(&self) -> Self {
+                Clone::clone(self)
+            }
+
+            fn unbounded_send(
+                &self,
+                message: P2pMessage<Minimal>,
+            ) -> Result<(), P2pMessage<Minimal>> {
+                let (outcome, gossip_id) = match &message {
+                    P2pMessage::Accept(gossip_id) => (P2pOutcome::Accept, Some(gossip_id.clone())),
+                    P2pMessage::Ignore(gossip_id)
+                    | P2pMessage::IgnoreWithReason(Some(gossip_id), _) => {
+                        (P2pOutcome::Ignore, Some(gossip_id.clone()))
+                    }
+                    P2pMessage::Reject(gossip_id, _) => (P2pOutcome::Reject, gossip_id.clone()),
+                    _ => (P2pOutcome::Other, None),
+                };
+                let store = self.store_snapshot.load_full();
+                let observation = P2pObservation {
+                    outcome,
+                    gossip_id,
+                    store: StoreObservation::capture(&store),
+                    stored_envelope: store
+                        .execution_proofs()
+                        .values()
+                        .flat_map(|proofs| proofs.values())
+                        .next()
+                        .map(ArcExt::clone_arc),
+                };
+
+                self.sender.send(observation).map_err(|_| message)
+            }
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        enum AttemptId {
+            A,
+            B,
+        }
+
+        struct RegisteredGate {
+            id: AttemptId,
+            expected_input: ExecutionProof,
+            release: Receiver<ProofVerdict>,
+        }
+
+        struct EngineEvent {
+            id: AttemptId,
+            execution_proof: ExecutionProof,
+            published_store: StoreObservation,
+        }
+
+        struct GatedProofEngine {
+            store_snapshot: Arc<ArcSwap<ControlStore>>,
+            registered: Mutex<Vec<RegisteredGate>>,
+            events: SyncSender<EngineEvent>,
+            invocations: AtomicUsize,
+        }
+
+        impl GatedProofEngine {
+            fn register(
+                &self,
+                id: AttemptId,
+                expected_input: ExecutionProof,
+            ) -> SyncSender<ProofVerdict> {
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let mut registered = self
+                    .registered
+                    .lock()
+                    .expect("test engine registry mutex should not be poisoned");
+                assert!(registered.iter().all(|gate| gate.id != id));
+                registered.push(RegisteredGate {
+                    id,
+                    expected_input,
+                    release: release_rx,
+                });
+                release_tx
+            }
+
+            fn invocation_count(&self) -> usize {
+                self.invocations.load(Ordering::SeqCst)
+            }
+        }
+
+        impl ProofEngine for GatedProofEngine {
+            fn is_null(&self) -> bool {
+                false
+            }
+
+            fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> ProofVerdict {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                let gate = {
+                    let mut registered = self
+                        .registered
+                        .lock()
+                        .expect("test engine registry mutex should not be poisoned");
+                    registered
+                        .iter()
+                        .position(|gate| gate.expected_input == execution_proof)
+                        .map(|index| registered.remove(index))
+                }
+                .expect("only registered, actually admitted inputs may enter the verifier");
+                let id = gate.id;
+                let published_store = StoreObservation::capture(&self.store_snapshot.load_full());
+                self.events
+                    .send(EngineEvent {
+                        id,
+                        execution_proof,
+                        published_store,
+                    })
+                    .expect("retirement tests keep the bounded engine observer alive");
+                gate.release
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("each entered verifier must receive an explicit test verdict")
+            }
+        }
+
+        #[derive(Default)]
+        struct GateReleaseGuard {
+            releases: HashMap<AttemptId, SyncSender<ProofVerdict>>,
+        }
+
+        impl GateReleaseGuard {
+            fn register(
+                &mut self,
+                engine: &GatedProofEngine,
+                id: AttemptId,
+                expected_input: ExecutionProof,
+            ) {
+                assert!(
+                    self.releases
+                        .insert(id, engine.register(id, expected_input))
+                        .is_none(),
+                    "attempt gate may be registered only once",
+                );
+            }
+
+            fn release(&mut self, id: AttemptId, verdict: ProofVerdict) {
+                self.releases
+                    .remove(&id)
+                    .expect("attempt release guard must own every pending gate")
+                    .send(verdict)
+                    .expect("entered verifier must still be waiting for its verdict");
+            }
+        }
+
+        impl Drop for GateReleaseGuard {
+            fn drop(&mut self) {
+                for sender in self.releases.drain().map(|(_, sender)| sender) {
+                    // Cleanup only: assertions never treat this fallback as a test result.
+                    let _ = sender.try_send(ProofVerdict::Undetermined);
+                }
+            }
+        }
+
+        struct AnchorFixture {
+            config: Arc<Config>,
+            validator_keys: [SecretKey; VALIDATOR_COUNT],
+            state: Arc<BeaconState<Minimal>>,
+            block: Arc<SignedBeaconBlock<Minimal>>,
+            block_root: H256,
+            bid: ExecutionPayloadBid<Minimal>,
+            payload: Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+        }
+
+        impl AnchorFixture {
+            fn new() -> Self {
+                let mut config = Config::minimal().start_and_stay_in(Phase::Gloas);
+                config.deposit_chain_id = 1337;
+                let config = Arc::new(config);
+                let validator_keys = [1, 2, 3, 4, 5, 6, 7, 8].map(test_validator_key);
+                let (state, block, block_root, bid) =
+                    build_anchor_block_and_state(&config, &validator_keys);
+                let payload =
+                    build_anchor_payload(&config, &state, &validator_keys, &bid, block_root);
+
+                Self {
+                    config,
+                    validator_keys,
+                    state: Arc::new(state),
+                    block,
+                    block_root,
+                    bid,
+                    payload,
+                }
+            }
+        }
+
+        fn build_anchor_block_and_state(
+            config: &Config,
+            validator_keys: &[SecretKey; VALIDATOR_COUNT],
+        ) -> (
+            BeaconState<Minimal>,
+            Arc<SignedBeaconBlock<Minimal>>,
+            H256,
+            ExecutionPayloadBid<Minimal>,
+        ) {
+            let execution_requests = ExecutionRequests::<Minimal>::default();
+            let bid = ExecutionPayloadBid {
+                parent_block_hash: ExecutionBlockHash::default(),
+                parent_block_root: H256::zero(),
+                block_hash: ExecutionBlockHash::repeat_byte(0x44),
+                prev_randao: H256::repeat_byte(0x55),
+                gas_limit: 30_000_000,
+                builder_index: BUILDER_INDEX_SELF_BUILD,
+                slot: 0,
+                execution_requests_root: execution_requests.hash_tree_root(),
+                ..Default::default()
+            };
+            let body = block_body(bid.clone());
+            let mut gloas_state = GloasBeaconState::<Minimal> {
+                genesis_time: config.min_genesis_time,
+                validators: validator_keys
+                    .iter()
+                    .map(|key| Validator {
+                        pubkey: key.to_public_key().into(),
+                        activation_epoch: 0,
+                        exit_epoch: FAR_FUTURE_EPOCH,
+                        effective_balance: EFFECTIVE_BALANCE,
+                        ..Default::default()
+                    })
+                    .collect(),
+                latest_block_header: BeaconBlockHeader {
+                    body_root: body.hash_tree_root(),
+                    ..Default::default()
+                },
+                latest_execution_payload_bid: bid.clone(),
+                ..Default::default()
+            };
+            initialize_validator_lists(&mut gloas_state);
+            let state = BeaconState::from(gloas_state);
+            let state_root = state.hash_tree_root();
+            let signed_block = GloasSignedBeaconBlock {
+                message: Hc::from(GloasBeaconBlock {
+                    state_root,
+                    body,
+                    ..Default::default()
+                }),
+                signature: SignatureBytes::default(),
+            };
+            let block_root = signed_block.message.hash_tree_root();
+            assert_eq!(state.slot(), signed_block.message.slot);
+            assert_eq!(state.hash_tree_root(), state_root);
+            assert_eq!(signed_block.message.state_root, state_root);
+            assert_eq!(
+                signed_block.message.body.hash_tree_root(),
+                state.latest_block_header().body_root,
+            );
+            assert_eq!(state.latest_block_header().state_root, H256::zero());
+            assert_eq!(accessors::latest_block_root(&state), block_root);
+            assert_eq!(state.validators().len_usize(), VALIDATOR_COUNT);
+            assert_eq!(state.balances().len_usize(), VALIDATOR_COUNT);
+            assert_eq!(
+                state
+                    .post_gloas()
+                    .expect("retirement fixture state is Gloas")
+                    .previous_epoch_participation()
+                    .len_usize(),
+                VALIDATOR_COUNT,
+            );
+            assert_eq!(
+                state
+                    .post_gloas()
+                    .expect("retirement fixture state is Gloas")
+                    .current_epoch_participation()
+                    .len_usize(),
+                VALIDATOR_COUNT,
+            );
+
+            (
+                state,
+                Arc::new(SignedBeaconBlock::from(signed_block)),
+                block_root,
+                bid,
+            )
+        }
+
+        fn initialize_validator_lists(state: &mut GloasBeaconState<Minimal>) {
+            state
+                .balances
+                .try_assign_from_iter(&mut core::iter::repeat_n(
+                    EFFECTIVE_BALANCE,
+                    VALIDATOR_COUNT,
+                ))
+                .expect("eight validator balances fit the persistent progressive list");
+            state
+                .previous_epoch_participation
+                .try_assign_from_iter(&mut core::iter::repeat_n(0_u8, VALIDATOR_COUNT))
+                .expect("eight previous participation flags fit the persistent progressive list");
+            state
+                .current_epoch_participation
+                .try_assign_from_iter(&mut core::iter::repeat_n(0_u8, VALIDATOR_COUNT))
+                .expect("eight current participation flags fit the persistent progressive list");
+            state
+                .inactivity_scores
+                .try_assign_from_iter(&mut core::iter::repeat_n(0_u64, VALIDATOR_COUNT))
+                .expect("eight inactivity scores fit the persistent progressive list");
+        }
+
+        fn build_anchor_payload(
+            config: &Config,
+            state: &BeaconState<Minimal>,
+            validator_keys: &[SecretKey; VALIDATOR_COUNT],
+            bid: &ExecutionPayloadBid<Minimal>,
+            block_root: H256,
+        ) -> Arc<SignedExecutionPayloadEnvelope<Minimal>> {
+            let post_gloas_state = state.post_gloas().expect("anchor state is Gloas");
+            let timestamp = misc::compute_timestamp_at_slot(config, state, state.slot())
+                .expect("anchor fixture timestamp should be computable");
+            let payload = ExecutionPayloadEnvelope {
+                payload: GloasExecutionPayload {
+                    parent_hash: post_gloas_state.latest_block_hash(),
+                    prev_randao: bid.prev_randao,
+                    gas_limit: bid.gas_limit,
+                    timestamp,
+                    withdrawals: ProgressiveList::try_from(
+                        post_gloas_state
+                            .payload_expected_withdrawals()
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("anchor expected withdrawals fit the payload list"),
+                    block_hash: bid.block_hash,
+                    slot_number: state.slot(),
+                    ..Default::default()
+                },
+                execution_requests: ExecutionRequests::default(),
+                builder_index: bid.builder_index,
+                beacon_block_root: block_root,
+                parent_beacon_block_root: state.latest_block_header().parent_root,
+            };
+            Arc::new(SignedExecutionPayloadEnvelope {
+                signature: payload.sign(config, state, &validator_keys[0]).into(),
+                message: payload,
+            })
+        }
+
+        struct ProofAttempt {
+            envelope: ExecutionProofEnvelope,
+            envelope_root: H256,
+            proof_type: u8,
+            validator_index: u64,
+            execution_proof: ExecutionProof,
+            signed_proof: Arc<SignedExecutionProofEnvelope>,
+            gossip_id: GossipId,
+        }
+
+        struct InFlightAttempts {
+            a: ProofAttempt,
+            b: Option<ProofAttempt>,
+            original_resident_arc: Option<Arc<ExecutionProofEnvelope>>,
+        }
+
+        impl InFlightAttempts {
+            fn expected(&self) -> Vec<&ProofAttempt> {
+                if let Some(attempt_b) = &self.b {
+                    vec![&self.a, attempt_b]
+                } else {
+                    vec![&self.a]
+                }
+            }
+
+            fn resident(&self) -> Option<&ProofAttempt> {
+                self.b.as_ref().map(|_| &self.a)
+            }
+
+            fn pending(&self) -> (&ProofAttempt, AttemptId) {
+                if let Some(attempt_b) = &self.b {
+                    (attempt_b, AttemptId::B)
+                } else {
+                    (&self.a, AttemptId::A)
+                }
+            }
+
+            const fn occupied(&self) -> bool {
+                self.b.is_some()
+            }
+        }
+
+        struct RetiredProbePair {
+            diagnostic_probe: ProofAttempt,
+            handler_probe: ProofAttempt,
+            diagnostic_message: MutatorMessage<Minimal, ()>,
+            handler_message: MutatorMessage<Minimal, ()>,
+        }
+
+        fn build_proof_attempt(
+            anchor: &AnchorFixture,
+            store: &ControlStore,
+            validator_index: u64,
+            proof_byte: u8,
+            gossip_seed: u8,
+        ) -> ProofAttempt {
+            assert!(get_supported_proof_types().contains(&PROOF_TYPE));
+            let envelope = ExecutionProofEnvelope {
+                proof_data: ProofData::try_from(vec![proof_byte, 0x82])
+                    .expect("test proof bytes fit the bounded proof container"),
+                proof_type: PROOF_TYPE,
+                beacon_block_root: anchor.block_root,
+            };
+            let public_input = store
+                .get_execution_proof(anchor.state.as_ref(), &envelope, &anchor.payload.message)
+                .expect("accepted B payload supplies its public proof context")
+                .public_input;
+            assert!(public_input.successful_validation);
+            assert_eq!(public_input.chain_id, anchor.config.deposit_chain_id);
+            assert_eq!(public_input.chain_id, 1337);
+
+            let index =
+                usize::try_from(validator_index).expect("test validator index fits this host");
+            let signature = SignForSingleForkAtSlot::<Minimal>::sign(
+                &envelope,
+                &anchor.config,
+                anchor.state.as_ref(),
+                anchor.state.slot(),
+                &anchor.validator_keys[index],
+            )
+            .into();
+            let gossip_id = test_gossip_id(gossip_seed);
+            let envelope_root = envelope.hash_tree_root();
+            let execution_proof = ExecutionProof {
+                proof_data: envelope.proof_data.clone(),
+                proof_type: envelope.proof_type,
+                public_input,
+            };
+            assert_ne!(envelope_root, H256::zero());
+
+            ProofAttempt {
+                envelope: envelope.clone(),
+                envelope_root,
+                proof_type: envelope.proof_type,
+                validator_index,
+                execution_proof,
+                signed_proof: Arc::new(SignedExecutionProofEnvelope {
+                    message: Hc::from(envelope),
+                    validator_index,
+                    signature,
+                }),
+                gossip_id,
+            }
+        }
+
+        struct RetirementTopology {
+            c_link: ChainLink<Minimal>,
+            e_link: ChainLink<Minimal>,
+            d_link: ChainLink<Minimal>,
+            c_root: H256,
+            e_root: H256,
+            d_root: H256,
+            c2: Checkpoint,
+            e3: Checkpoint,
+            c2_state: Arc<BeaconState<Minimal>>,
+            e3_state: Arc<BeaconState<Minimal>>,
+        }
+
+        impl RetirementTopology {
+            fn build(anchor: &AnchorFixture, pubkey_cache: &PubkeyCache) -> Self {
+                let z = anchor.state.current_justified_checkpoint();
+                assert_eq!(z.epoch, 0);
+                assert_eq!(anchor.state.finalized_checkpoint(), z);
+
+                let c_bid = make_bid(0x45, anchor.bid.block_hash, anchor.block_root, 16);
+                let mut c_state = anchor.state.as_ref().clone();
+                combined::process_slots(&anchor.config, pubkey_cache, &mut c_state, 16)
+                    .expect("public slot processing constructs C's slot-16 state");
+                let (c_link, c_root) = make_link(c_state, 16, &anchor.block, c_bid);
+                assert_eq!(c_link.parent_payload_presence, PayloadPresence::Full);
+                assert_eq!(c_link.payload_status, PayloadStatus::Valid);
+                assert_link_checkpoint_table(&c_link, z, z, z, z);
+
+                let mut c_end_epoch = c_link
+                    .state
+                    .as_ref()
+                    .expect("C link carries its coherent post-state")
+                    .as_ref()
+                    .clone();
+                combined::process_slots(&anchor.config, pubkey_cache, &mut c_end_epoch, 23)
+                    .expect("public slot processing reaches epoch-2 boundary state");
+                set_current_target_participation(&mut c_end_epoch, true);
+                assert_target_participation(&c_end_epoch, false);
+                assert!(!has_target_participation(&c_end_epoch, true));
+                let mut justification_probe = c_end_epoch.clone();
+                combined::process_justification_and_finalization(&mut justification_probe)
+                    .expect("public FFG calculation derives C2 from current participation");
+                let c2 = Checkpoint {
+                    epoch: 2,
+                    root: c_root,
+                };
+                assert_eq!(justification_probe.current_justified_checkpoint(), c2);
+                assert_eq!(justification_probe.finalized_checkpoint(), z);
+                assert_eq!(accessors::latest_block_root(&justification_probe), c_root);
+
+                let mut e_state = c_end_epoch;
+                combined::process_slots(&anchor.config, pubkey_cache, &mut e_state, 24)
+                    .expect("epoch transition carries C2 and rotates participation into E");
+                assert_eq!(e_state.current_justified_checkpoint(), c2);
+                assert_eq!(e_state.finalized_checkpoint(), z);
+                assert_target_participation(&e_state, true);
+                assert!(!has_target_participation(&e_state, false));
+
+                let e_bid = make_bid(0x46, anchor.bid.block_hash, c_root, 24);
+                let (e_link, e_root) = make_link(e_state, 24, &c_link.block, e_bid);
+                assert_eq!(e_link.parent_payload_presence, PayloadPresence::Empty);
+                assert_eq!(e_link.payload_status, PayloadStatus::Valid);
+                assert_link_checkpoint_table(&e_link, c2, z, c2, z);
+
+                let mut e_end_epoch = e_link
+                    .state
+                    .as_ref()
+                    .expect("E link carries its coherent post-state")
+                    .as_ref()
+                    .clone();
+                combined::process_slots(&anchor.config, pubkey_cache, &mut e_end_epoch, 31)
+                    .expect("public slot processing reaches epoch-3 boundary state");
+                assert_target_participation(&e_end_epoch, true);
+                set_current_target_participation(&mut e_end_epoch, true);
+                assert_target_participation(&e_end_epoch, false);
+                let mut finalization_probe = e_end_epoch.clone();
+                combined::process_justification_and_finalization(&mut finalization_probe)
+                    .expect("public FFG calculation derives E3 and finalizes C2");
+                let e3 = Checkpoint {
+                    epoch: 3,
+                    root: e_root,
+                };
+                assert_eq!(finalization_probe.current_justified_checkpoint(), e3);
+                assert_eq!(finalization_probe.finalized_checkpoint(), c2);
+                assert_eq!(accessors::latest_block_root(&finalization_probe), e_root);
+
+                let mut d_state = e_end_epoch;
+                combined::process_slots(&anchor.config, pubkey_cache, &mut d_state, 32)
+                    .expect("public epoch processing carries E3/C2 into D at slot 32");
+                assert_eq!(d_state.current_justified_checkpoint(), e3);
+                assert_eq!(d_state.finalized_checkpoint(), c2);
+
+                let d_bid = make_bid(0x47, anchor.bid.block_hash, e_root, 32);
+                let (d_link, d_root) = make_link(d_state, 32, &e_link.block, d_bid);
+                assert_eq!(d_link.parent_payload_presence, PayloadPresence::Empty);
+                assert_eq!(d_link.payload_status, PayloadStatus::Valid);
+                assert_link_checkpoint_table(&d_link, e3, c2, e3, c2);
+
+                // The FFG probes above are at slots 23/31; checkpoint cache entries must
+                // instead be the actual C/E boundary post-states at slots 16/24.
+                let c2_boundary_state = checkpoint_boundary_state(&c_link, 16);
+                let e3_boundary_state = checkpoint_boundary_state(&e_link, 24);
+
+                Self {
+                    c_link,
+                    e_link,
+                    d_link,
+                    c_root,
+                    e_root,
+                    d_root,
+                    c2,
+                    e3,
+                    c2_state: c2_boundary_state,
+                    e3_state: e3_boundary_state,
+                }
+            }
+        }
+
+        fn checkpoint_boundary_state(
+            link: &ChainLink<Minimal>,
+            slot: Slot,
+        ) -> Arc<BeaconState<Minimal>> {
+            let state = link
+                .state
+                .as_ref()
+                .expect("link carries its frozen checkpoint boundary post-state")
+                .clone_arc();
+            assert_eq!(state.slot(), slot);
+            assert_eq!(accessors::latest_block_root(&state), link.block_root);
+            state
+        }
+
+        fn make_bid(
+            seed: u8,
+            parent_block_hash: ExecutionBlockHash,
+            parent_block_root: H256,
+            slot: Slot,
+        ) -> ExecutionPayloadBid<Minimal> {
+            let requests = ExecutionRequests::<Minimal>::default();
+            ExecutionPayloadBid {
+                parent_block_hash,
+                parent_block_root,
+                block_hash: ExecutionBlockHash::repeat_byte(seed),
+                prev_randao: H256::repeat_byte(seed ^ 0x80),
+                gas_limit: 30_000_000,
+                builder_index: BUILDER_INDEX_SELF_BUILD,
+                slot,
+                execution_requests_root: requests.hash_tree_root(),
+                ..Default::default()
+            }
+        }
+
+        fn block_body(bid: ExecutionPayloadBid<Minimal>) -> GloasBeaconBlockBody<Minimal> {
+            GloasBeaconBlockBody {
+                signed_execution_payload_bid: SignedExecutionPayloadBid {
+                    message: bid,
+                    signature: SignatureBytes::default(),
+                },
+                parent_execution_requests: ExecutionRequests::default(),
+                ..Default::default()
+            }
+        }
+
+        fn make_link(
+            mut state: BeaconState<Minimal>,
+            slot: Slot,
+            parent: &Arc<SignedBeaconBlock<Minimal>>,
+            bid: ExecutionPayloadBid<Minimal>,
+        ) -> (ChainLink<Minimal>, H256) {
+            let body = block_body(bid.clone());
+            let body_root = body.hash_tree_root();
+            let parent_root = parent.message().hash_tree_root();
+            let executed_hash = ExecutionBlockHash::repeat_byte(0x44);
+            {
+                let gloas_state = match &mut state {
+                    BeaconState::Gloas(state) => state.as_mut(),
+                    _ => panic!("controlled lifecycle links must use Gloas state"),
+                };
+                gloas_state.latest_execution_payload_bid = bid;
+                gloas_state.latest_block_hash = executed_hash;
+                gloas_state.latest_block_header = BeaconBlockHeader {
+                    slot,
+                    parent_root,
+                    state_root: H256::zero(),
+                    body_root,
+                    ..Default::default()
+                };
+            }
+
+            let realized_justified = state.current_justified_checkpoint();
+            let realized_finalized = state.finalized_checkpoint();
+            let (unrealized_justified, unrealized_finalized) = unrealized_checkpoints(&state);
+            let state_root = state.hash_tree_root();
+            let signed_block = GloasSignedBeaconBlock {
+                message: Hc::from(GloasBeaconBlock {
+                    slot,
+                    proposer_index: 0,
+                    parent_root,
+                    state_root,
+                    body,
+                }),
+                signature: SignatureBytes::default(),
+            };
+            let block_root = signed_block.message.hash_tree_root();
+            assert_eq!(state.slot(), slot);
+            assert_eq!(signed_block.message.slot, state.slot());
+            assert_eq!(signed_block.message.parent_root, parent_root);
+            assert_eq!(signed_block.message.body.hash_tree_root(), body_root);
+            assert_eq!(state_root, state.hash_tree_root());
+            assert_eq!(signed_block.message.state_root, state_root);
+            assert_eq!(accessors::latest_block_root(&state), block_root);
+            let header = state.latest_block_header();
+            assert_eq!(header.slot, slot);
+            assert_eq!(header.parent_root, parent_root);
+            assert_eq!(header.body_root, body_root);
+            assert_eq!(header.state_root, H256::zero());
+            assert_eq!(
+                state
+                    .post_gloas()
+                    .expect("retirement fixture state is Gloas")
+                    .latest_block_hash(),
+                executed_hash
+            );
+
+            let block = Arc::new(SignedBeaconBlock::from(signed_block));
+            let parent_payload_presence =
+                PayloadPresence::of_parent(block.message(), parent.message());
+            (
+                ChainLink {
+                    block_root,
+                    block,
+                    state: Some(Arc::new(state)),
+                    current_justified_checkpoint: realized_justified,
+                    finalized_checkpoint: realized_finalized,
+                    unrealized_justified_checkpoint: unrealized_justified,
+                    unrealized_finalized_checkpoint: unrealized_finalized,
+                    payload_status: PayloadStatus::Valid,
+                    parent_payload_presence,
+                },
+                block_root,
+            )
+        }
+
+        fn unrealized_checkpoints(state: &BeaconState<Minimal>) -> (Checkpoint, Checkpoint) {
+            let mut state = state.clone();
+            combined::process_justification_and_finalization(&mut state)
+                .expect("public FFG routine computes unrealized checkpoints on a clone");
+            (
+                state.current_justified_checkpoint(),
+                state.finalized_checkpoint(),
+            )
+        }
+
+        fn assert_link_checkpoint_table(
+            link: &ChainLink<Minimal>,
+            realized_justified: Checkpoint,
+            realized_finalized: Checkpoint,
+            unrealized_justified: Checkpoint,
+            unrealized_finalized: Checkpoint,
+        ) {
+            assert_eq!(link.current_justified_checkpoint, realized_justified);
+            assert_eq!(link.finalized_checkpoint, realized_finalized);
+            assert_eq!(link.unrealized_justified_checkpoint, unrealized_justified);
+            assert_eq!(link.unrealized_finalized_checkpoint, unrealized_finalized);
+        }
+
+        fn set_current_target_participation(state: &mut BeaconState<Minimal>, participating: bool) {
+            let flags = if participating { TARGET_FLAG } else { 0 };
+            let BeaconState::Gloas(state) = state else {
+                panic!("participation fixture must be Gloas");
+            };
+            state
+                .current_epoch_participation
+                .try_assign_from_iter(&mut core::iter::repeat_n(flags, VALIDATOR_COUNT))
+                .expect("eight target participation flags fit the persistent progressive list");
+        }
+
+        fn has_target_participation(state: &BeaconState<Minimal>, previous: bool) -> bool {
+            let post_gloas = state.post_gloas().expect("participation state is Gloas");
+            let participation = if previous {
+                post_gloas.previous_epoch_participation()
+            } else {
+                post_gloas.current_epoch_participation()
+            };
+            assert_eq!(participation.len_usize(), VALIDATOR_COUNT);
+            participation
+                .iter()
+                .all(|flags| flags & TARGET_FLAG == TARGET_FLAG)
+        }
+
+        fn assert_target_participation(state: &BeaconState<Minimal>, previous: bool) {
+            assert!(has_target_participation(state, previous));
+        }
+
+        fn test_validator_key(scalar: u8) -> SecretKey {
+            let mut key_bytes = SecretKeyBytes::default();
+            key_bytes.as_mut()[31] = scalar;
+            key_bytes
+                .try_into()
+                .expect("nonzero small scalar is a valid test key")
+        }
+
+        fn test_gossip_id(seed: u8) -> GossipId {
+            let mut peer_id_bytes = vec![0x12, 0x20];
+            peer_id_bytes.resize(34, seed);
+            GossipId {
+                source: PeerId::from_bytes(&peer_id_bytes).expect("test peer id should decode"),
+                message_id: MessageId::new(&[seed, 0xc3]),
+            }
+        }
+
+        fn assert_gossip_identity(actual: Option<&GossipId>, expected: &GossipId) {
+            let actual = actual.expect("gossip response preserves source and message id");
+            assert_eq!(&actual.source, &expected.source);
+            assert_eq!(&actual.message_id, &expected.message_id);
+            let source_bytes = actual.source.to_bytes();
+            assert_eq!(source_bytes.len(), 34);
+            assert!(source_bytes[2..].iter().any(|byte| *byte != 0));
+            assert_ne!(actual.message_id, MessageId::new(&[]));
+        }
+
+        fn expected_store(
+            attempts: &[&ProofAttempt],
+            stored: Option<&ProofAttempt>,
+        ) -> StoreObservation {
+            let mut expected = StoreObservation::default();
+            for attempt in attempts {
+                expected
+                    .seen_roots
+                    .entry(attempt.envelope.beacon_block_root)
+                    .or_default()
+                    .insert(attempt.envelope_root);
+                expected.seen_provers.insert((
+                    attempt.envelope.beacon_block_root,
+                    attempt.proof_type,
+                    attempt.validator_index,
+                ));
+            }
+            if let Some(attempt) = stored {
+                expected.execution_proofs.insert(
+                    attempt.envelope.beacon_block_root,
+                    HashMap::from([(attempt.proof_type, attempt.envelope.clone())]),
+                );
+            }
+            expected
+        }
+
+        fn assert_observation(
+            observation: &StoreObservation,
+            attempts: &[&ProofAttempt],
+            stored: Option<&ProofAttempt>,
+        ) {
+            assert_eq!(observation, &expected_store(attempts, stored));
+        }
+
+        fn assert_origin(origin: &ExecutionProofOrigin, expected: &GossipId) {
+            let actual = origin
+                .gossip_id_ref()
+                .expect("retirement attempts use gossip origins");
+            assert_gossip_identity(Some(actual), expected);
+        }
+
+        struct RetirementHarness {
+            anchor: AnchorFixture,
+            pubkey_cache: Arc<PubkeyCache>,
+            store_snapshot: Arc<ArcSwap<ControlStore>>,
+            mutator: TestMutator,
+            proof_engine: Arc<dyn ProofEngine>,
+            engine: Arc<GatedProofEngine>,
+            engine_events: Receiver<EngineEvent>,
+            p2p_events: Receiver<P2pObservation>,
+            releases: GateReleaseGuard,
+        }
+
+        impl Drop for RetirementHarness {
+            fn drop(&mut self) {
+                // Unblock verifier workers before the Mutator-owned pool is dropped.
+                drop(core::mem::take(&mut self.releases));
+            }
+        }
+
+        impl RetirementHarness {
+            fn new() -> Self {
+                let anchor = AnchorFixture::new();
+                let pubkey_cache = Arc::new(PubkeyCache::default());
+                let storage = Arc::new(Storage::new(
+                    anchor.config.clone_arc(),
+                    pubkey_cache.clone_arc(),
+                    Database::in_memory(),
+                    DEFAULT_ARCHIVAL_EPOCH_INTERVAL,
+                    StorageMode::Prune,
+                    true,
+                    DEFAULT_ZSTD_COMPRESSION_LEVEL,
+                ));
+                let store = Store::new(
+                    anchor.config.clone_arc(),
+                    pubkey_cache.clone_arc(),
+                    StoreConfig::aggressive(&anchor.config),
+                    anchor.block.clone_arc(),
+                    anchor.state.clone_arc(),
+                    storage.clone_arc(),
+                    true,
+                    true,
+                    HashSet::new(),
+                    Arc::new(SccHashMap::new()),
+                );
+                let store_snapshot = Arc::new(ArcSwap::from_pointee(store));
+                let (p2p_sender, p2p_events) = mpsc::sync_channel(16);
+                let p2p_sink = ObservingP2pSink {
+                    store_snapshot: store_snapshot.clone_arc(),
+                    sender: p2p_sender,
+                };
+                let (engine_sender, engine_events) = mpsc::sync_channel(8);
+                let engine = Arc::new(GatedProofEngine {
+                    store_snapshot: store_snapshot.clone_arc(),
+                    registered: Mutex::new(Vec::new()),
+                    events: engine_sender,
+                    invocations: AtomicUsize::new(0),
+                });
+                let proof_engine: Arc<dyn ProofEngine> = engine.clone_arc();
+                let execution_engine: TestExecutionEngine<Minimal> =
+                    Arc::new(Mutex::new(MockExecutionEngine::new(true, false, None)));
+                let state_cache = store_snapshot.load_full().state_cache();
+                let block_processor = Arc::new(BlockProcessor::new(
+                    anchor.config.clone_arc(),
+                    pubkey_cache.clone_arc(),
+                    state_cache.clone_arc(),
+                ));
+                let thread_pool = ThreadPool::<Minimal, _, ()>::with_worker_count(2)
+                    .expect("retirement fixture starts the actual proof worker pool");
+                let (mutator_tx, mutator_rx) = mpsc::channel();
+                let mut mutator = Mutator::new(
+                    pubkey_cache.clone_arc(),
+                    store_snapshot.clone_arc(),
+                    state_cache,
+                    block_processor,
+                    Arc::new(EventChannels::new(16)),
+                    execution_engine,
+                    Arc::new(SccHashMap::new()),
+                    Arc::new(StateAtSlotCache::build()),
+                    storage,
+                    thread_pool,
+                    None,
+                    mutator_tx,
+                    mutator_rx,
+                    futures::sink::drain(),
+                    p2p_sink,
+                    futures::sink::drain(),
+                    futures::sink::drain(),
+                    futures::sink::drain(),
+                    futures::sink::drain(),
+                );
+                mutator
+                    .process_unfinalized_blocks(core::iter::empty())
+                    .expect("empty anchor fixture completes Mutator load initialization");
+                assert_eq!(
+                    store_snapshot.load().finalized_checkpoint(),
+                    Checkpoint {
+                        epoch: 0,
+                        root: anchor.block_root,
+                    },
+                    "Store::new uses the anchor-root epoch-zero checkpoint, unlike the state stub",
+                );
+
+                Self {
+                    anchor,
+                    pubkey_cache,
+                    store_snapshot,
+                    mutator,
+                    proof_engine,
+                    engine,
+                    engine_events,
+                    p2p_events,
+                    releases: GateReleaseGuard::default(),
+                }
+            }
+
+            fn accept_anchor_payload(&mut self) {
+                let gossip_id = test_gossip_id(0x11);
+                let origin = ExecutionPayloadEnvelopeOrigin::Gossip(gossip_id.clone());
+                let snapshot = self.store_snapshot.load_full();
+                let result = snapshot.validate_execution_payload_envelope(
+                    &self.anchor.payload,
+                    &origin,
+                    &self.mutator.execution_engine,
+                    MultiVerifier::default(),
+                );
+                assert!(matches!(
+                    &result,
+                    Ok(ExecutionPayloadEnvelopeValidationAction::Accept(_))
+                ));
+                let identifier = self.anchor.payload.as_ref().into();
+                self.mutator.handle_execution_payload_envelope(
+                    (),
+                    result,
+                    origin,
+                    identifier,
+                    true,
+                    ProcessingTimings::new(),
+                    tracing::Span::none(),
+                );
+                let response = self.receive_p2p(P2pOutcome::Accept, &gossip_id);
+                assert_observation(&response.store, &[], None);
+                assert_eq!(response.stored_envelope, None);
+                let accepted = self.store_snapshot.load_full();
+                assert!(accepted.is_payload_verified(self.anchor.block_root));
+                assert_eq!(
+                    accepted
+                        .cached_execution_payload_envelope_by_root(self.anchor.block_root)
+                        .expect("accepted B envelope is published")
+                        .as_ref(),
+                    self.anchor.payload.as_ref(),
+                );
+            }
+
+            fn receive_p2p(&self, outcome: P2pOutcome, gossip_id: &GossipId) -> P2pObservation {
+                let observation = self
+                    .p2p_events
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("actual P2P send is synchronously observed");
+                assert_eq!(observation.outcome, outcome);
+                assert_gossip_identity(observation.gossip_id.as_ref(), gossip_id);
+                observation
+            }
+
+            fn run_preparation(&mut self, snapshot: Arc<ControlStore>, attempt: &ProofAttempt) {
+                ProcessExecutionProofTask {
+                    store_snapshot: snapshot,
+                    proof_engine: self.proof_engine.clone_arc(),
+                    mutator_tx: self.mutator.mutator_tx.clone(),
+                    signed_proof: attempt.signed_proof.clone_arc(),
+                    origin: ExecutionProofOrigin::Gossip(attempt.gossip_id.clone()),
+                }
+                .run();
+                let message = self
+                    .mutator
+                    .mutator_rx
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("real preparation task sends a protected prepared message");
+                self.deliver_prepared(message);
+            }
+
+            fn prepare_detached(
+                &self,
+                snapshot: Arc<ControlStore>,
+                attempt: &ProofAttempt,
+            ) -> MutatorMessage<Minimal, ()> {
+                let (sender, receiver) = mpsc::channel();
+                ProcessExecutionProofTask {
+                    store_snapshot: snapshot,
+                    proof_engine: self.proof_engine.clone_arc(),
+                    mutator_tx: sender,
+                    signed_proof: attempt.signed_proof.clone_arc(),
+                    origin: ExecutionProofOrigin::Gossip(attempt.gossip_id.clone()),
+                }
+                .run();
+                receiver
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("independent preparation uses the accepted pre-transition snapshot")
+            }
+
+            fn deliver_prepared(&mut self, message: MutatorMessage<Minimal, ()>) {
+                match message {
+                    MutatorMessage::ExecutionProofPrepared {
+                        result,
+                        proof_engine,
+                        origin,
+                    } => self
+                        .mutator
+                        .handle_prepared_execution_proof(result, proof_engine, origin),
+                    _ => panic!("expected the actual prepared-proof mutator message"),
+                }
+            }
+
+            fn observe_entry(
+                &self,
+                id: AttemptId,
+                attempt: &ProofAttempt,
+                expected_attempts: &[&ProofAttempt],
+            ) {
+                let event = self
+                    .engine_events
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("real VerifyExecutionProofTask enters the gated engine");
+                assert_eq!(event.id, id);
+                assert_eq!(event.execution_proof, attempt.execution_proof);
+                assert_observation(&event.published_store, expected_attempts, None);
+            }
+
+            fn receive_completion(
+                &mut self,
+                attempt: &ProofAttempt,
+                expected_attempts: &[&ProofAttempt],
+                stored: Option<&ProofAttempt>,
+                expected_outcome: P2pOutcome,
+            ) -> P2pObservation {
+                let message = self
+                    .mutator
+                    .mutator_rx
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("released worker sends its actual completed-proof message");
+                match message {
+                    MutatorMessage::ExecutionProofCompleted { completion, origin } => {
+                        assert_origin(&origin, &attempt.gossip_id);
+                        self.mutator
+                            .handle_completed_execution_proof(completion, origin);
+                    }
+                    _ => panic!("expected worker-produced ExecutionProofCompleted"),
+                }
+                let response = self.receive_p2p(expected_outcome, &attempt.gossip_id);
+                assert_observation(&response.store, expected_attempts, stored);
+                response
+            }
+
+            fn apply_retirement_topology(&mut self, topology: &RetirementTopology) {
+                {
+                    let store = self.mutator.store_mut();
+                    drop(
+                        store
+                            .apply_tick(Tick::start_of_slot(16))
+                            .expect("public Store tick reaches C"),
+                    );
+                    drop(
+                        store
+                            .apply_block(topology.c_link.clone())
+                            .expect("public Store applies C"),
+                    );
+                    store.insert_checkpoint_state(topology.c2, topology.c2_state.clone_arc());
+                }
+                {
+                    let store = self.mutator.store_mut();
+                    drop(
+                        store
+                            .apply_tick(Tick::start_of_slot(24))
+                            .expect("public Store tick reaches E"),
+                    );
+                    drop(
+                        store
+                            .apply_block(topology.e_link.clone())
+                            .expect("public Store applies E"),
+                    );
+                    store.insert_checkpoint_state(topology.e3, topology.e3_state.clone_arc());
+                }
+                {
+                    let store = self.mutator.store_mut();
+                    drop(
+                        store
+                            .apply_tick(Tick::start_of_slot(32))
+                            .expect("public Store tick reaches D"),
+                    );
+                    drop(
+                        store
+                            .apply_block(topology.d_link.clone())
+                            .expect("public Store applies D"),
+                    );
+                }
+                self.mutator.update_store_snapshot();
+
+                let store = self.store_snapshot.load_full();
+                assert_eq!(store.last_finalized().block_root, topology.c_root);
+                assert_eq!(store.finalized_checkpoint(), topology.c2);
+                assert_eq!(store.head().block_root, topology.d_root);
+                let retained: HashSet<_> = store
+                    .unfinalized_canonical_chain()
+                    .map(|link| link.block_root)
+                    .collect();
+                assert!(retained.contains(&topology.e_root));
+                assert!(retained.contains(&topology.d_root));
+                assert!(!retained.contains(&self.anchor.block_root));
+                assert!(!retained.contains(&topology.c_root));
+                assert!(!store.is_payload_verified(topology.c_root));
+                assert!(!store.is_payload_verified(topology.e_root));
+                assert!(!store.is_payload_verified(topology.d_root));
+                assert_eq!(
+                    StoreObservation::capture(&store),
+                    StoreObservation::capture(&self.mutator.store),
+                    "snapshot publication exposes the actual live Mutator Store",
+                );
+            }
+
+            fn assert_retired_admission_and_handler(
+                &mut self,
+                probes: RetiredProbePair,
+                attempts: &InFlightAttempts,
+            ) {
+                let expected_attempts = attempts.expected();
+                let stored = attempts.resident();
+                let before_live = StoreObservation::capture(&self.mutator.store);
+                let before_published = StoreObservation::capture(&self.store_snapshot.load_full());
+                assert_eq!(before_live, before_published);
+                let count_before = self.engine.invocation_count();
+
+                let MutatorMessage::ExecutionProofPrepared { result, origin, .. } =
+                    probes.diagnostic_message
+                else {
+                    panic!("diagnostic probe came from actual authenticated preparation");
+                };
+                assert_origin(&origin, &probes.diagnostic_probe.gossip_id);
+                let prepared = match result
+                    .expect("diagnostic preparation uses the old accepted snapshot")
+                {
+                    ExecutionProofPreparation::Prepared(prepared) => prepared,
+                    ExecutionProofPreparation::Ignore(reason) => {
+                        panic!("fresh probe unexpectedly ignored before live admission: {reason}")
+                    }
+                };
+                assert!(matches!(
+                    self.mutator.store_mut().admit_execution_proof(prepared),
+                    ExecutionProofAdmission::Declined(ExecutionProofAdmissionDecline::Retired),
+                ));
+                assert_eq!(StoreObservation::capture(&self.mutator.store), before_live);
+                assert_eq!(
+                    StoreObservation::capture(&self.store_snapshot.load_full()),
+                    before_published,
+                );
+                assert_eq!(self.engine.invocation_count(), count_before);
+
+                let MutatorMessage::ExecutionProofPrepared {
+                    result,
+                    proof_engine,
+                    origin,
+                } = probes.handler_message
+                else {
+                    panic!("handler probe came from a separate actual preparation");
+                };
+                assert_origin(&origin, &probes.handler_probe.gossip_id);
+                self.mutator
+                    .handle_prepared_execution_proof(result, proof_engine, origin);
+                let response =
+                    self.receive_p2p(P2pOutcome::Ignore, &probes.handler_probe.gossip_id);
+                assert_observation(&response.store, &expected_attempts, stored);
+                assert_eq!(self.engine.invocation_count(), count_before);
+                assert_eq!(StoreObservation::capture(&self.mutator.store), before_live);
+            }
+        }
+
+        fn make_attempt_pair(
+            anchor: &AnchorFixture,
+            snapshot: &ControlStore,
+            occupied: bool,
+        ) -> (ProofAttempt, Option<ProofAttempt>) {
+            let attempt_a = build_proof_attempt(anchor, snapshot, 0, 0xa1, 0x21);
+            let attempt_b = occupied.then(|| build_proof_attempt(anchor, snapshot, 1, 0xb2, 0x22));
+            if let Some(attempt_b) = &attempt_b {
+                assert_ne!(attempt_a.envelope_root, attempt_b.envelope_root);
+                assert_ne!(attempt_a.validator_index, attempt_b.validator_index);
+                assert_eq!(
+                    attempt_a.execution_proof.public_input,
+                    attempt_b.execution_proof.public_input
+                );
+            }
+            (attempt_a, attempt_b)
+        }
+
+        fn prepare_retired_probe_pair(
+            harness: &RetirementHarness,
+            anchor: &AnchorFixture,
+            accepted_snapshot: Arc<ControlStore>,
+        ) -> RetiredProbePair {
+            let diagnostic_probe = build_proof_attempt(anchor, &accepted_snapshot, 2, 0xc3, 0x34);
+            let handler_probe = build_proof_attempt(anchor, &accepted_snapshot, 2, 0xc3, 0x35);
+            assert_eq!(diagnostic_probe.envelope_root, handler_probe.envelope_root);
+            assert_eq!(diagnostic_probe.validator_index, 2);
+            assert_eq!(handler_probe.validator_index, 2);
+            assert_eq!(diagnostic_probe.proof_type, handler_probe.proof_type);
+            assert_eq!(
+                diagnostic_probe.execution_proof,
+                handler_probe.execution_proof
+            );
+            assert_eq!(
+                diagnostic_probe.signed_proof.as_ref(),
+                handler_probe.signed_proof.as_ref()
+            );
+            assert_ne!(
+                diagnostic_probe.gossip_id.source,
+                handler_probe.gossip_id.source
+            );
+            assert_ne!(
+                diagnostic_probe.gossip_id.message_id,
+                handler_probe.gossip_id.message_id,
+            );
+            assert_ne!(diagnostic_probe.envelope_root, H256::zero());
+            let diagnostic_message =
+                harness.prepare_detached(accepted_snapshot.clone_arc(), &diagnostic_probe);
+            let handler_message = harness.prepare_detached(accepted_snapshot, &handler_probe);
+            RetiredProbePair {
+                diagnostic_probe,
+                handler_probe,
+                diagnostic_message,
+                handler_message,
+            }
+        }
+
+        fn gate_initial_attempts(
+            harness: &mut RetirementHarness,
+            accepted_snapshot: Arc<ControlStore>,
+            attempts: &mut InFlightAttempts,
+        ) {
+            harness.releases.register(
+                &harness.engine,
+                AttemptId::A,
+                attempts.a.execution_proof.clone(),
+            );
+            harness.run_preparation(accepted_snapshot.clone_arc(), &attempts.a);
+            harness.observe_entry(AttemptId::A, &attempts.a, &[&attempts.a]);
+
+            if let Some(attempt_b) = &attempts.b {
+                harness.releases.register(
+                    &harness.engine,
+                    AttemptId::B,
+                    attempt_b.execution_proof.clone(),
+                );
+                harness.run_preparation(accepted_snapshot, attempt_b);
+                {
+                    let expected = attempts.expected();
+                    harness.observe_entry(AttemptId::B, attempt_b, &expected);
+                }
+                assert_eq!(harness.engine.invocation_count(), 2);
+                harness.releases.release(AttemptId::A, ProofVerdict::Valid);
+                let first_response = {
+                    let expected = attempts.expected();
+                    harness.receive_completion(
+                        &attempts.a,
+                        &expected,
+                        Some(&attempts.a),
+                        P2pOutcome::Accept,
+                    )
+                };
+                let original_arc = first_response
+                    .stored_envelope
+                    .expect("first actual Valid completion publishes the resident Arc");
+                assert_eq!(original_arc.as_ref(), &attempts.a.envelope);
+                attempts.original_resident_arc = Some(original_arc);
+            } else {
+                assert_eq!(harness.engine.invocation_count(), 1);
+            }
+        }
+
+        fn finish_retired_attempts(
+            harness: &mut RetirementHarness,
+            topology: &RetirementTopology,
+            attempts: &InFlightAttempts,
+            probes: RetiredProbePair,
+            verdict: ProofVerdict,
+        ) {
+            assert_eq!(
+                probes.diagnostic_probe.envelope.beacon_block_root,
+                attempts.a.envelope.beacon_block_root,
+            );
+            assert_eq!(probes.diagnostic_probe.proof_type, attempts.a.proof_type);
+            assert_ne!(
+                probes.diagnostic_probe.envelope_root,
+                attempts.a.envelope_root
+            );
+            assert_ne!(
+                probes.diagnostic_probe.validator_index,
+                attempts.a.validator_index
+            );
+            if let Some(attempt_b) = &attempts.b {
+                assert_eq!(
+                    probes.diagnostic_probe.envelope.beacon_block_root,
+                    attempt_b.envelope.beacon_block_root,
+                );
+                assert_eq!(probes.diagnostic_probe.proof_type, attempt_b.proof_type);
+                assert_ne!(
+                    probes.diagnostic_probe.envelope_root,
+                    attempt_b.envelope_root
+                );
+                assert_ne!(
+                    probes.diagnostic_probe.validator_index,
+                    attempt_b.validator_index
+                );
+            }
+            assert_eq!(
+                harness.engine.invocation_count(),
+                if attempts.occupied() { 2 } else { 1 },
+            );
+
+            harness.apply_retirement_topology(topology);
+            let expected = attempts.expected();
+            let stored = attempts.resident();
+            assert_observation(
+                &StoreObservation::capture(&harness.mutator.store),
+                &expected,
+                stored,
+            );
+            harness.assert_retired_admission_and_handler(probes, attempts);
+
+            let (pending, pending_id) = attempts.pending();
+            harness.releases.release(pending_id, verdict);
+            let late_response =
+                harness.receive_completion(pending, &expected, stored, P2pOutcome::Ignore);
+            if let Some(original_arc) = &attempts.original_resident_arc {
+                let retained_arc = late_response
+                    .stored_envelope
+                    .as_ref()
+                    .expect("late completion observes the original resident Arc");
+                assert!(Arc::ptr_eq(original_arc, retained_arc));
+                assert_eq!(retained_arc.as_ref(), &attempts.a.envelope);
+            } else {
+                assert_eq!(late_response.stored_envelope, None);
+            }
+            assert_eq!(
+                harness.engine.invocation_count(),
+                if attempts.occupied() { 2 } else { 1 },
+            );
+            assert_eq!(
+                StoreObservation::capture(&harness.store_snapshot.load_full()),
+                expected_store(&expected, stored),
+            );
+        }
+
+        fn run_retired_late_completion(verdict: ProofVerdict, occupied: bool) {
+            let mut harness = RetirementHarness::new();
+            // Build and assert all C/E/D state, root, payload and FFG inputs before gating workers.
+            let topology = RetirementTopology::build(&harness.anchor, &harness.pubkey_cache);
+            harness.accept_anchor_payload();
+            let accepted_snapshot = harness.store_snapshot.load_full();
+            let (a, b) = make_attempt_pair(&harness.anchor, &accepted_snapshot, occupied);
+            let mut attempts = InFlightAttempts {
+                a,
+                b,
+                original_resident_arc: None,
+            };
+            gate_initial_attempts(&mut harness, accepted_snapshot.clone_arc(), &mut attempts);
+
+            // Both independent authentic preparations use the same fresh signed B/T/R input and
+            // the pre-transition snapshot; only their gossip identities differ.
+            let probes = prepare_retired_probe_pair(&harness, &harness.anchor, accepted_snapshot);
+            finish_retired_attempts(&mut harness, &topology, &attempts, probes, verdict);
+        }
+
+        #[test]
+        fn execution_proof_retired_late_valid_vacant() {
+            run_retired_late_completion(ProofVerdict::Valid, false);
+        }
+
+        #[test]
+        fn execution_proof_retired_late_invalid_vacant() {
+            run_retired_late_completion(ProofVerdict::Invalid, false);
+        }
+
+        #[test]
+        fn execution_proof_retired_late_undetermined_vacant() {
+            run_retired_late_completion(ProofVerdict::Undetermined, false);
+        }
+
+        #[test]
+        fn execution_proof_retired_late_valid_occupied() {
+            run_retired_late_completion(ProofVerdict::Valid, true);
+        }
+
+        #[test]
+        fn execution_proof_retired_late_invalid_occupied() {
+            run_retired_late_completion(ProofVerdict::Invalid, true);
+        }
+
+        #[test]
+        fn execution_proof_retired_late_undetermined_occupied() {
+            run_retired_late_completion(ProofVerdict::Undetermined, true);
+        }
+    }
 }

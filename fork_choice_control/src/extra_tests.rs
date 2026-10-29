@@ -4007,7 +4007,10 @@ mod execution_proof_tests {
     use crossbeam_utils::sync::WaitGroup;
     use eth2_libp2p::{GossipId, MessageId, PeerId};
     use execution_engine::MockExecutionEngine;
-    use fork_choice_store::{ExecutionProofOrigin, Storage, Store};
+    use fork_choice_store::{
+        ExecutionPayloadEnvelopeOrigin, ExecutionProofOrigin, ExecutionProofPreparation, Storage,
+        Store,
+    };
     use helper_functions::{
         accessors, misc,
         signing::{SignForSingleFork as _, SignForSingleForkAtSlot},
@@ -4021,7 +4024,8 @@ mod execution_proof_tests {
         deneb::primitives::KzgCommitment,
         eip8025::{
             containers::{
-                ExecutionProof, ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope,
+                ExecutionProof, ExecutionProofEnvelope, ProofData, PublicInput,
+                SignedExecutionProofEnvelope,
             },
             primitives::{MaxProofSize, get_supported_proof_types},
         },
@@ -4049,10 +4053,11 @@ mod execution_proof_tests {
     use crate::{
         controller::MutatorHandle,
         events::EventChannels,
-        messages::P2pMessage,
+        messages::{MutatorMessage, P2pMessage},
+        misc::ProcessingTimings,
         specialized::{TestController, TestExecutionEngine},
         storage::Storage as ControlStorage,
-        tasks::{ProcessExecutionProofTask, Run},
+        tasks::{ExecutionPayloadEnvelopeTask, ProcessExecutionProofTask, Run},
         unbounded_sink::UnboundedSink,
     };
 
@@ -4912,6 +4917,73 @@ mod execution_proof_tests {
         fn response(&self, attempt: &ProofAttempt, result: P2pResult) -> P2pObservation {
             receive_p2p_response(&self.p2p_receiver, result, &attempt.gossip_id, true)
         }
+
+        fn accept_payload_from_snapshot(
+            &self,
+            snapshot: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+            payload: &Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+            gossip_seed: u8,
+        ) -> P2pObservation {
+            let gossip_id = test_gossip_id(gossip_seed);
+            let seen_before_deadline = snapshot.slot() == payload.slot()
+                && snapshot.is_before_due_bps_deadline(snapshot.chain_config().payload_due_bps);
+
+            // Construct only at the call site, so each payload owns the current ordinary wait token.
+            ExecutionPayloadEnvelopeTask {
+                store_snapshot: snapshot,
+                mutator_tx: self.controller.owned_mutator_tx(),
+                execution_engine: self.controller.execution_engine().clone_arc(),
+                wait_group: self.controller.owned_wait_group(),
+                execution_payload_envelope: payload.clone_arc(),
+                origin: ExecutionPayloadEnvelopeOrigin::Gossip(gossip_id.clone()),
+                seen_before_deadline,
+                processing_timings: ProcessingTimings::new(),
+                metrics: None,
+                tracing_span: tracing::Span::none(),
+            }
+            .run();
+
+            // ACCEPT is sent before Store application/publication. This wait acknowledges the
+            // ordinary payload task and its mutator handling; it does not wait for proof workers.
+            self.controller.wait_for_tasks();
+            let response =
+                receive_p2p_response(&self.p2p_receiver, P2pResult::Accept, &gossip_id, false);
+            let published = self.controller.store_snapshot();
+            assert!(published.is_payload_verified(payload.block_root()));
+            let selected = published
+                .cached_execution_payload_envelope_by_root(payload.block_root())
+                .expect("accepted payload is published before ordinary task wait returns");
+            assert_eq!(selected.as_ref(), payload.as_ref());
+            response
+        }
+
+        fn prepare_without_delivery(
+            &self,
+            snapshot: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+            attempt: &ProofAttempt,
+        ) -> MutatorMessage<Minimal, WaitGroup> {
+            let (mutator_tx, mutator_rx) = mpsc::channel();
+            ProcessExecutionProofTask {
+                store_snapshot: snapshot,
+                proof_engine: self.proof_engine.clone_arc(),
+                mutator_tx,
+                signed_proof: attempt.signed_proof.clone_arc(),
+                origin: ExecutionProofOrigin::Gossip(attempt.gossip_id.clone()),
+            }
+            .run();
+
+            let message = mutator_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("actual preparation task must return its prepared message");
+            assert!(matches!(
+                &message,
+                MutatorMessage::ExecutionProofPrepared {
+                    result: Ok(ExecutionProofPreparation::Prepared(_)),
+                    ..
+                }
+            ));
+            message
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -5613,5 +5685,325 @@ mod execution_proof_tests {
                 .expect("stale-prepared post-storage Ignore captures the stored Arc")
         ));
         assert_eq!(harness.engine.invocation_count(), 1);
+    }
+
+    struct ContextReplacementHarness {
+        fixture: ExecutionProofFixture,
+        harness: GatedHarness,
+        s0: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+        payload_b: Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+        s_a: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+        q_a: PublicInput,
+    }
+
+    fn payload_with_changed_gas_used(
+        fixture: &ExecutionProofFixture,
+    ) -> Arc<SignedExecutionPayloadEnvelope<Minimal>> {
+        let mut message = fixture.payload.message.clone();
+        let old_gas_used = message.payload.gas_used;
+        message.payload.gas_used = old_gas_used
+            .checked_add(1)
+            .expect("test payload gas_used should not overflow");
+        assert_ne!(message.payload.gas_used, old_gas_used);
+        assert!(message.payload.gas_used <= message.payload.gas_limit);
+
+        let replacement = Arc::new(SignedExecutionPayloadEnvelope {
+            signature: message
+                .sign(
+                    &fixture.config,
+                    fixture.state.as_ref(),
+                    &fixture.validator_keys[0],
+                )
+                .into(),
+            message,
+        });
+        assert_eq!(
+            replacement.message.payload.slot_number,
+            fixture.payload.message.payload.slot_number,
+        );
+        assert_eq!(
+            replacement.message.beacon_block_root,
+            fixture.payload.message.beacon_block_root,
+        );
+        assert_eq!(
+            replacement.message.builder_index,
+            fixture.payload.message.builder_index,
+        );
+        replacement
+    }
+
+    fn public_input_for_payload(
+        fixture: &ExecutionProofFixture,
+        store: &Store<Minimal, ControlStorage<Minimal>>,
+        payload: &SignedExecutionPayloadEnvelope<Minimal>,
+    ) -> PublicInput {
+        let envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("nonempty context probe proof bytes fit"),
+            proof_type: CONFIGURED_PROOF_TYPE,
+            beacon_block_root: fixture.block_root,
+        };
+        store
+            .get_execution_proof(fixture.state.as_ref(), &envelope, &payload.message)
+            .expect("published accepted payload binds against the target state")
+            .public_input
+    }
+
+    fn new_context_replacement_harness() -> ContextReplacementHarness {
+        let fixture = ExecutionProofFixture::new();
+        let harness = GatedHarness::new(&fixture, 2);
+        let s0 = harness.controller.owned_store_snapshot();
+        // Keep B as data only. Its actual task and wait token are created after A's ordinary wait.
+        let payload_b = payload_with_changed_gas_used(&fixture);
+
+        harness.accept_payload_from_snapshot(s0.clone_arc(), &fixture.payload, 0x71);
+        let s_a = harness.controller.owned_store_snapshot();
+        let selected_a = s_a
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("A's accepted payload is selected after its task wait");
+        assert_eq!(selected_a.as_ref(), fixture.payload.as_ref());
+        let q_a = public_input_for_payload(&fixture, &s_a, selected_a);
+
+        ContextReplacementHarness {
+            fixture,
+            harness,
+            s0,
+            payload_b,
+            s_a,
+            q_a,
+        }
+    }
+
+    fn publish_replacement_b(replacement: &ContextReplacementHarness) -> PublicInput {
+        replacement.harness.accept_payload_from_snapshot(
+            replacement.s0.clone_arc(),
+            &replacement.payload_b,
+            0x72,
+        );
+        let s_b = replacement.harness.controller.owned_store_snapshot();
+        let selected_b = s_b
+            .cached_execution_payload_envelope_by_root(replacement.fixture.block_root)
+            .expect("B's accepted payload is selected after its task wait");
+        assert_eq!(selected_b.as_ref(), replacement.payload_b.as_ref());
+        assert_eq!(selected_b.block_root(), replacement.fixture.block_root);
+        let q_b = public_input_for_payload(&replacement.fixture, &s_b, selected_b);
+        assert_ne!(
+            replacement.q_a, q_b,
+            "same target block must have a different complete PublicInput after gas_used changes"
+        );
+        q_b
+    }
+
+    fn admit_context_replacement_attempts(
+        replacement: &mut ContextReplacementHarness,
+        occupied: bool,
+    ) -> (ProofAttempt, Option<ProofAttempt>) {
+        let fixture = &replacement.fixture;
+        let harness = &mut replacement.harness;
+        let selected_a = replacement
+            .s_a
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("A payload remains selected while work is prepared");
+        let attempt_a = build_proof_attempt(
+            fixture,
+            &replacement.s_a,
+            selected_a,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x73,
+        );
+        assert_eq!(attempt_a.expected_input.public_input, replacement.q_a);
+
+        harness.register_gate(AttemptId::A, &attempt_a);
+        harness.submit_preparation(replacement.s_a.clone_arc(), &attempt_a);
+        harness.expect_entry(
+            AttemptId::A,
+            &attempt_a,
+            &expected_store_for(&[&attempt_a.expected], &[]),
+        );
+
+        let attempt_b = occupied.then(|| {
+            let attempt = build_proof_attempt(
+                fixture,
+                &replacement.s_a,
+                selected_a,
+                CONFIGURED_PROOF_TYPE,
+                1,
+                ProofEncoding::Matching(0xb2),
+                0x74,
+            );
+            assert_ne!(
+                attempt.expected.envelope_root,
+                attempt_a.expected.envelope_root
+            );
+            assert_ne!(
+                attempt.expected.validator_index,
+                attempt_a.expected.validator_index
+            );
+            assert_eq!(attempt.expected_input.public_input, replacement.q_a);
+
+            harness.register_gate(AttemptId::B, &attempt);
+            harness.submit_preparation(replacement.s_a.clone_arc(), &attempt);
+            harness.expect_entry(
+                AttemptId::B,
+                &attempt,
+                &expected_store_for(&[&attempt_a.expected, &attempt.expected], &[]),
+            );
+            attempt
+        });
+
+        (attempt_a, attempt_b)
+    }
+
+    fn finish_context_replacement_vacant(
+        replacement: &mut ContextReplacementHarness,
+        attempt: &ProofAttempt,
+        verdict: ProofVerdict,
+    ) {
+        assert_eq!(replacement.harness.engine.invocation_count(), 1);
+        let q_b = publish_replacement_b(replacement);
+        assert_ne!(replacement.q_a, q_b);
+        let harness = &mut replacement.harness;
+        let published = harness.controller.store_snapshot();
+        let selected_b = published
+            .cached_execution_payload_envelope_by_root(replacement.fixture.block_root)
+            .expect("replacement B is selected before the old proof is released");
+        assert_eq!(selected_b.as_ref(), replacement.payload_b.as_ref());
+
+        harness.releases.release(AttemptId::A, verdict);
+        let late_response = harness.response(attempt, P2pResult::Ignore);
+        assert_terminal_store(&late_response, &[&attempt.expected], &[], None);
+    }
+
+    fn finish_context_replacement_occupied(
+        replacement: &mut ContextReplacementHarness,
+        attempt_a: &ProofAttempt,
+        attempt_b: &ProofAttempt,
+        verdict: ProofVerdict,
+    ) {
+        let harness = &mut replacement.harness;
+        assert_eq!(harness.engine.invocation_count(), 2);
+
+        // The first real completion stores its Arc while the other verifier remains gated.
+        harness.releases.release(AttemptId::A, ProofVerdict::Valid);
+        let first_response = harness.response(attempt_a, P2pResult::Accept);
+        assert_terminal_store(
+            &first_response,
+            &[&attempt_a.expected, &attempt_b.expected],
+            &[&attempt_a.expected],
+            Some(&attempt_a.expected),
+        );
+        let original_arc = first_response
+            .stored_envelope_at_send
+            .as_ref()
+            .expect("first valid completion captures its actual resident Arc")
+            .clone_arc();
+
+        let q_b = publish_replacement_b(replacement);
+        let harness = &mut replacement.harness;
+        let published = harness.controller.store_snapshot();
+        let selected_b = published
+            .cached_execution_payload_envelope_by_root(replacement.fixture.block_root)
+            .expect("replacement B remains selected while old proof work is gated");
+        assert_eq!(attempt_b.expected_input.public_input, replacement.q_a);
+        assert_ne!(replacement.q_a, q_b);
+        assert_eq!(selected_b.as_ref(), replacement.payload_b.as_ref());
+
+        harness.releases.release(AttemptId::B, verdict);
+        let late_response = harness.response(attempt_b, P2pResult::Ignore);
+        assert_terminal_store(
+            &late_response,
+            &[&attempt_a.expected, &attempt_b.expected],
+            &[&attempt_a.expected],
+            Some(&attempt_a.expected),
+        );
+        let retained_arc = late_response
+            .stored_envelope_at_send
+            .as_ref()
+            .expect("stale occupied completion retains actual resident bytes")
+            .clone_arc();
+        assert!(Arc::ptr_eq(&original_arc, &retained_arc));
+        assert_eq!(retained_arc.as_ref(), &attempt_a.expected.envelope);
+    }
+
+    fn run_context_replacement_late_completion(verdict: ProofVerdict, occupied: bool) {
+        let mut replacement = new_context_replacement_harness();
+        let (attempt_a, attempt_b) = admit_context_replacement_attempts(&mut replacement, occupied);
+
+        if let Some(attempt_b) = attempt_b.as_ref() {
+            finish_context_replacement_occupied(&mut replacement, &attempt_a, attempt_b, verdict);
+        } else {
+            finish_context_replacement_vacant(&mut replacement, &attempt_a, verdict);
+        }
+
+        assert_eq!(
+            replacement.harness.engine.invocation_count(),
+            if occupied { 2 } else { 1 },
+            "late completion must use only the already-admitted verifier work"
+        );
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_before_admission_ignore() {
+        let replacement = new_context_replacement_harness();
+        let fixture = &replacement.fixture;
+        let selected_a = replacement
+            .s_a
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("A payload remains selected for genuine snapshot preparation");
+        let stale = build_proof_attempt(
+            fixture,
+            &replacement.s_a,
+            selected_a,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x75,
+        );
+        assert_eq!(stale.expected_input.public_input, replacement.q_a);
+        replacement.harness.register_response(&stale);
+        let prepared = replacement
+            .harness
+            .prepare_without_delivery(replacement.s_a.clone_arc(), &stale);
+        assert_eq!(replacement.harness.engine.invocation_count(), 0);
+
+        let q_b = publish_replacement_b(&replacement);
+        assert_ne!(replacement.q_a, q_b);
+        prepared.send(&replacement.harness.controller.owned_mutator_tx());
+
+        let response = replacement.harness.response(&stale, P2pResult::Ignore);
+        assert_terminal_store(&response, &[], &[], None);
+        assert_eq!(replacement.harness.engine.invocation_count(), 0);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_valid_vacant() {
+        run_context_replacement_late_completion(ProofVerdict::Valid, false);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_invalid_vacant() {
+        run_context_replacement_late_completion(ProofVerdict::Invalid, false);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_undetermined_vacant() {
+        run_context_replacement_late_completion(ProofVerdict::Undetermined, false);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_valid_occupied() {
+        run_context_replacement_late_completion(ProofVerdict::Valid, true);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_invalid_occupied() {
+        run_context_replacement_late_completion(ProofVerdict::Invalid, true);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_undetermined_occupied() {
+        run_context_replacement_late_completion(ProofVerdict::Undetermined, true);
     }
 }
