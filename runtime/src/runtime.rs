@@ -72,7 +72,7 @@ use p2p::{
     SubnetService,
 };
 use prometheus_client::registry::Registry;
-use proof_engine::{ConstructionError, NullProofEngine, ProofEngine};
+use proof_engine::{ConstructionError, ProofEngine};
 use pubkey_cache::PubkeyCache;
 use reqwest::{Client, ClientBuilder, redirect::Policy};
 use scc::HashMap as SccHashMap;
@@ -219,9 +219,7 @@ async fn build_local_node<P: Preset>(
                 builder_config,
                 ..
             },
-        // TODO(feature/eip8025): Pass to `Controller::new` once P1 adds its `proof_engine`
-        //                        parameter (design 0011, Hand-off to P1).
-        proof_engine: _proof_engine,
+        proof_engine,
         pubkey_cache,
         client,
         eth1_config,
@@ -402,7 +400,7 @@ async fn build_local_node<P: Preset>(
         current_tick,
         event_channels.clone_arc(),
         execution_engine.clone_arc(),
-        Arc::new(NullProofEngine),
+        proof_engine,
         metrics.clone(),
         fork_choice_to_attestation_verifier_tx,
         fork_choice_to_p2p_tx,

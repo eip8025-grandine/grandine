@@ -237,6 +237,22 @@ mod tests {
         ));
     }
 
+    // The mock check refuses the first entry before the duplicate is seen.
+    #[test]
+    fn duplicate_mock_on_mainnet_is_refused_as_mock() {
+        let error = build_proof_engine(
+            &ChainConfig::mainnet(),
+            &[(1, BackendSpec::ZkboostMock), (1, BackendSpec::ZkboostMock)],
+        )
+        .err()
+        .expect("mock should be refused on mainnet");
+
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ConstructionError::MockOnMainnet { proof_type: 1 }),
+        ));
+    }
+
     #[cfg(feature = "execution-proof-sp1")]
     #[test]
     fn non_canonical_verifying_key_is_refused() {
