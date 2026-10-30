@@ -205,7 +205,7 @@ async fn build_local_node<P: Preset>(
                 checkpoint_sync_url,
                 force_checkpoint_sync,
                 back_sync_enabled,
-                network_config,
+                mut network_config,
                 storage_config,
                 store_config,
                 reconstruction_delay,
@@ -231,6 +231,9 @@ async fn build_local_node<P: Preset>(
         restart_tx,
         restart_rx,
     } = config;
+
+    // Read the gossip policy while the engine is still borrowed rather than moved.
+    let enable_execution_proof = !proof_engine.is_null();
 
     let state_load_strategy = if force_checkpoint_sync {
         StateLoadStrategy::Remote {
@@ -678,6 +681,11 @@ async fn build_local_node<P: Preset>(
     // and the metrics server to convert collected metrics to an HTTP response for Prometheus.
     let gossip_registry = Registry::default();
     let mut metrics_registry = network_config.metrics_enabled.then_some(gossip_registry);
+    network_config.enable_execution_proof = enable_execution_proof;
+    tracing::debug!(
+        enable_execution_proof = network_config.enable_execution_proof,
+        "configured execution-proof gossip",
+    );
     let network_config = Arc::new(network_config);
 
     if let Some(metrics) = metrics.as_ref()
