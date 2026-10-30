@@ -94,6 +94,9 @@ embed = []
 
 logger-always-write-style = []
 
+# Real verification of SP1 execution proofs for `--execution-proof-type TYPE=sp1:VK`.
+execution-proof-sp1 = ['proof_engine/sp1']
+
 # `preset-any` and `network-any` should not be passed to Cargo.
 # They only exist to avoid duplicating lists of features.
 preset-any = []

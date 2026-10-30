@@ -72,7 +72,7 @@ use p2p::{
     SubnetService,
 };
 use prometheus_client::registry::Registry;
-use proof_engine::NullProofEngine;
+use proof_engine::{ConstructionError, ProofEngine};
 use pubkey_cache::PubkeyCache;
 use reqwest::{Client, ClientBuilder, redirect::Policy};
 use scc::HashMap as SccHashMap;
@@ -109,7 +109,7 @@ use validator_statistics::ValidatorStatistics;
 
 use crate::{
     commands::{GrandineCommand, InterchangeCommand},
-    db_info, db_stats,
+    db_info, db_stats, execution_proofs,
     grandine_args::GrandineArgs,
     grandine_config::{BeaconNodeConfig, GrandineConfig, Mode, ValidatorClientConfig},
     initialize_schema,
@@ -129,6 +129,7 @@ use tokio::signal::unix::SignalKind;
 /// What one run builds the built-in beacon node from.
 struct LocalNodeConfig<P: Preset> {
     beacon_node: BeaconNodeConfig,
+    proof_engine: Arc<dyn ProofEngine>,
     pubkey_cache: Arc<PubkeyCache>,
     client: Client,
     eth1_config: Arc<Eth1Config>,
@@ -218,6 +219,7 @@ async fn build_local_node<P: Preset>(
                 builder_config,
                 ..
             },
+        proof_engine,
         pubkey_cache,
         client,
         eth1_config,
@@ -398,7 +400,7 @@ async fn build_local_node<P: Preset>(
         current_tick,
         event_channels.clone_arc(),
         execution_engine.clone_arc(),
-        Arc::new(NullProofEngine),
+        proof_engine,
         metrics.clone(),
         fork_choice_to_attestation_verifier_tx,
         fork_choice_to_p2p_tx,
@@ -1248,10 +1250,12 @@ impl Context {
                         db_size_modifier = db_size_modifier.saturating_mul(2);
                     }
 
+                    // A misconfigured proof engine would be refused again on every restart.
                     if matches!(
                         error.downcast_ref::<doppelganger_protection::Error>(),
                         Some(&doppelganger_protection::Error::DoppelgangersDetected { .. })
                     ) || error.downcast_ref::<ValidatorStartupError>().is_some()
+                        || error.downcast_ref::<ConstructionError>().is_some()
                     {
                         break Err(error);
                     }
@@ -1352,7 +1356,7 @@ impl Context {
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_beacon_node<P: Preset>(
     config: &GrandineConfig,
     client: Client,
@@ -1452,6 +1456,12 @@ async fn run_beacon_node<P: Preset>(
         .inspect_err(|error| error!("error occurred while executing command: {error:?}"));
     }
 
+    // Built before the anchor, so a misconfiguration is reported before any slow startup work.
+    let proof_engine = execution_proofs::build_proof_engine(
+        &config.chain_config,
+        &beacon_node.execution_proof_backends,
+    )?;
+
     let anchor_checkpoint_provider = load_anchor_checkpoint_provider().await?;
     let genesis = anchor_genesis(&config.chain_config, &anchor_checkpoint_provider);
 
@@ -1460,6 +1470,7 @@ async fn run_beacon_node<P: Preset>(
     let (chain, services) = build_local_node(
         LocalNodeConfig {
             beacon_node,
+            proof_engine,
             pubkey_cache,
             client,
             eth1_config,
@@ -2295,4 +2306,126 @@ fn remove_database_dir(path: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, io::Write as _, sync::mpsc, thread};
+
+    use grandine_version::APPLICATION_NAME;
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    #[test]
+    fn mock_on_mainnet_stops_startup() {
+        let error = startup_error([
+            "--network",
+            "mainnet",
+            "--in-memory",
+            "--execution-proof-type",
+            "1=mock",
+        ]);
+
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ConstructionError::MockOnMainnet { proof_type: 1 }),
+        ));
+    }
+
+    #[test]
+    fn duplicate_proof_type_stops_startup() {
+        let error = startup_error([
+            "--network",
+            "sepolia",
+            "--in-memory",
+            "--execution-proof-type",
+            "1=mock",
+            "--execution-proof-type",
+            "1=mock",
+        ]);
+
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ConstructionError::DuplicateProofType { proof_type: 1 }),
+        ));
+    }
+
+    // With no genesis state, loading the anchor waits for deposits on an execution layer that
+    // does not exist. Only building the engine first lets startup stop.
+    #[test]
+    fn mock_on_custom_chain_id_1_stops_startup_before_anchor() {
+        let mut configuration_file =
+            NamedTempFile::new().expect("creating a named temporary file should succeed");
+
+        writeln!(configuration_file, "DEPOSIT_CHAIN_ID: 1")
+            .expect("writing the configuration file should succeed");
+
+        let configuration_file = configuration_file
+            .path()
+            .to_str()
+            .expect("temporary file path should be a valid UTF-8 string");
+
+        let error = startup_error([
+            "--network",
+            "custom",
+            "--configuration-file",
+            configuration_file,
+            "--eth1-rpc-urls",
+            "http://localhost:8545",
+            "--in-memory",
+            "--execution-proof-type",
+            "1=mock",
+        ]);
+
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(ConstructionError::MockOnMainnet { proof_type: 1 }),
+        ));
+    }
+
+    /// Starts a node as [`run`] does, through [`Context::run_with_restart`], and returns the
+    /// error that stops it.
+    fn startup_error<'a>(arguments: impl IntoIterator<Item = &'a str>) -> anyhow::Error {
+        let args = core::iter::once(APPLICATION_NAME)
+            .chain(arguments)
+            .map(OsString::from);
+
+        let config = GrandineArgs::parse_and_merge_args_file(args)
+            .and_then(GrandineArgs::try_into_config)
+            .expect("arguments should be valid");
+
+        let client = Client::new();
+
+        let signer = Arc::new(Signer::new(
+            core::iter::empty(),
+            client.clone(),
+            Web3SignerConfig::default(),
+            config.metrics_config.metrics.clone(),
+        ));
+
+        let validator_definitions = Arc::new(ValidatorDefinitionsWithStorage::new(
+            Arc::new(RwLock::new(ValidatorDefinitions::default())),
+            DefinitionsStorage::InMemory,
+        ));
+
+        let context = Context {
+            validator_config: Arc::new(config.validator_config(validator_definitions)),
+            config,
+            client,
+            eth1_auth: Arc::default(),
+            signer,
+            tracing_handle: None,
+        };
+
+        let (result_tx, result_rx) = mpsc::channel();
+
+        // Detached, so a node that keeps restarting fails the test instead of hanging it.
+        thread::spawn(move || result_tx.send(context.run_with_restart::<Mainnet>()));
+
+        result_rx
+            .recv_timeout(Duration::from_mins(1))
+            .expect("startup should stop instead of restarting or waiting")
+            .expect_err("startup should fail")
+    }
 }

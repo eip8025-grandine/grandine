@@ -23,6 +23,7 @@ mod config_dir;
 mod db_info;
 pub mod db_stats;
 mod defaults;
+mod execution_proofs;
 pub mod grandine_args;
 pub mod grandine_config;
 mod misc;

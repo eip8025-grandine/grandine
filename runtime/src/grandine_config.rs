@@ -14,6 +14,7 @@ use keymanager::{
     ValidatorDefinitionsWithStorage,
 };
 use p2p::NetworkConfig;
+use proof_engine::BackendSpec;
 use signer::Web3SignerConfig;
 use slasher::SlasherConfig;
 use ssz::Uint256;
@@ -21,6 +22,7 @@ use tracing::info;
 use types::{
     bellatrix::primitives::Gas,
     config::Config as ChainConfig,
+    eip8025::primitives::ProofType,
     nonstandard::{CustodyMode, PublishedDuty},
     phase0::primitives::{ExecutionAddress, ExecutionBlockNumber, Gwei, H256, Slot},
     redacting_url::RedactingUrl,
@@ -113,6 +115,8 @@ pub struct BeaconNodeConfig {
     pub backfill_custody_groups: bool,
     pub custody_mode: CustodyMode,
     pub builder_config: Option<BuilderConfig>,
+    /// One backend per execution proof type. Empty unless the node opts in to verification.
+    pub execution_proof_backends: Vec<(ProofType, BackendSpec)>,
 }
 
 /// What only a running validator client needs; `bn` has none.
