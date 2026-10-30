@@ -13,10 +13,11 @@ use fork_choice_store::{
     AttesterSlashingOrigin, BlobSidecarAction, BlobSidecarOrigin, BlockAction, BlockOrigin,
     ChainLink, DataColumnSidecarAction, DataColumnSidecarOrigin, ExecutionPayloadBidAction,
     ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeOrigin,
-    ExecutionPayloadEnvelopeValidationAction, ExecutionProofAction, ExecutionProofOrigin,
-    ProposerPreferencesAction, ProposerPreferencesOrigin,
+    ExecutionPayloadEnvelopeValidationAction, ExecutionProofCompletion, ExecutionProofOrigin,
+    ExecutionProofPreparation, ProposerPreferencesAction, ProposerPreferencesOrigin,
 };
 use logging::debug_with_peers;
+use proof_engine::ProofEngine;
 use serde::Serialize;
 use tracing::Span;
 use types::{
@@ -26,6 +27,7 @@ use types::{
     deneb::containers::BlobIdentifier,
     fulu::{containers::DataColumnIdentifier, primitives::ColumnIndex},
     gloas::containers::{PayloadAttestationMessage, PayloadEnvelopeIdentifier},
+    nonstandard::ValidationOutcomeWithReason,
     phase0::{
         containers::Checkpoint,
         primitives::{ExecutionBlockHash, H256, Slot, ValidatorIndex},
@@ -180,8 +182,17 @@ pub enum MutatorMessage<P: Preset, W> {
         result: Result<ExecutionPayloadBidAction<P>>,
         origin: ExecutionPayloadBidOrigin,
     },
+    ExecutionProofPrepared {
+        result: Result<ExecutionProofPreparation>,
+        proof_engine: Arc<dyn ProofEngine>,
+        origin: ExecutionProofOrigin,
+    },
+    ExecutionProofCompleted {
+        completion: ExecutionProofCompletion,
+        origin: ExecutionProofOrigin,
+    },
     ExecutionProof {
-        result: Result<ExecutionProofAction>,
+        result: Result<ValidationOutcomeWithReason>,
         origin: ExecutionProofOrigin,
     },
     PayloadAttestation {

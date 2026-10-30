@@ -8,6 +8,7 @@ use execution_engine::{ExecutionEngine, NullExecutionEngine};
 use fork_choice_store::StoreConfig;
 use futures::sink::Drain;
 use prometheus_metrics::Metrics;
+use proof_engine::{NullProofEngine, ProofEngine};
 use pubkey_cache::PubkeyCache;
 use scc::HashMap as SccHashMap;
 use std_ext::ArcExt as _;
@@ -104,6 +105,7 @@ where
         anchor_state: Arc<BeaconState<P>>,
         database: Database,
         execution_engine: E,
+        proof_engine: Arc<dyn ProofEngine>,
         metrics: Option<Arc<Metrics>>,
         p2p_tx: impl UnboundedSink<P2pMessage<P>>,
         event_channels: Arc<EventChannels<P>>,
@@ -132,6 +134,7 @@ where
             tick,
             event_channels,
             execution_engine,
+            proof_engine,
             metrics,
             futures::sink::drain(),
             p2p_tx,
@@ -168,6 +171,7 @@ impl<P: Preset> AdHocBenchController<P> {
             anchor_state,
             database,
             NullExecutionEngine,
+            Arc::new(NullProofEngine),
             None,
             p2p_tx,
             Arc::new(EventChannels::default()),
@@ -193,6 +197,7 @@ impl<P: Preset> BenchController<P> {
             anchor_state,
             Database::in_memory(),
             NullExecutionEngine,
+            Arc::new(NullProofEngine),
             None,
             futures::sink::drain(),
             Arc::new(EventChannels::default()),
@@ -241,6 +246,37 @@ impl<P: Preset> TestController<P> {
             anchor_state,
             Database::in_memory(),
             execution_engine,
+            Arc::new(NullProofEngine),
+            None,
+            p2p_tx,
+            event_channels,
+            thread_pool_size,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn with_p2p_tx_and_proof_engine(
+        chain_config: Arc<ChainConfig>,
+        pubkey_cache: Arc<PubkeyCache>,
+        anchor_block: Arc<SignedBeaconBlock<P>>,
+        anchor_state: Arc<BeaconState<P>>,
+        execution_engine: TestExecutionEngine<P>,
+        proof_engine: Arc<dyn ProofEngine>,
+        p2p_tx: impl UnboundedSink<P2pMessage<P>>,
+        event_channels: Arc<EventChannels<P>>,
+        thread_pool_size: Option<usize>,
+    ) -> (Arc<Self>, MutatorHandle<P, WaitGroup>) {
+        let store_config = StoreConfig::aggressive(&chain_config);
+
+        Self::new_internal(
+            chain_config,
+            pubkey_cache,
+            store_config,
+            anchor_block,
+            anchor_state,
+            Database::in_memory(),
+            execution_engine,
+            proof_engine,
             None,
             p2p_tx,
             event_channels,

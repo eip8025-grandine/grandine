@@ -4162,6 +4162,8 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         )
     }
 
+    /// Validates and submits the payload normally; captures optional proof context only when
+    /// requested by Control's verifier policy. Disabling capture does not disable payload validation.
     #[instrument(level = "debug", skip_all)]
     pub fn validate_execution_payload_envelope(
         &self,
@@ -4169,6 +4171,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         origin: &ExecutionPayloadEnvelopeOrigin,
         execution_engine: &(impl ExecutionEngine<P> + Send),
         _verifier: impl Verifier + Send,
+        capture_proof_context: bool,
     ) -> Result<ExecutionPayloadEnvelopeValidationAction<P>> {
         let block_root = envelope.block_root();
         let chain_link = self.chain_link(block_root);
@@ -4204,7 +4207,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
                 block_info,
                 state_fn,
                 execution_engine,
-                true,
+                capture_proof_context,
             )?;
 
         Ok(match action {
@@ -5359,7 +5362,7 @@ impl<P: Preset, S: Storage<P>> Store<P, S> {
         }
 
         // Any selection without paired evidence revokes old authority, including an
-        // equivalent payload replacement whose fresh best-effort capture failed.
+        // equivalent payload replacement whose fresh capture failed or was disabled.
         self.execution_proof_contexts.remove(&beacon_block_root);
     }
 

@@ -30,6 +30,7 @@ use operation_pools::{
     AttestationAggPool, BlsToExecutionChangePool, PayloadAttestationAggPool, SyncCommitteeAggPool,
 };
 use p2p::{NetworkConfig, SubnetService, SyncToApi};
+use proof_engine::NullProofEngine;
 use pubkey_cache::PubkeyCache;
 use reqwest::Client;
 use scc::HashMap as SccHashMap;
@@ -193,6 +194,7 @@ impl<P: Preset> Context<P> {
             tick,
             event_channels.clone_arc(),
             execution_engine.clone_arc(),
+            Arc::new(NullProofEngine),
             None,
             fc_to_attestation_verifier_tx,
             fc_to_p2p_tx,

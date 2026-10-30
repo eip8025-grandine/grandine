@@ -3742,20 +3742,25 @@ fn run_execution_payload_control_case(
     commitment_count: usize,
     execution_valid: bool,
     use_api: bool,
-) -> ExecutionPayloadControlObservations {
+    proof_engine: Arc<dyn proof_engine::ProofEngine>,
+) -> (ExecutionPayloadControlObservations, bool) {
     use std::sync::{Arc, Mutex};
 
     use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
     use eth2_libp2p::GossipId;
     use execution_engine::MockExecutionEngine;
     use futures::{StreamExt as _, channel::mpsc};
-    use helper_functions::{misc, signing::SignForSingleFork as _};
+    use helper_functions::{
+        misc,
+        signing::{SignForSingleFork as _, SignForSingleForkAtSlot},
+    };
     use pubkey_cache::PubkeyCache;
     use ssz::{Hc, ProgressiveList, SszHash as _, SszList as _};
     use std_ext::ArcExt as _;
     use types::{
         config::Config,
         deneb::primitives::KzgCommitment,
+        eip8025::containers::{ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope},
         gloas::{
             beacon_state::BeaconState as GloasBeaconState,
             consts::BUILDER_INDEX_SELF_BUILD,
@@ -3859,6 +3864,23 @@ fn run_execution_payload_control_case(
         signature: envelope_message.sign(&config, &state, &key).into(),
         message: envelope_message,
     });
+    let proof_message = ExecutionProofEnvelope {
+        proof_data: ProofData::try_from(vec![0x42]).expect("non-empty proof bytes fit"),
+        proof_type: 1,
+        beacon_block_root: block_root,
+    };
+    let proof = SignedExecutionProofEnvelope {
+        signature: SignForSingleForkAtSlot::<Minimal>::sign(
+            &proof_message,
+            &config,
+            &state,
+            state.slot(),
+            &key,
+        )
+        .into(),
+        message: Hc::from(proof_message),
+        validator_index: 0,
+    };
     let block = Arc::new(types::combined::SignedBeaconBlock::<Minimal>::from(block));
     let state = Arc::new(state);
 
@@ -3872,12 +3894,13 @@ fn run_execution_payload_control_case(
         false,
         None,
     )));
-    let (controller, _mutator_handle) = TestController::with_p2p_tx(
+    let (controller, _mutator_handle) = TestController::with_p2p_tx_and_proof_engine(
         config,
         Arc::new(PubkeyCache::default()),
         block,
         state,
         execution_engine,
+        proof_engine,
         p2p_tx,
         event_channels.clone_arc(),
         Some(1),
@@ -3926,24 +3949,50 @@ fn run_execution_payload_control_case(
         Ok(Event::ExecutionPayload(event)) if event.block_root == block_root
     );
 
-    ExecutionPayloadControlObservations {
-        gossip_accept,
-        gossip_reject,
-        api_accept,
-        accepted_marker,
-        selected_envelope,
-        available_event,
-        gossip_event,
-        payload_event,
-    }
+    // Preparation checks the live full-Q evidence without entering a proof engine or consuming
+    // Seen. The healthy enabled case makes this a positive as well as a negative capture check.
+    let proof_context_available = match fork_choice_store::prepare_execution_proof(&store, &proof) {
+        Ok(fork_choice_store::ExecutionProofPreparation::Prepared(_)) => true,
+        Ok(fork_choice_store::ExecutionProofPreparation::Ignore(_)) => false,
+        Err(error) => {
+            assert!(
+                commitment_count > 4096,
+                "healthy fixture must prepare: {error:#}"
+            );
+            false
+        }
+    };
+    assert!(store.execution_proof_roots().is_empty());
+    assert!(store.execution_proof_provers().is_empty());
+    (
+        ExecutionPayloadControlObservations {
+            gossip_accept,
+            gossip_reject,
+            api_accept,
+            accepted_marker,
+            selected_envelope,
+            available_event,
+            gossip_event,
+            payload_event,
+        },
+        proof_context_available,
+    )
 }
 
 #[test]
 fn execution_payload_some_none_and_submission_failure_preserve_control_observables() {
     // The selected binding type accepts at most 4096 versioned hashes. The ordinary mock EL
     // accepts both submissions; the over-limit case forces only post-notification capture to None.
-    let some = run_execution_payload_control_case(2, true, false);
-    let none = run_execution_payload_control_case(4097, true, false);
+    use proof_engine::{MockProofEngine, NullProofEngine, ProofEngine, ProofVerdict};
+    use std_ext::ArcExt as _;
+
+    let enabled: Arc<dyn ProofEngine> = Arc::new(MockProofEngine::new(ProofVerdict::Undetermined));
+    let (some, some_context) =
+        run_execution_payload_control_case(2, true, false, enabled.clone_arc());
+    let (none, none_context) =
+        run_execution_payload_control_case(4097, true, false, enabled.clone_arc());
+    assert!(some_context);
+    assert!(!none_context);
     assert_eq!(some, none);
     assert_eq!(
         some,
@@ -3959,8 +4008,11 @@ fn execution_payload_some_none_and_submission_failure_preserve_control_observabl
         }
     );
 
-    let api = run_execution_payload_control_case(2, true, true);
-    let api_none = run_execution_payload_control_case(4097, true, true);
+    let (api, api_context) = run_execution_payload_control_case(2, true, true, enabled.clone_arc());
+    let (api_none, api_none_context) =
+        run_execution_payload_control_case(4097, true, true, enabled.clone_arc());
+    assert!(api_context);
+    assert!(!api_none_context);
     assert_eq!(api, api_none);
     assert_eq!(
         api,
@@ -3976,7 +4028,22 @@ fn execution_payload_some_none_and_submission_failure_preserve_control_observabl
         }
     );
 
-    let failed = run_execution_payload_control_case(2, false, false);
+    for (use_api, expected) in [(false, &some), (true, &api)] {
+        let (disabled, context) =
+            run_execution_payload_control_case(2, true, use_api, Arc::new(NullProofEngine));
+        assert_eq!(&disabled, expected);
+        assert!(
+            !context,
+            "Null must skip proof context without changing payload outcomes"
+        );
+    }
+
+    let (failed, failed_context) = run_execution_payload_control_case(2, false, false, enabled);
+    let (disabled_failed, disabled_failed_context) =
+        run_execution_payload_control_case(2, false, false, Arc::new(NullProofEngine));
+    assert!(!failed_context);
+    assert!(!disabled_failed_context);
+    assert_eq!(failed, disabled_failed);
     assert_eq!(
         failed,
         ExecutionPayloadControlObservations {
@@ -3990,4 +4057,2021 @@ fn execution_payload_some_none_and_submission_failure_preserve_control_observabl
             payload_event: false,
         }
     );
+}
+
+#[cfg(test)]
+mod execution_proof_tests {
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex, Weak, mpsc},
+    };
+
+    use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
+    use crossbeam_utils::sync::WaitGroup;
+    use eth2_libp2p::{GossipId, MessageId, PeerId};
+    use execution_engine::MockExecutionEngine;
+    use fork_choice_store::{
+        ExecutionPayloadEnvelopeOrigin, ExecutionProofOrigin, ExecutionProofPreparation, Storage,
+        Store,
+    };
+    use helper_functions::{
+        accessors, misc,
+        signing::{SignForSingleFork as _, SignForSingleForkAtSlot},
+    };
+    use proof_engine::{BackendSpec, ProofEngine, ProofVerdict, ZkvmProofEngine};
+    use pubkey_cache::PubkeyCache;
+    use ssz::{ByteList, Hc, ProgressiveList, Ssz, SszHash as _, SszList as _, SszWrite as _};
+    use std_ext::ArcExt;
+    use types::{
+        config::Config,
+        deneb::primitives::KzgCommitment,
+        eip8025::{
+            containers::{
+                ExecutionProof, ExecutionProofEnvelope, ProofData, PublicInput,
+                SignedExecutionProofEnvelope,
+            },
+            primitives::{MaxProofSize, get_supported_proof_types},
+        },
+        gloas::{
+            beacon_state::BeaconState as GloasBeaconState,
+            consts::BUILDER_INDEX_SELF_BUILD,
+            containers::{
+                BeaconBlock as GloasBeaconBlock, BeaconBlockBody as GloasBeaconBlockBody,
+                ExecutionPayload as GloasExecutionPayload, ExecutionPayloadBid,
+                ExecutionPayloadEnvelope, ExecutionRequests,
+                SignedBeaconBlock as GloasSignedBeaconBlock, SignedExecutionPayloadBid,
+                SignedExecutionPayloadEnvelope,
+            },
+        },
+        nonstandard::Phase,
+        phase0::{
+            consts::FAR_FUTURE_EPOCH,
+            containers::{BeaconBlockHeader, Validator},
+            primitives::{ExecutionBlockHash, H256},
+        },
+        preset::{Minimal, Preset},
+        traits::BeaconState as _,
+    };
+
+    use crate::{
+        controller::MutatorHandle,
+        events::EventChannels,
+        messages::{MutatorMessage, P2pMessage},
+        misc::ProcessingTimings,
+        specialized::{TestController, TestExecutionEngine},
+        storage::Storage as ControlStorage,
+        tasks::{ExecutionPayloadEnvelopeTask, ProcessExecutionProofTask, Run},
+        unbounded_sink::UnboundedSink,
+    };
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    const CONFIGURED_PROOF_TYPE: u8 = 1;
+    const SUPPORTED_UNCONFIGURED_PROOF_TYPE: u8 = 2;
+    const TEST_VALIDATOR_INDEX: u64 = 0;
+
+    #[derive(Ssz)]
+    #[ssz(derive_hash = false)]
+    struct ZkboostMockProofForTest {
+        public_values: ByteList<MaxProofSize>,
+        proof: ByteList<MaxProofSize>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    struct StoreObservation {
+        seen_roots: HashMap<H256, HashSet<H256>>,
+        seen_provers: HashSet<(H256, u8, u64)>,
+        execution_proofs: HashMap<H256, HashMap<u8, ExecutionProofEnvelope>>,
+    }
+
+    impl StoreObservation {
+        fn capture<P: Preset, S: Storage<P>>(store: &Store<P, S>) -> Self {
+            Self {
+                seen_roots: store
+                    .execution_proof_roots()
+                    .iter()
+                    .map(|(root, roots)| (*root, roots.iter().copied().collect()))
+                    .collect(),
+                seen_provers: store.execution_proof_provers().iter().copied().collect(),
+                execution_proofs: store
+                    .execution_proofs()
+                    .iter()
+                    .map(|(root, proofs)| {
+                        (
+                            *root,
+                            proofs
+                                .iter()
+                                .map(|(proof_type, envelope)| {
+                                    (*proof_type, envelope.as_ref().clone())
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    type ControllerSlot = Arc<Mutex<Option<Weak<TestController<Minimal>>>>>;
+    type ExpectedProofSlot = Arc<Mutex<HashMap<(PeerId, MessageId), (H256, u8)>>>;
+
+    struct ExecutionProofFixture {
+        config: Arc<Config>,
+        validator_keys: [SecretKey; 2],
+        anchor_block: Arc<types::combined::SignedBeaconBlock<Minimal>>,
+        state: Arc<types::combined::BeaconState<Minimal>>,
+        payload: Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+        block_root: H256,
+    }
+
+    impl ExecutionProofFixture {
+        fn new() -> Self {
+            let mut chain_config = Config::minimal().start_and_stay_in(Phase::Gloas);
+            chain_config.deposit_chain_id = 1337;
+            let config = Arc::new(chain_config);
+            let validator_keys = [test_validator_key(1), test_validator_key(2)];
+            let execution_requests = ExecutionRequests::<Minimal>::default();
+            let mut bid = ExecutionPayloadBid::<Minimal> {
+                block_hash: ExecutionBlockHash::repeat_byte(0x44),
+                prev_randao: H256::repeat_byte(0x55),
+                gas_limit: 30_000_000,
+                builder_index: BUILDER_INDEX_SELF_BUILD,
+                execution_requests_root: execution_requests.hash_tree_root(),
+                ..Default::default()
+            };
+            bid.blob_kzg_commitments = ProgressiveList::try_from(vec![
+                KzgCommitment::repeat_byte(0x66),
+                KzgCommitment::repeat_byte(0x66),
+            ])
+            .expect("fixture commitments fit the progressive-list container");
+            let body = GloasBeaconBlockBody::<Minimal> {
+                signed_execution_payload_bid: SignedExecutionPayloadBid {
+                    message: bid.clone(),
+                    signature: <_>::default(),
+                },
+                ..Default::default()
+            };
+            let state = types::combined::BeaconState::from(GloasBeaconState::<Minimal> {
+                genesis_time: config.min_genesis_time,
+                validators: validator_keys
+                    .iter()
+                    .map(|key| Validator {
+                        pubkey: key.to_public_key().into(),
+                        activation_epoch: 0,
+                        exit_epoch: FAR_FUTURE_EPOCH,
+                        ..Default::default()
+                    })
+                    .collect(),
+                latest_block_header: BeaconBlockHeader {
+                    body_root: body.hash_tree_root(),
+                    ..Default::default()
+                },
+                latest_execution_payload_bid: bid.clone(),
+                ..Default::default()
+            });
+            let anchor_block = GloasSignedBeaconBlock {
+                message: Hc::from(GloasBeaconBlock {
+                    state_root: state.hash_tree_root(),
+                    body,
+                    ..Default::default()
+                }),
+                signature: <_>::default(),
+            };
+            let block_root = anchor_block.message.hash_tree_root();
+            assert_eq!(accessors::latest_block_root(&state), block_root);
+            let timestamp = misc::compute_timestamp_at_slot(&config, &state, state.slot())
+                .expect("fixture timestamp should be computable");
+            let post_gloas_state = state.post_gloas().expect("fixture state is Gloas");
+            let payload_message = ExecutionPayloadEnvelope {
+                payload: GloasExecutionPayload {
+                    parent_hash: post_gloas_state.latest_block_hash(),
+                    prev_randao: bid.prev_randao,
+                    gas_limit: bid.gas_limit,
+                    timestamp,
+                    withdrawals: ProgressiveList::try_from(
+                        post_gloas_state
+                            .payload_expected_withdrawals()
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("expected withdrawals fit in the payload progressive list"),
+                    block_hash: bid.block_hash,
+                    slot_number: state.slot(),
+                    ..Default::default()
+                },
+                execution_requests,
+                builder_index: bid.builder_index,
+                beacon_block_root: block_root,
+                parent_beacon_block_root: state.latest_block_header().parent_root,
+            };
+            let payload = Arc::new(SignedExecutionPayloadEnvelope {
+                signature: payload_message
+                    .sign(&config, &state, &validator_keys[0])
+                    .into(),
+                message: payload_message,
+            });
+
+            Self {
+                config,
+                validator_keys,
+                anchor_block: Arc::new(types::combined::SignedBeaconBlock::<Minimal>::from(
+                    anchor_block,
+                )),
+                state: Arc::new(state),
+                payload,
+                block_root,
+            }
+        }
+    }
+
+    fn test_validator_key(scalar: u8) -> SecretKey {
+        let mut key_bytes = SecretKeyBytes::default();
+        key_bytes.as_mut()[31] = scalar;
+        key_bytes
+            .try_into()
+            .expect("nonzero small scalar is a valid test key")
+    }
+
+    struct ExpectedProof {
+        block_root: H256,
+        envelope_root: H256,
+        proof_type: u8,
+        validator_index: u64,
+        envelope: ExecutionProofEnvelope,
+        gossip_source: PeerId,
+        gossip_message_id: MessageId,
+    }
+
+    enum EngineEvent {
+        Entered {
+            invocation: usize,
+            execution_proof: Box<ExecutionProof>,
+            published_store: Option<Box<StoreObservation>>,
+        },
+        Returned {
+            invocation: usize,
+            verdict: ProofVerdict,
+        },
+    }
+
+    struct ObservingProofEngine {
+        concrete: ZkvmProofEngine,
+        controller: ControllerSlot,
+        events: mpsc::SyncSender<EngineEvent>,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl ProofEngine for ObservingProofEngine {
+        fn is_null(&self) -> bool {
+            self.concrete.is_null()
+        }
+
+        fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> ProofVerdict {
+            let invocation = self
+                .invocations
+                .fetch_add(1, Ordering::SeqCst)
+                .checked_add(1)
+                .expect("test verifier invocation count should not overflow");
+            // Capture the published paired Seen state before announcing engine entry and before
+            // delegating. The wrapper never substitutes or changes the concrete verdict.
+            let published_store = capture_controller_observation(&self.controller).map(Box::new);
+            drop(self.events.send(EngineEvent::Entered {
+                invocation,
+                execution_proof: Box::new(execution_proof.clone()),
+                published_store,
+            }));
+
+            let verdict = self.concrete.verify_execution_proof(execution_proof);
+            drop(self.events.send(EngineEvent::Returned {
+                invocation,
+                verdict,
+            }));
+            verdict
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum AttemptId {
+        A,
+        B,
+    }
+
+    struct RegisteredGate {
+        id: AttemptId,
+        expected_input: Arc<ExecutionProof>,
+        release: mpsc::Receiver<ProofVerdict>,
+    }
+
+    #[derive(Debug)]
+    enum GatedEngineEvent {
+        Entered {
+            id: AttemptId,
+            execution_proof: Box<ExecutionProof>,
+            published_store: Option<Box<StoreObservation>>,
+        },
+        Unexpected {
+            execution_proof: Box<ExecutionProof>,
+        },
+    }
+
+    struct GatedProofEngine {
+        controller: ControllerSlot,
+        registered: Mutex<Vec<RegisteredGate>>,
+        events: mpsc::SyncSender<GatedEngineEvent>,
+        invocations: AtomicUsize,
+    }
+
+    impl GatedProofEngine {
+        fn new(controller: ControllerSlot, events: mpsc::SyncSender<GatedEngineEvent>) -> Self {
+            Self {
+                controller,
+                registered: Mutex::new(Vec::new()),
+                events,
+                invocations: AtomicUsize::new(0),
+            }
+        }
+
+        fn register(
+            &self,
+            id: AttemptId,
+            expected_input: Arc<ExecutionProof>,
+        ) -> mpsc::SyncSender<ProofVerdict> {
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let mut registered = self
+                .registered
+                .lock()
+                .expect("gated-engine registry mutex should not be poisoned");
+            assert!(
+                registered.iter().all(|gate| gate.id != id),
+                "attempt gate registered twice: {id:?}"
+            );
+            registered.push(RegisteredGate {
+                id,
+                expected_input,
+                release: release_rx,
+            });
+            release_tx
+        }
+
+        fn cancel_unentered(&self, id: AttemptId) {
+            let mut registered = self
+                .registered
+                .lock()
+                .expect("gated-engine registry mutex should not be poisoned");
+            if let Some(index) = registered.iter().position(|gate| gate.id == id) {
+                drop(registered.remove(index));
+            }
+        }
+
+        fn invocation_count(&self) -> usize {
+            self.invocations.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ProofEngine for GatedProofEngine {
+        fn is_null(&self) -> bool {
+            false
+        }
+
+        fn verify_execution_proof(&self, execution_proof: ExecutionProof) -> ProofVerdict {
+            self.invocations
+                .fetch_add(1, Ordering::SeqCst)
+                .checked_add(1)
+                .expect("test verifier invocation count should not overflow");
+            let gate = {
+                let mut registered = self
+                    .registered
+                    .lock()
+                    .expect("gated-engine registry mutex should not be poisoned");
+                registered
+                    .iter()
+                    .position(|gate| gate.expected_input.as_ref() == &execution_proof)
+                    .map(|index| registered.remove(index))
+            };
+            let Some(gate) = gate else {
+                drop(self.events.send(GatedEngineEvent::Unexpected {
+                    execution_proof: Box::new(execution_proof),
+                }));
+                panic!("unregistered execution proof entered the scheduling fake");
+            };
+
+            // No registry or controller-slot lock is held across the gate wait. Publication is
+            // captured in this actual call before the entry event makes the attempt observable.
+            let published_store = capture_controller_observation(&self.controller).map(Box::new);
+            self.events
+                .send(GatedEngineEvent::Entered {
+                    id: gate.id,
+                    execution_proof: Box::new(execution_proof),
+                    published_store,
+                })
+                .expect("race test must keep its bounded engine-event receiver alive");
+            gate.release
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("race test must explicitly release each entered verifier attempt")
+        }
+    }
+
+    #[derive(Default)]
+    struct GateReleaseGuard {
+        releases: HashMap<AttemptId, mpsc::SyncSender<ProofVerdict>>,
+    }
+
+    impl GateReleaseGuard {
+        fn register(
+            &mut self,
+            engine: &GatedProofEngine,
+            id: AttemptId,
+            expected_input: Arc<ExecutionProof>,
+        ) {
+            let sender = engine.register(id, expected_input);
+            assert!(self.releases.insert(id, sender).is_none());
+        }
+
+        fn release(&mut self, id: AttemptId, verdict: ProofVerdict) {
+            self.releases
+                .remove(&id)
+                .expect("entered attempt should have an owned release sender")
+                .send(verdict)
+                .expect("entered verifier should still be waiting for its explicit verdict");
+        }
+
+        fn cancel_unentered(&mut self, engine: &GatedProofEngine, id: AttemptId) {
+            engine.cancel_unentered(id);
+            drop(self.releases.remove(&id));
+        }
+    }
+
+    impl Drop for GateReleaseGuard {
+        fn drop(&mut self) {
+            // Panic-path teardown only; this is not a timeout verdict or delivery guarantee.
+            for release in self.releases.drain().map(|(_, release)| release) {
+                let _ = release.try_send(ProofVerdict::Undetermined);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum P2pResult {
+        Accept,
+        Ignore,
+        Reject,
+        Other,
+    }
+
+    struct P2pObservation {
+        result: P2pResult,
+        gossip_identity: Option<(PeerId, MessageId)>,
+        is_proof_response: bool,
+        store_at_send: Option<StoreObservation>,
+        stored_envelope_at_send: Option<Arc<ExecutionProofEnvelope>>,
+    }
+
+    struct StoreCapture {
+        observation: StoreObservation,
+        stored_envelopes: HashMap<(H256, u8), Arc<ExecutionProofEnvelope>>,
+    }
+
+    impl StoreCapture {
+        fn capture<P: Preset, S: Storage<P>>(store: &Store<P, S>) -> Self {
+            Self {
+                observation: StoreObservation::capture(store),
+                stored_envelopes: store
+                    .execution_proofs()
+                    .iter()
+                    .flat_map(|(block_root, proofs)| {
+                        proofs.iter().map(move |(proof_type, envelope)| {
+                            ((*block_root, *proof_type), envelope.clone_arc())
+                        })
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ObservingP2pSink {
+        sender: mpsc::SyncSender<P2pObservation>,
+        controller: ControllerSlot,
+        expected_proof: ExpectedProofSlot,
+    }
+
+    impl UnboundedSink<P2pMessage<Minimal>> for ObservingP2pSink {
+        fn clone(&self) -> Self {
+            Clone::clone(self)
+        }
+
+        fn unbounded_send(&self, message: P2pMessage<Minimal>) -> Result<(), P2pMessage<Minimal>> {
+            let (result, gossip_identity) = match &message {
+                P2pMessage::Accept(gossip_id) => {
+                    (P2pResult::Accept, Some(gossip_identity(gossip_id)))
+                }
+                P2pMessage::Ignore(gossip_id) => {
+                    (P2pResult::Ignore, Some(gossip_identity(gossip_id)))
+                }
+                P2pMessage::IgnoreWithReason(gossip_id, _) => {
+                    (P2pResult::Ignore, gossip_id.as_ref().map(gossip_identity))
+                }
+                P2pMessage::Reject(gossip_id, _) => {
+                    (P2pResult::Reject, gossip_id.as_ref().map(gossip_identity))
+                }
+                _ => (P2pResult::Other, None),
+            };
+            let proof_storage_key = gossip_identity.as_ref().and_then(|identity| {
+                self.expected_proof
+                    .lock()
+                    .expect("expected-proof observer mutex should not be poisoned")
+                    .get(identity)
+                    .copied()
+            });
+            let is_proof_response = proof_storage_key.is_some();
+            // Observe publication synchronously at the actual proof terminal send, rather than
+            // looking at a later test-thread snapshot. The retained Arc is the actual Store value.
+            let capture = is_proof_response
+                .then(|| capture_controller_store(&self.controller))
+                .flatten();
+            let store_at_send = capture.as_ref().map(|capture| capture.observation.clone());
+            let stored_envelope_at_send = capture.and_then(|capture| {
+                let key = proof_storage_key.expect("proof response has a storage key");
+                capture.stored_envelopes.get(&key).map(ArcExt::clone_arc)
+            });
+
+            self.sender
+                .send(P2pObservation {
+                    result,
+                    gossip_identity,
+                    is_proof_response,
+                    store_at_send,
+                    stored_envelope_at_send,
+                })
+                .map_err(|_| message)
+        }
+    }
+
+    fn gossip_identity(gossip_id: &GossipId) -> (PeerId, MessageId) {
+        (gossip_id.source, gossip_id.message_id.clone())
+    }
+
+    fn capture_controller_observation(controller: &ControllerSlot) -> Option<StoreObservation> {
+        let controller = controller
+            .lock()
+            .expect("weak-controller observer mutex should not be poisoned")
+            .as_ref()?
+            .upgrade()?;
+        let store = controller.store_snapshot();
+        Some(StoreObservation::capture(&store))
+    }
+
+    fn capture_controller_store(controller: &ControllerSlot) -> Option<StoreCapture> {
+        let controller = controller
+            .lock()
+            .expect("weak-controller observer mutex should not be poisoned")
+            .as_ref()?
+            .upgrade()?;
+        let store = controller.store_snapshot();
+        Some(StoreCapture::capture(&store))
+    }
+
+    fn test_gossip_id(seed: u8) -> GossipId {
+        // A valid non-default sha2-256 multihash and non-empty message id make origin preservation
+        // observable without depending on random peer identity generation.
+        let mut peer_id_bytes = vec![0x12, 0x20];
+        peer_id_bytes.resize(34, seed);
+        GossipId {
+            source: PeerId::from_bytes(&peer_id_bytes).expect("test peer id should decode"),
+            message_id: MessageId::new(&[seed, 0xc2]),
+        }
+    }
+
+    fn assert_gossip_identity(actual: Option<&(PeerId, MessageId)>, expected: &GossipId) {
+        let (actual_source, actual_message_id) =
+            actual.expect("terminal response should preserve the submitted gossip identity");
+        assert_eq!(*actual_source, expected.source);
+        assert_eq!(actual_message_id, &expected.message_id);
+
+        let default = GossipId::default();
+        assert_ne!(*actual_source, default.source);
+        assert_ne!(actual_message_id, &default.message_id);
+    }
+
+    fn expected_store(expected: &ExpectedProof, include_proof: bool) -> StoreObservation {
+        StoreObservation {
+            seen_roots: HashMap::from([(
+                expected.block_root,
+                HashSet::from([expected.envelope_root]),
+            )]),
+            seen_provers: HashSet::from([(
+                expected.block_root,
+                expected.proof_type,
+                expected.validator_index,
+            )]),
+            execution_proofs: if include_proof {
+                HashMap::from([(
+                    expected.block_root,
+                    HashMap::from([(expected.proof_type, expected.envelope.clone())]),
+                )])
+            } else {
+                HashMap::new()
+            },
+        }
+    }
+
+    fn mock_proof_data(public_values: Vec<u8>, proof_byte: u8) -> ProofData {
+        let mock_proof = ZkboostMockProofForTest {
+            public_values: ByteList::try_from(public_values)
+                .expect("serialized public values should fit the mock wire field"),
+            proof: ByteList::try_from(vec![proof_byte])
+                .expect("one mock proof byte should fit the mock wire field"),
+        };
+        let encoded = mock_proof
+            .to_ssz()
+            .expect("test mirror of the mock wire shape should serialize");
+        ProofData::try_from(encoded).expect("encoded mock proof should fit ProofData")
+    }
+
+    fn expected_store_for(
+        attempts: &[&ExpectedProof],
+        stored: &[&ExpectedProof],
+    ) -> StoreObservation {
+        let mut observation = StoreObservation::default();
+        for attempt in attempts {
+            observation
+                .seen_roots
+                .entry(attempt.block_root)
+                .or_default()
+                .insert(attempt.envelope_root);
+            observation.seen_provers.insert((
+                attempt.block_root,
+                attempt.proof_type,
+                attempt.validator_index,
+            ));
+        }
+        for accepted in stored {
+            observation
+                .execution_proofs
+                .entry(accepted.block_root)
+                .or_default()
+                .insert(accepted.proof_type, accepted.envelope.clone());
+        }
+        observation
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProofEncoding {
+        Matching(u8),
+        Malformed,
+        Mismatched(u8),
+    }
+
+    struct ProofAttempt {
+        expected: ExpectedProof,
+        expected_input: Arc<ExecutionProof>,
+        signed_proof: Arc<SignedExecutionProofEnvelope>,
+        gossip_id: GossipId,
+    }
+
+    fn build_proof_attempt(
+        fixture: &ExecutionProofFixture,
+        store: &Store<Minimal, ControlStorage<Minimal>>,
+        selected_payload: &SignedExecutionPayloadEnvelope<Minimal>,
+        proof_type: u8,
+        validator_index: u64,
+        encoding: ProofEncoding,
+        gossip_seed: u8,
+    ) -> ProofAttempt {
+        assert!(get_supported_proof_types().contains(&proof_type));
+        let mut envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("non-empty placeholder proof data should fit"),
+            proof_type,
+            beacon_block_root: fixture.block_root,
+        };
+        let public_input = store
+            .get_execution_proof(fixture.state.as_ref(), &envelope, &selected_payload.message)
+            .expect("accepted payload and target state should bind")
+            .public_input;
+        assert!(public_input.successful_validation);
+        assert_eq!(public_input.chain_id, fixture.config.deposit_chain_id);
+        assert_eq!(public_input.chain_id, 1337);
+        let mut public_values = public_input
+            .to_ssz()
+            .expect("trusted public input should serialize");
+        assert_eq!(public_values.len(), 43);
+        match encoding {
+            ProofEncoding::Matching(proof_byte) => {
+                envelope.proof_data = mock_proof_data(public_values, proof_byte);
+            }
+            ProofEncoding::Malformed => {
+                // Non-empty, but too short to encode both mock SSZ variable-field offsets.
+                envelope.proof_data =
+                    ProofData::try_from(vec![0x42]).expect("malformed bytes still fit ProofData");
+            }
+            ProofEncoding::Mismatched(proof_byte) => {
+                public_values[0] ^= 1;
+                envelope.proof_data = mock_proof_data(public_values, proof_byte);
+            }
+        }
+
+        let validator_index_usize =
+            usize::try_from(validator_index).expect("validator index should fit this test host");
+        let validator_key = fixture
+            .validator_keys
+            .get(validator_index_usize)
+            .expect("selected signing validator exists in the accepted target state");
+        let signature = SignForSingleForkAtSlot::<Minimal>::sign(
+            &envelope,
+            &fixture.config,
+            fixture.state.as_ref(),
+            fixture.state.slot(),
+            validator_key,
+        )
+        .into();
+        let gossip_id = test_gossip_id(gossip_seed);
+        let envelope_root = envelope.hash_tree_root();
+        let expected = ExpectedProof {
+            block_root: fixture.block_root,
+            envelope_root,
+            proof_type,
+            validator_index,
+            envelope: envelope.clone(),
+            gossip_source: gossip_id.source,
+            gossip_message_id: gossip_id.message_id.clone(),
+        };
+        let expected_input = Arc::new(ExecutionProof {
+            proof_data: envelope.proof_data.clone(),
+            proof_type,
+            public_input,
+        });
+        let signed_proof = Arc::new(SignedExecutionProofEnvelope {
+            message: Hc::from(envelope),
+            validator_index,
+            signature,
+        });
+
+        ProofAttempt {
+            expected,
+            expected_input,
+            signed_proof,
+            gossip_id,
+        }
+    }
+
+    fn receive_p2p_response(
+        receiver: &mpsc::Receiver<P2pObservation>,
+        expected_result: P2pResult,
+        expected_gossip_id: &GossipId,
+        expected_is_proof_response: bool,
+    ) -> P2pObservation {
+        let observation = receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("timed out waiting for P2P validation response");
+        assert_eq!(observation.result, expected_result);
+        assert_gossip_identity(observation.gossip_identity.as_ref(), expected_gossip_id);
+        assert_eq!(observation.is_proof_response, expected_is_proof_response);
+        observation
+    }
+
+    fn register_expected_proof(expected: &ExpectedProofSlot, proof: &ExpectedProof) {
+        let identity = (proof.gossip_source, proof.gossip_message_id.clone());
+        let previous = expected
+            .lock()
+            .expect("expected-proof observer mutex should not be poisoned")
+            .insert(identity, (proof.block_root, proof.proof_type));
+        assert!(
+            previous.is_none(),
+            "gossip identity registered more than once"
+        );
+    }
+
+    struct GatedHarness {
+        controller: Arc<TestController<Minimal>>,
+        _mutator_handle: MutatorHandle<Minimal, WaitGroup>,
+        p2p_receiver: mpsc::Receiver<P2pObservation>,
+        expected_proofs: ExpectedProofSlot,
+        engine: Arc<GatedProofEngine>,
+        proof_engine: Arc<dyn ProofEngine>,
+        engine_receiver: mpsc::Receiver<GatedEngineEvent>,
+        releases: GateReleaseGuard,
+    }
+
+    impl Drop for GatedHarness {
+        fn drop(&mut self) {
+            // Release blocked verifier workers before the Controller/Mutator teardown fields drop.
+            drop(core::mem::take(&mut self.releases));
+        }
+    }
+
+    impl GatedHarness {
+        fn new(fixture: &ExecutionProofFixture, worker_count: usize) -> Self {
+            assert!(
+                worker_count >= 2,
+                "race harness needs at least two verifier workers"
+            );
+            let controller_slot: ControllerSlot = Arc::new(Mutex::new(None));
+            let expected_proofs: ExpectedProofSlot = Arc::new(Mutex::new(HashMap::new()));
+            let (p2p_sender, p2p_receiver) = mpsc::sync_channel(16);
+            let (engine_sender, engine_receiver) = mpsc::sync_channel(8);
+            let engine = Arc::new(GatedProofEngine::new(
+                controller_slot.clone_arc(),
+                engine_sender,
+            ));
+            let proof_engine: Arc<dyn ProofEngine> = engine.clone_arc();
+            let p2p_sink = ObservingP2pSink {
+                sender: p2p_sender,
+                controller: controller_slot.clone_arc(),
+                expected_proof: expected_proofs.clone_arc(),
+            };
+            let execution_engine: TestExecutionEngine<Minimal> =
+                Arc::new(Mutex::new(MockExecutionEngine::new(true, false, None)));
+            let (controller, mutator_handle) = TestController::with_p2p_tx_and_proof_engine(
+                fixture.config.clone_arc(),
+                Arc::new(PubkeyCache::default()),
+                fixture.anchor_block.clone_arc(),
+                fixture.state.clone_arc(),
+                execution_engine,
+                proof_engine.clone_arc(),
+                p2p_sink,
+                Arc::new(EventChannels::new(32)),
+                Some(worker_count),
+            );
+            *controller_slot
+                .lock()
+                .expect("weak-controller observer mutex should not be poisoned") =
+                Some(Arc::downgrade(&controller));
+
+            Self {
+                controller,
+                _mutator_handle: mutator_handle,
+                p2p_receiver,
+                expected_proofs,
+                engine,
+                proof_engine,
+                engine_receiver,
+                releases: GateReleaseGuard::default(),
+            }
+        }
+
+        fn accept_payload(&self, fixture: &ExecutionProofFixture, seed: u8) {
+            let gossip_id = test_gossip_id(seed);
+            self.controller
+                .on_gossip_execution_payload(fixture.payload.clone_arc(), gossip_id.clone());
+            // The only WaitGroup use in this harness is ordinary accepted-payload fixture setup.
+            self.controller.wait_for_tasks();
+            receive_p2p_response(&self.p2p_receiver, P2pResult::Accept, &gossip_id, false);
+
+            let store = self.controller.store_snapshot();
+            assert!(store.is_payload_verified(fixture.block_root));
+            let selected = store
+                .cached_execution_payload_envelope_by_root(fixture.block_root)
+                .expect("accepted payload envelope should remain selected");
+            assert_eq!(selected.as_ref(), fixture.payload.as_ref());
+        }
+
+        fn register_gate(&mut self, id: AttemptId, attempt: &ProofAttempt) {
+            register_expected_proof(&self.expected_proofs, &attempt.expected);
+            self.releases
+                .register(&self.engine, id, attempt.expected_input.clone_arc());
+        }
+
+        fn register_response(&self, attempt: &ProofAttempt) {
+            register_expected_proof(&self.expected_proofs, &attempt.expected);
+        }
+
+        fn submit_preparation(
+            &self,
+            snapshot: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+            attempt: &ProofAttempt,
+        ) {
+            ProcessExecutionProofTask {
+                store_snapshot: snapshot,
+                proof_engine: self.proof_engine.clone_arc(),
+                mutator_tx: self.controller.owned_mutator_tx(),
+                signed_proof: attempt.signed_proof.clone_arc(),
+                origin: ExecutionProofOrigin::Gossip(attempt.gossip_id.clone()),
+            }
+            .run();
+        }
+
+        fn expect_entry(
+            &self,
+            id: AttemptId,
+            attempt: &ProofAttempt,
+            expected_store: &StoreObservation,
+        ) {
+            match self
+                .engine_receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("timed out waiting for gated verifier entry")
+            {
+                GatedEngineEvent::Entered {
+                    id: actual_id,
+                    execution_proof,
+                    published_store,
+                } => {
+                    assert_eq!(actual_id, id);
+                    assert_eq!(execution_proof.as_ref(), attempt.expected_input.as_ref());
+                    assert_eq!(published_store.as_deref(), Some(expected_store));
+                }
+                GatedEngineEvent::Unexpected { execution_proof } => {
+                    panic!("unregistered verifier call entered: {execution_proof:?}");
+                }
+            }
+        }
+
+        fn response(&self, attempt: &ProofAttempt, result: P2pResult) -> P2pObservation {
+            receive_p2p_response(&self.p2p_receiver, result, &attempt.gossip_id, true)
+        }
+
+        fn accept_payload_from_snapshot(
+            &self,
+            snapshot: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+            payload: &Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+            gossip_seed: u8,
+        ) -> P2pObservation {
+            let gossip_id = test_gossip_id(gossip_seed);
+            let seen_before_deadline = snapshot.slot() == payload.slot()
+                && snapshot.is_before_due_bps_deadline(snapshot.chain_config().payload_due_bps);
+
+            // Construct only at the call site, so each payload owns the current ordinary wait token.
+            ExecutionPayloadEnvelopeTask {
+                store_snapshot: snapshot,
+                mutator_tx: self.controller.owned_mutator_tx(),
+                execution_engine: self.controller.execution_engine().clone_arc(),
+                capture_proof_context: true,
+                wait_group: self.controller.owned_wait_group(),
+                execution_payload_envelope: payload.clone_arc(),
+                origin: ExecutionPayloadEnvelopeOrigin::Gossip(gossip_id.clone()),
+                seen_before_deadline,
+                processing_timings: ProcessingTimings::new(),
+                metrics: None,
+                tracing_span: tracing::Span::none(),
+            }
+            .run();
+
+            // ACCEPT is sent before Store application/publication. This wait acknowledges the
+            // ordinary payload task and its mutator handling; it does not wait for proof workers.
+            self.controller.wait_for_tasks();
+            let response =
+                receive_p2p_response(&self.p2p_receiver, P2pResult::Accept, &gossip_id, false);
+            let published = self.controller.store_snapshot();
+            assert!(published.is_payload_verified(payload.block_root()));
+            let selected = published
+                .cached_execution_payload_envelope_by_root(payload.block_root())
+                .expect("accepted payload is published before ordinary task wait returns");
+            assert_eq!(selected.as_ref(), payload.as_ref());
+            response
+        }
+
+        fn prepare_without_delivery(
+            &self,
+            snapshot: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+            attempt: &ProofAttempt,
+        ) -> MutatorMessage<Minimal, WaitGroup> {
+            let (mutator_tx, mutator_rx) = mpsc::channel();
+            ProcessExecutionProofTask {
+                store_snapshot: snapshot,
+                proof_engine: self.proof_engine.clone_arc(),
+                mutator_tx,
+                signed_proof: attempt.signed_proof.clone_arc(),
+                origin: ExecutionProofOrigin::Gossip(attempt.gossip_id.clone()),
+            }
+            .run();
+
+            let message = mutator_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("actual preparation task must return its prepared message");
+            assert!(matches!(
+                &message,
+                MutatorMessage::ExecutionProofPrepared {
+                    result: Ok(ExecutionProofPreparation::Prepared(_)),
+                    ..
+                }
+            ));
+            message
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProofCase {
+        MatchingMock,
+        MalformedMock,
+        MismatchedPublicValues,
+        SupportedUnconfigured,
+    }
+
+    fn run_execution_proof_case(case: ProofCase) {
+        let fixture = ExecutionProofFixture::new();
+        let controller_slot: ControllerSlot = Arc::new(Mutex::new(None));
+        let expected_proofs: ExpectedProofSlot = Arc::new(Mutex::new(HashMap::new()));
+        let (p2p_sender, p2p_receiver) = mpsc::sync_channel(16);
+        let (engine_sender, engine_receiver) = mpsc::sync_channel(16);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let concrete_engine = ZkvmProofEngine::new(
+            &fixture.config,
+            [(CONFIGURED_PROOF_TYPE, BackendSpec::ZkboostMock)],
+        )
+        .expect("one configured zkBoost mock backend is valid on this non-mainnet chain");
+        let proof_engine: Arc<dyn ProofEngine> = Arc::new(ObservingProofEngine {
+            concrete: concrete_engine,
+            controller: controller_slot.clone_arc(),
+            events: engine_sender,
+            invocations: invocations.clone_arc(),
+        });
+        let p2p_sink = ObservingP2pSink {
+            sender: p2p_sender,
+            controller: controller_slot.clone_arc(),
+            expected_proof: expected_proofs.clone_arc(),
+        };
+        let execution_engine: TestExecutionEngine<Minimal> =
+            Arc::new(Mutex::new(MockExecutionEngine::new(true, false, None)));
+        let (controller, _mutator_handle) = TestController::with_p2p_tx_and_proof_engine(
+            fixture.config.clone_arc(),
+            Arc::new(PubkeyCache::default()),
+            fixture.anchor_block.clone_arc(),
+            fixture.state.clone_arc(),
+            execution_engine,
+            proof_engine,
+            p2p_sink,
+            Arc::new(EventChannels::new(32)),
+            Some(1),
+        );
+        *controller_slot
+            .lock()
+            .expect("weak-controller observer mutex should not be poisoned") =
+            Some(Arc::downgrade(&controller));
+
+        let payload_gossip_id = test_gossip_id(0x31);
+        controller
+            .on_gossip_execution_payload(fixture.payload.clone_arc(), payload_gossip_id.clone());
+        // This wait is for ordinary payload setup only. Proof completion below is observed through
+        // the engine/P2P channels and is deliberately not put in the wait group.
+        controller.wait_for_tasks();
+        receive_p2p_response(&p2p_receiver, P2pResult::Accept, &payload_gossip_id, false);
+
+        let accepted_store = controller.store_snapshot();
+        assert!(accepted_store.is_payload_verified(fixture.block_root));
+        let selected_payload = accepted_store
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("accepted payload envelope should remain selected");
+        assert_eq!(selected_payload.as_ref(), fixture.payload.as_ref());
+
+        let (proof_type, encoding) = match case {
+            ProofCase::MatchingMock => (CONFIGURED_PROOF_TYPE, ProofEncoding::Matching(0xa1)),
+            ProofCase::MalformedMock => (CONFIGURED_PROOF_TYPE, ProofEncoding::Malformed),
+            ProofCase::MismatchedPublicValues => {
+                (CONFIGURED_PROOF_TYPE, ProofEncoding::Mismatched(0xa2))
+            }
+            ProofCase::SupportedUnconfigured => (
+                SUPPORTED_UNCONFIGURED_PROOF_TYPE,
+                ProofEncoding::Matching(0xa1),
+            ),
+        };
+        let attempt = build_proof_attempt(
+            &fixture,
+            &accepted_store,
+            selected_payload,
+            proof_type,
+            TEST_VALIDATOR_INDEX,
+            encoding,
+            0x52,
+        );
+        register_expected_proof(&expected_proofs, &attempt.expected);
+
+        controller
+            .on_gossip_execution_proof(attempt.signed_proof.clone_arc(), attempt.gossip_id.clone());
+        let (invocation, actual_input, store_at_entry) = match engine_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("timed out waiting for concrete proof-engine entry")
+        {
+            EngineEvent::Entered {
+                invocation,
+                execution_proof,
+                published_store,
+            } => (
+                invocation,
+                execution_proof,
+                published_store.map(|store| *store),
+            ),
+            EngineEvent::Returned { .. } => {
+                panic!("proof engine returned before publishing its entry observation")
+            }
+        };
+        assert_eq!(invocation, 1, "fresh fixture should invoke one verifier");
+        assert_eq!(
+            actual_input.as_ref(),
+            attempt.expected_input.as_ref(),
+            "live service must bind exactly the accepted payload context"
+        );
+        assert_eq!(
+            store_at_entry,
+            Some(expected_store(&attempt.expected, false))
+        );
+
+        let actual_verdict = match engine_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("timed out waiting for concrete proof-engine verdict")
+        {
+            EngineEvent::Returned {
+                invocation: returned_invocation,
+                verdict,
+            } => {
+                assert_eq!(returned_invocation, invocation);
+                verdict
+            }
+            EngineEvent::Entered { .. } => {
+                panic!("unexpected additional proof-engine invocation in fresh fixture")
+            }
+        };
+        let (expected_verdict, expected_response, store_has_proof) = match case {
+            ProofCase::MatchingMock => (ProofVerdict::Valid, P2pResult::Accept, true),
+            ProofCase::MalformedMock | ProofCase::MismatchedPublicValues => {
+                (ProofVerdict::Invalid, P2pResult::Reject, false)
+            }
+            ProofCase::SupportedUnconfigured => {
+                (ProofVerdict::Undetermined, P2pResult::Ignore, false)
+            }
+        };
+        assert_eq!(actual_verdict, expected_verdict);
+
+        let response =
+            receive_p2p_response(&p2p_receiver, expected_response, &attempt.gossip_id, true);
+        assert_eq!(
+            response.store_at_send,
+            Some(expected_store(&attempt.expected, store_has_proof)),
+            "terminal P2P send must synchronously observe exact storage and paired Seen state"
+        );
+        match (store_has_proof, response.stored_envelope_at_send.as_ref()) {
+            (true, Some(stored)) => assert_eq!(stored.as_ref(), &attempt.expected.envelope),
+            (false, None) => {}
+            _ => panic!("terminal storage Arc must match the concrete verdict outcome"),
+        }
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn execution_proof_accepts_matching_zkboost_mock_for_accepted_payload() {
+        run_execution_proof_case(ProofCase::MatchingMock);
+    }
+
+    #[test]
+    fn execution_proof_rejects_nonempty_malformed_zkboost_mock() {
+        run_execution_proof_case(ProofCase::MalformedMock);
+    }
+
+    #[test]
+    fn execution_proof_rejects_mismatched_mock_public_values() {
+        run_execution_proof_case(ProofCase::MismatchedPublicValues);
+    }
+
+    #[test]
+    fn execution_proof_ignores_supported_unconfigured_type_two() {
+        run_execution_proof_case(ProofCase::SupportedUnconfigured);
+    }
+
+    fn new_race_harness() -> (ExecutionProofFixture, GatedHarness) {
+        let fixture = ExecutionProofFixture::new();
+        let harness = GatedHarness::new(&fixture, 2);
+        harness.accept_payload(&fixture, 0x31);
+        (fixture, harness)
+    }
+
+    fn assert_terminal_store(
+        response: &P2pObservation,
+        attempts: &[&ExpectedProof],
+        stored: &[&ExpectedProof],
+        expected_stored: Option<&ExpectedProof>,
+    ) {
+        assert_eq!(
+            response.store_at_send,
+            Some(expected_store_for(attempts, stored)),
+            "the actual terminal send must publish exact Seen and storage maps"
+        );
+        match (expected_stored, response.stored_envelope_at_send.as_ref()) {
+            (Some(expected), Some(actual)) => assert_eq!(actual.as_ref(), &expected.envelope),
+            (None, None) => {}
+            _ => panic!("terminal send captured an unexpected actual stored envelope Arc"),
+        }
+    }
+
+    fn p2p_result_for(verdict: ProofVerdict) -> P2pResult {
+        match verdict {
+            ProofVerdict::Valid => P2pResult::Accept,
+            ProofVerdict::Invalid => P2pResult::Reject,
+            ProofVerdict::Undetermined => P2pResult::Ignore,
+        }
+    }
+
+    #[test]
+    fn execution_proof_same_root_different_validators_uses_one_engine_entry() {
+        let (fixture, mut harness) = new_race_harness();
+        let snapshot = harness.controller.owned_store_snapshot();
+        let selected_payload = snapshot
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("accepted payload remains available");
+        let attempt_a = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x61,
+        );
+        let attempt_b = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            1,
+            ProofEncoding::Matching(0xa1),
+            0x62,
+        );
+        assert_eq!(
+            attempt_a.expected.envelope_root,
+            attempt_b.expected.envelope_root
+        );
+        assert_eq!(attempt_a.expected.envelope, attempt_b.expected.envelope);
+        assert_ne!(
+            attempt_a.expected.validator_index,
+            attempt_b.expected.validator_index
+        );
+        assert_eq!(attempt_a.expected_input, attempt_b.expected_input);
+
+        let before_b = expected_store_for(&[&attempt_a.expected], &[]);
+        harness.register_gate(AttemptId::A, &attempt_a);
+        harness.submit_preparation(snapshot.clone_arc(), &attempt_a);
+        harness.expect_entry(AttemptId::A, &attempt_a, &before_b);
+
+        harness.register_gate(AttemptId::B, &attempt_b);
+        harness.submit_preparation(snapshot, &attempt_b);
+        let response_b = harness.response(&attempt_b, P2pResult::Ignore);
+        assert_terminal_store(&response_b, &[&attempt_a.expected], &[], None);
+        assert_eq!(harness.engine.invocation_count(), 1);
+        harness
+            .releases
+            .cancel_unentered(&harness.engine, AttemptId::B);
+
+        harness.releases.release(AttemptId::A, ProofVerdict::Valid);
+        let response_a = harness.response(&attempt_a, P2pResult::Accept);
+        assert_terminal_store(
+            &response_a,
+            &[&attempt_a.expected],
+            &[&attempt_a.expected],
+            Some(&attempt_a.expected),
+        );
+        assert_eq!(harness.engine.invocation_count(), 1);
+    }
+
+    #[test]
+    fn execution_proof_same_prover_changed_root_uses_one_engine_entry() {
+        let (fixture, mut harness) = new_race_harness();
+        let snapshot = harness.controller.owned_store_snapshot();
+        let selected_payload = snapshot
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("accepted payload remains available");
+        let attempt_a = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x63,
+        );
+        let attempt_b = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xb2),
+            0x64,
+        );
+        assert_ne!(
+            attempt_a.expected.envelope_root,
+            attempt_b.expected.envelope_root
+        );
+        assert_eq!(
+            attempt_a.expected.validator_index,
+            attempt_b.expected.validator_index
+        );
+        assert_ne!(attempt_a.expected.envelope, attempt_b.expected.envelope);
+
+        let before_b = expected_store_for(&[&attempt_a.expected], &[]);
+        harness.register_gate(AttemptId::A, &attempt_a);
+        harness.submit_preparation(snapshot.clone_arc(), &attempt_a);
+        harness.expect_entry(AttemptId::A, &attempt_a, &before_b);
+
+        harness.register_gate(AttemptId::B, &attempt_b);
+        harness.submit_preparation(snapshot, &attempt_b);
+        let response_b = harness.response(&attempt_b, P2pResult::Ignore);
+        assert_terminal_store(&response_b, &[&attempt_a.expected], &[], None);
+        assert!(!response_b.store_at_send.as_ref().is_some_and(|store| {
+            store.seen_roots[&fixture.block_root].contains(&attempt_b.expected.envelope_root)
+        }));
+        assert_eq!(harness.engine.invocation_count(), 1);
+        harness
+            .releases
+            .cancel_unentered(&harness.engine, AttemptId::B);
+
+        harness.releases.release(AttemptId::A, ProofVerdict::Valid);
+        let response_a = harness.response(&attempt_a, P2pResult::Accept);
+        assert_terminal_store(
+            &response_a,
+            &[&attempt_a.expected],
+            &[&attempt_a.expected],
+            Some(&attempt_a.expected),
+        );
+        assert_eq!(harness.engine.invocation_count(), 1);
+    }
+
+    fn run_distinct_attempt_order(
+        first_verdict: ProofVerdict,
+        second_verdict: ProofVerdict,
+        first_is_b: bool,
+        scenario: &str,
+    ) {
+        let (fixture, mut harness) = new_race_harness();
+        let snapshot = harness.controller.owned_store_snapshot();
+        let selected_payload = snapshot
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("accepted payload remains available");
+        let attempt_a = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x65,
+        );
+        let attempt_b = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            1,
+            ProofEncoding::Matching(0xb2),
+            0x66,
+        );
+        assert_ne!(
+            attempt_a.expected.envelope_root,
+            attempt_b.expected.envelope_root
+        );
+        assert_ne!(
+            attempt_a.expected.validator_index,
+            attempt_b.expected.validator_index
+        );
+
+        let only_a = expected_store_for(&[&attempt_a.expected], &[]);
+        let both_seen = expected_store_for(&[&attempt_a.expected, &attempt_b.expected], &[]);
+        harness.register_gate(AttemptId::A, &attempt_a);
+        harness.submit_preparation(snapshot.clone_arc(), &attempt_a);
+        harness.expect_entry(AttemptId::A, &attempt_a, &only_a);
+
+        harness.register_gate(AttemptId::B, &attempt_b);
+        harness.submit_preparation(snapshot, &attempt_b);
+        harness.expect_entry(AttemptId::B, &attempt_b, &both_seen);
+        assert_eq!(harness.engine.invocation_count(), 2, "{scenario}");
+
+        let (first_id, first_attempt, first_verdict, second_id, second_attempt, second_verdict) =
+            if first_is_b {
+                (
+                    AttemptId::B,
+                    &attempt_b,
+                    first_verdict,
+                    AttemptId::A,
+                    &attempt_a,
+                    second_verdict,
+                )
+            } else {
+                (
+                    AttemptId::A,
+                    &attempt_a,
+                    first_verdict,
+                    AttemptId::B,
+                    &attempt_b,
+                    second_verdict,
+                )
+            };
+
+        harness.releases.release(first_id, first_verdict);
+        let first_stored =
+            (first_verdict == ProofVerdict::Valid).then_some(&first_attempt.expected);
+        let first_response = harness.response(first_attempt, p2p_result_for(first_verdict));
+        assert_terminal_store(
+            &first_response,
+            &[&attempt_a.expected, &attempt_b.expected],
+            first_stored.as_slice(),
+            first_stored,
+        );
+        let first_stored_arc = first_response.stored_envelope_at_send.as_ref();
+
+        harness.releases.release(second_id, second_verdict);
+        let final_stored = if first_verdict == ProofVerdict::Valid {
+            Some(&first_attempt.expected)
+        } else if second_verdict == ProofVerdict::Valid {
+            Some(&second_attempt.expected)
+        } else {
+            None
+        };
+        let second_result = if first_verdict == ProofVerdict::Valid {
+            P2pResult::Ignore
+        } else {
+            p2p_result_for(second_verdict)
+        };
+        let second_response = harness.response(second_attempt, second_result);
+        assert_terminal_store(
+            &second_response,
+            &[&attempt_a.expected, &attempt_b.expected],
+            final_stored.as_slice(),
+            final_stored,
+        );
+        if first_verdict == ProofVerdict::Valid {
+            let original = first_stored_arc
+                .expect("first Valid completion must capture its actual stored Arc");
+            let retained = second_response
+                .stored_envelope_at_send
+                .as_ref()
+                .expect("occupied-storage loser must observe the retained Arc");
+            assert!(Arc::ptr_eq(original, retained), "{scenario}");
+            assert_eq!(
+                original.as_ref(),
+                &first_attempt.expected.envelope,
+                "{scenario}"
+            );
+        } else if let Some(expected) = final_stored {
+            assert_eq!(
+                second_response
+                    .stored_envelope_at_send
+                    .as_ref()
+                    .expect("second Valid completion must capture its actual stored Arc")
+                    .as_ref(),
+                &expected.envelope,
+                "{scenario}"
+            );
+        }
+        assert_eq!(harness.engine.invocation_count(), 2, "{scenario}");
+    }
+
+    #[test]
+    fn execution_proof_valid_valid_a_then_b_first_writer() {
+        run_distinct_attempt_order(
+            ProofVerdict::Valid,
+            ProofVerdict::Valid,
+            false,
+            "Valid A then Valid B",
+        );
+    }
+
+    #[test]
+    fn execution_proof_valid_valid_b_then_a_first_writer() {
+        run_distinct_attempt_order(
+            ProofVerdict::Valid,
+            ProofVerdict::Valid,
+            true,
+            "Valid B then Valid A",
+        );
+    }
+
+    #[test]
+    fn execution_proof_valid_invalid_valid_then_invalid() {
+        run_distinct_attempt_order(
+            ProofVerdict::Valid,
+            ProofVerdict::Invalid,
+            false,
+            "Valid then Invalid",
+        );
+    }
+
+    #[test]
+    fn execution_proof_valid_invalid_invalid_then_valid() {
+        run_distinct_attempt_order(
+            ProofVerdict::Invalid,
+            ProofVerdict::Valid,
+            false,
+            "Invalid then Valid",
+        );
+    }
+
+    #[test]
+    fn execution_proof_valid_undetermined_valid_then_local_fault() {
+        run_distinct_attempt_order(
+            ProofVerdict::Valid,
+            ProofVerdict::Undetermined,
+            false,
+            "Valid then Undetermined",
+        );
+    }
+
+    #[test]
+    fn execution_proof_valid_undetermined_local_fault_then_valid() {
+        run_distinct_attempt_order(
+            ProofVerdict::Undetermined,
+            ProofVerdict::Valid,
+            false,
+            "Undetermined then Valid",
+        );
+    }
+
+    #[test]
+    fn execution_proof_distinct_supported_types_overlap() {
+        let (fixture, mut harness) = new_race_harness();
+        let snapshot = harness.controller.owned_store_snapshot();
+        let selected_payload = snapshot
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("accepted payload remains available");
+        let attempt_a = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x67,
+        );
+        let attempt_b = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            SUPPORTED_UNCONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xb2),
+            0x68,
+        );
+        assert!(get_supported_proof_types().contains(&attempt_a.expected.proof_type));
+        assert!(get_supported_proof_types().contains(&attempt_b.expected.proof_type));
+        assert_ne!(attempt_a.expected.proof_type, attempt_b.expected.proof_type);
+
+        harness.register_gate(AttemptId::A, &attempt_a);
+        harness.submit_preparation(snapshot.clone_arc(), &attempt_a);
+        harness.expect_entry(
+            AttemptId::A,
+            &attempt_a,
+            &expected_store_for(&[&attempt_a.expected], &[]),
+        );
+        harness.register_gate(AttemptId::B, &attempt_b);
+        harness.submit_preparation(snapshot, &attempt_b);
+        harness.expect_entry(
+            AttemptId::B,
+            &attempt_b,
+            &expected_store_for(&[&attempt_a.expected, &attempt_b.expected], &[]),
+        );
+        assert_eq!(harness.engine.invocation_count(), 2);
+
+        harness.releases.release(AttemptId::A, ProofVerdict::Valid);
+        let first = harness.response(&attempt_a, P2pResult::Accept);
+        assert_terminal_store(
+            &first,
+            &[&attempt_a.expected, &attempt_b.expected],
+            &[&attempt_a.expected],
+            Some(&attempt_a.expected),
+        );
+        let first_arc = first
+            .stored_envelope_at_send
+            .as_ref()
+            .expect("type one proof should be stored before its Accept");
+
+        harness.releases.release(AttemptId::B, ProofVerdict::Valid);
+        let second = harness.response(&attempt_b, P2pResult::Accept);
+        assert_terminal_store(
+            &second,
+            &[&attempt_a.expected, &attempt_b.expected],
+            &[&attempt_a.expected, &attempt_b.expected],
+            Some(&attempt_b.expected),
+        );
+        let current = harness.controller.store_snapshot();
+        let retained_type_one = current.execution_proofs()[&fixture.block_root]
+            .get(&CONFIGURED_PROOF_TYPE)
+            .expect("type one proof remains stored beside type two");
+        assert!(Arc::ptr_eq(first_arc, retained_type_one));
+        assert_eq!(harness.engine.invocation_count(), 2);
+    }
+
+    #[test]
+    fn execution_proof_post_storage_new_and_stale_arrivals_ignore() {
+        let (fixture, mut harness) = new_race_harness();
+        let snapshot = harness.controller.owned_store_snapshot();
+        let selected_payload = snapshot
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("accepted payload remains available");
+        let first = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x69,
+        );
+        let ordinary_arrival = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            1,
+            ProofEncoding::Matching(0xb2),
+            0x6a,
+        );
+        let stale_arrival = build_proof_attempt(
+            &fixture,
+            &snapshot,
+            selected_payload,
+            CONFIGURED_PROOF_TYPE,
+            1,
+            ProofEncoding::Matching(0xc3),
+            0x6b,
+        );
+        assert_ne!(
+            first.expected.envelope_root,
+            ordinary_arrival.expected.envelope_root
+        );
+        assert_ne!(
+            first.expected.envelope_root,
+            stale_arrival.expected.envelope_root
+        );
+        assert_eq!(ordinary_arrival.expected.validator_index, 1);
+        assert_eq!(stale_arrival.expected.validator_index, 1);
+
+        harness.register_gate(AttemptId::A, &first);
+        harness.submit_preparation(snapshot.clone_arc(), &first);
+        harness.expect_entry(
+            AttemptId::A,
+            &first,
+            &expected_store_for(&[&first.expected], &[]),
+        );
+        harness.releases.release(AttemptId::A, ProofVerdict::Valid);
+        let accepted = harness.response(&first, P2pResult::Accept);
+        assert_terminal_store(
+            &accepted,
+            &[&first.expected],
+            &[&first.expected],
+            Some(&first.expected),
+        );
+        let original_arc = accepted
+            .stored_envelope_at_send
+            .as_ref()
+            .expect("first Valid proof response captures the actual Store Arc");
+
+        harness.register_response(&ordinary_arrival);
+        harness.controller.on_gossip_execution_proof(
+            ordinary_arrival.signed_proof.clone_arc(),
+            ordinary_arrival.gossip_id.clone(),
+        );
+        let ordinary_response = harness.response(&ordinary_arrival, P2pResult::Ignore);
+        assert_terminal_store(
+            &ordinary_response,
+            &[&first.expected],
+            &[&first.expected],
+            Some(&first.expected),
+        );
+        assert!(Arc::ptr_eq(
+            original_arc,
+            ordinary_response
+                .stored_envelope_at_send
+                .as_ref()
+                .expect("ordinary post-storage Ignore captures the stored Arc")
+        ));
+
+        harness.register_response(&stale_arrival);
+        harness.submit_preparation(snapshot, &stale_arrival);
+        let stale_response = harness.response(&stale_arrival, P2pResult::Ignore);
+        assert_terminal_store(
+            &stale_response,
+            &[&first.expected],
+            &[&first.expected],
+            Some(&first.expected),
+        );
+        assert!(Arc::ptr_eq(
+            original_arc,
+            stale_response
+                .stored_envelope_at_send
+                .as_ref()
+                .expect("stale-prepared post-storage Ignore captures the stored Arc")
+        ));
+        assert_eq!(harness.engine.invocation_count(), 1);
+    }
+
+    struct ContextReplacementHarness {
+        fixture: ExecutionProofFixture,
+        harness: GatedHarness,
+        s0: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+        payload_b: Arc<SignedExecutionPayloadEnvelope<Minimal>>,
+        s_a: Arc<Store<Minimal, ControlStorage<Minimal>>>,
+        q_a: PublicInput,
+    }
+
+    fn payload_with_changed_gas_used(
+        fixture: &ExecutionProofFixture,
+    ) -> Arc<SignedExecutionPayloadEnvelope<Minimal>> {
+        let mut message = fixture.payload.message.clone();
+        let old_gas_used = message.payload.gas_used;
+        message.payload.gas_used = old_gas_used
+            .checked_add(1)
+            .expect("test payload gas_used should not overflow");
+        assert_ne!(message.payload.gas_used, old_gas_used);
+        assert!(message.payload.gas_used <= message.payload.gas_limit);
+
+        let replacement = Arc::new(SignedExecutionPayloadEnvelope {
+            signature: message
+                .sign(
+                    &fixture.config,
+                    fixture.state.as_ref(),
+                    &fixture.validator_keys[0],
+                )
+                .into(),
+            message,
+        });
+        assert_eq!(
+            replacement.message.payload.slot_number,
+            fixture.payload.message.payload.slot_number,
+        );
+        assert_eq!(
+            replacement.message.beacon_block_root,
+            fixture.payload.message.beacon_block_root,
+        );
+        assert_eq!(
+            replacement.message.builder_index,
+            fixture.payload.message.builder_index,
+        );
+        replacement
+    }
+
+    fn public_input_for_payload(
+        fixture: &ExecutionProofFixture,
+        store: &Store<Minimal, ControlStorage<Minimal>>,
+        payload: &SignedExecutionPayloadEnvelope<Minimal>,
+    ) -> PublicInput {
+        let envelope = ExecutionProofEnvelope {
+            proof_data: ProofData::try_from(vec![0x42])
+                .expect("nonempty context probe proof bytes fit"),
+            proof_type: CONFIGURED_PROOF_TYPE,
+            beacon_block_root: fixture.block_root,
+        };
+        store
+            .get_execution_proof(fixture.state.as_ref(), &envelope, &payload.message)
+            .expect("published accepted payload binds against the target state")
+            .public_input
+    }
+
+    fn new_context_replacement_harness() -> ContextReplacementHarness {
+        let fixture = ExecutionProofFixture::new();
+        let harness = GatedHarness::new(&fixture, 2);
+        let s0 = harness.controller.owned_store_snapshot();
+        // Keep B as data only. Its actual task and wait token are created after A's ordinary wait.
+        let payload_b = payload_with_changed_gas_used(&fixture);
+
+        harness.accept_payload_from_snapshot(s0.clone_arc(), &fixture.payload, 0x71);
+        let s_a = harness.controller.owned_store_snapshot();
+        let selected_a = s_a
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("A's accepted payload is selected after its task wait");
+        assert_eq!(selected_a.as_ref(), fixture.payload.as_ref());
+        let q_a = public_input_for_payload(&fixture, &s_a, selected_a);
+
+        ContextReplacementHarness {
+            fixture,
+            harness,
+            s0,
+            payload_b,
+            s_a,
+            q_a,
+        }
+    }
+
+    fn publish_replacement_b(replacement: &ContextReplacementHarness) -> PublicInput {
+        replacement.harness.accept_payload_from_snapshot(
+            replacement.s0.clone_arc(),
+            &replacement.payload_b,
+            0x72,
+        );
+        let s_b = replacement.harness.controller.owned_store_snapshot();
+        let selected_b = s_b
+            .cached_execution_payload_envelope_by_root(replacement.fixture.block_root)
+            .expect("B's accepted payload is selected after its task wait");
+        assert_eq!(selected_b.as_ref(), replacement.payload_b.as_ref());
+        assert_eq!(selected_b.block_root(), replacement.fixture.block_root);
+        let q_b = public_input_for_payload(&replacement.fixture, &s_b, selected_b);
+        assert_ne!(
+            replacement.q_a, q_b,
+            "same target block must have a different complete PublicInput after gas_used changes"
+        );
+        q_b
+    }
+
+    fn admit_context_replacement_attempts(
+        replacement: &mut ContextReplacementHarness,
+        occupied: bool,
+    ) -> (ProofAttempt, Option<ProofAttempt>) {
+        let fixture = &replacement.fixture;
+        let harness = &mut replacement.harness;
+        let selected_a = replacement
+            .s_a
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("A payload remains selected while work is prepared");
+        let attempt_a = build_proof_attempt(
+            fixture,
+            &replacement.s_a,
+            selected_a,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x73,
+        );
+        assert_eq!(attempt_a.expected_input.public_input, replacement.q_a);
+
+        harness.register_gate(AttemptId::A, &attempt_a);
+        harness.submit_preparation(replacement.s_a.clone_arc(), &attempt_a);
+        harness.expect_entry(
+            AttemptId::A,
+            &attempt_a,
+            &expected_store_for(&[&attempt_a.expected], &[]),
+        );
+
+        let attempt_b = occupied.then(|| {
+            let attempt = build_proof_attempt(
+                fixture,
+                &replacement.s_a,
+                selected_a,
+                CONFIGURED_PROOF_TYPE,
+                1,
+                ProofEncoding::Matching(0xb2),
+                0x74,
+            );
+            assert_ne!(
+                attempt.expected.envelope_root,
+                attempt_a.expected.envelope_root
+            );
+            assert_ne!(
+                attempt.expected.validator_index,
+                attempt_a.expected.validator_index
+            );
+            assert_eq!(attempt.expected_input.public_input, replacement.q_a);
+
+            harness.register_gate(AttemptId::B, &attempt);
+            harness.submit_preparation(replacement.s_a.clone_arc(), &attempt);
+            harness.expect_entry(
+                AttemptId::B,
+                &attempt,
+                &expected_store_for(&[&attempt_a.expected, &attempt.expected], &[]),
+            );
+            attempt
+        });
+
+        (attempt_a, attempt_b)
+    }
+
+    fn finish_context_replacement_vacant(
+        replacement: &mut ContextReplacementHarness,
+        attempt: &ProofAttempt,
+        verdict: ProofVerdict,
+    ) {
+        assert_eq!(replacement.harness.engine.invocation_count(), 1);
+        let q_b = publish_replacement_b(replacement);
+        assert_ne!(replacement.q_a, q_b);
+        let harness = &mut replacement.harness;
+        let published = harness.controller.store_snapshot();
+        let selected_b = published
+            .cached_execution_payload_envelope_by_root(replacement.fixture.block_root)
+            .expect("replacement B is selected before the old proof is released");
+        assert_eq!(selected_b.as_ref(), replacement.payload_b.as_ref());
+
+        harness.releases.release(AttemptId::A, verdict);
+        let late_response = harness.response(attempt, P2pResult::Ignore);
+        assert_terminal_store(&late_response, &[&attempt.expected], &[], None);
+    }
+
+    fn finish_context_replacement_occupied(
+        replacement: &mut ContextReplacementHarness,
+        attempt_a: &ProofAttempt,
+        attempt_b: &ProofAttempt,
+        verdict: ProofVerdict,
+    ) {
+        let harness = &mut replacement.harness;
+        assert_eq!(harness.engine.invocation_count(), 2);
+
+        // The first real completion stores its Arc while the other verifier remains gated.
+        harness.releases.release(AttemptId::A, ProofVerdict::Valid);
+        let first_response = harness.response(attempt_a, P2pResult::Accept);
+        assert_terminal_store(
+            &first_response,
+            &[&attempt_a.expected, &attempt_b.expected],
+            &[&attempt_a.expected],
+            Some(&attempt_a.expected),
+        );
+        let original_arc = first_response
+            .stored_envelope_at_send
+            .as_ref()
+            .expect("first valid completion captures its actual resident Arc")
+            .clone_arc();
+
+        let q_b = publish_replacement_b(replacement);
+        let harness = &mut replacement.harness;
+        let published = harness.controller.store_snapshot();
+        let selected_b = published
+            .cached_execution_payload_envelope_by_root(replacement.fixture.block_root)
+            .expect("replacement B remains selected while old proof work is gated");
+        assert_eq!(attempt_b.expected_input.public_input, replacement.q_a);
+        assert_ne!(replacement.q_a, q_b);
+        assert_eq!(selected_b.as_ref(), replacement.payload_b.as_ref());
+
+        harness.releases.release(AttemptId::B, verdict);
+        let late_response = harness.response(attempt_b, P2pResult::Ignore);
+        assert_terminal_store(
+            &late_response,
+            &[&attempt_a.expected, &attempt_b.expected],
+            &[&attempt_a.expected],
+            Some(&attempt_a.expected),
+        );
+        let retained_arc = late_response
+            .stored_envelope_at_send
+            .as_ref()
+            .expect("stale occupied completion retains actual resident bytes")
+            .clone_arc();
+        assert!(Arc::ptr_eq(&original_arc, &retained_arc));
+        assert_eq!(retained_arc.as_ref(), &attempt_a.expected.envelope);
+    }
+
+    fn run_context_replacement_late_completion(verdict: ProofVerdict, occupied: bool) {
+        let mut replacement = new_context_replacement_harness();
+        let (attempt_a, attempt_b) = admit_context_replacement_attempts(&mut replacement, occupied);
+
+        if let Some(attempt_b) = attempt_b.as_ref() {
+            finish_context_replacement_occupied(&mut replacement, &attempt_a, attempt_b, verdict);
+        } else {
+            finish_context_replacement_vacant(&mut replacement, &attempt_a, verdict);
+        }
+
+        assert_eq!(
+            replacement.harness.engine.invocation_count(),
+            if occupied { 2 } else { 1 },
+            "late completion must use only the already-admitted verifier work"
+        );
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_before_admission_ignore() {
+        let replacement = new_context_replacement_harness();
+        let fixture = &replacement.fixture;
+        let selected_a = replacement
+            .s_a
+            .cached_execution_payload_envelope_by_root(fixture.block_root)
+            .expect("A payload remains selected for genuine snapshot preparation");
+        let stale = build_proof_attempt(
+            fixture,
+            &replacement.s_a,
+            selected_a,
+            CONFIGURED_PROOF_TYPE,
+            0,
+            ProofEncoding::Matching(0xa1),
+            0x75,
+        );
+        assert_eq!(stale.expected_input.public_input, replacement.q_a);
+        replacement.harness.register_response(&stale);
+        let prepared = replacement
+            .harness
+            .prepare_without_delivery(replacement.s_a.clone_arc(), &stale);
+        assert_eq!(replacement.harness.engine.invocation_count(), 0);
+
+        let q_b = publish_replacement_b(&replacement);
+        assert_ne!(replacement.q_a, q_b);
+        prepared.send(&replacement.harness.controller.owned_mutator_tx());
+
+        let response = replacement.harness.response(&stale, P2pResult::Ignore);
+        assert_terminal_store(&response, &[], &[], None);
+        assert_eq!(replacement.harness.engine.invocation_count(), 0);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_valid_vacant() {
+        run_context_replacement_late_completion(ProofVerdict::Valid, false);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_invalid_vacant() {
+        run_context_replacement_late_completion(ProofVerdict::Invalid, false);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_undetermined_vacant() {
+        run_context_replacement_late_completion(ProofVerdict::Undetermined, false);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_valid_occupied() {
+        run_context_replacement_late_completion(ProofVerdict::Valid, true);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_invalid_occupied() {
+        run_context_replacement_late_completion(ProofVerdict::Invalid, true);
+    }
+
+    #[test]
+    fn execution_proof_context_replacement_late_undetermined_occupied() {
+        run_context_replacement_late_completion(ProofVerdict::Undetermined, true);
+    }
 }

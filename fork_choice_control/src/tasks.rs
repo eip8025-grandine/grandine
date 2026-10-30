@@ -9,21 +9,22 @@ use eth2_libp2p::GossipId;
 use execution_engine::{ExecutionEngine, NullExecutionEngine};
 use features::Feature;
 use fork_choice_store::{
-    AggregateAndProofOrigin, AttestationItem, AttestationOrigin, AttesterSlashingOrigin,
-    BlobSidecarOrigin, BlockAction, BlockItem, BlockOrigin, DataColumnSidecarAction,
-    DataColumnSidecarOrigin, ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction,
-    ExecutionPayloadEnvelopeOrigin, ExecutionProofAction, ExecutionProofOrigin,
+    AdmittedExecutionProof, AggregateAndProofOrigin, AttestationItem, AttestationOrigin,
+    AttesterSlashingOrigin, BlobSidecarOrigin, BlockAction, BlockItem, BlockOrigin,
+    DataColumnSidecarAction, DataColumnSidecarOrigin, Error as StoreError,
+    ExecutionPayloadBidOrigin, ExecutionPayloadEnvelopeAction, ExecutionPayloadEnvelopeOrigin,
+    ExecutionProofOrigin, ExecutionProofPreparation, ExecutionProofVerificationOutcome,
     PayloadAttestationItem, PayloadAttestationOrigin, ProposerPreferencesOrigin,
-    StateCacheProcessor, Store,
+    StateCacheProcessor, Store, prepare_execution_proof,
 };
 use futures::channel::mpsc::Sender as MultiSender;
 use helper_functions::{
     accessors, deposit_signatures, misc,
     verifier::{MultiVerifier, NullVerifier},
 };
-use logging::{debug_with_peers, warn_with_peers};
+use logging::{debug_with_peers, trace_with_peers, warn_with_peers};
 use prometheus_metrics::Metrics;
-use proof_engine::ProofEngine;
+use proof_engine::{ProofEngine, ProofVerdict};
 use pubkey_cache::PubkeyCache;
 use spec_test_utils::BlsSetting;
 use ssz::SszHash as _;
@@ -40,7 +41,7 @@ use types::{
     gloas::containers::{
         SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope, SignedProposerPreferences,
     },
-    nonstandard::{RelativeEpoch, ValidationOutcome},
+    nonstandard::{RelativeEpoch, ValidationOutcome, ValidationOutcomeWithReason},
     phase0::{
         containers::Checkpoint,
         primitives::{H256, Slot},
@@ -643,6 +644,7 @@ pub struct ExecutionPayloadEnvelopeTask<P: Preset, E, W> {
     pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub execution_engine: E,
+    pub capture_proof_context: bool,
     pub wait_group: W,
     pub execution_payload_envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
     pub origin: ExecutionPayloadEnvelopeOrigin,
@@ -667,6 +669,7 @@ impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for ExecutionPayloadEnvelop
             store_snapshot,
             mutator_tx,
             execution_engine,
+            capture_proof_context,
             wait_group,
             execution_payload_envelope,
             origin,
@@ -689,6 +692,7 @@ impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for ExecutionPayloadEnvelop
             &origin,
             &execution_engine,
             MultiVerifier::default(),
+            capture_proof_context,
         );
 
         MutatorMessage::ExecutionPayloadEnvelope {
@@ -746,17 +750,99 @@ impl<P: Preset, W> Run for ProcessExecutionProofTask<P, W> {
             origin,
         } = self;
 
-        // Reserved for the spec-ordered pipeline follow-up.
-        let _ = (&store_snapshot, &signed_proof);
+        if proof_engine.is_null() {
+            MutatorMessage::ExecutionProof {
+                result: Ok(ValidationOutcomeWithReason::Ignore(
+                    "proof engine not enabled",
+                )),
+                origin,
+            }
+            .send(&mutator_tx);
+            return;
+        }
 
-        let result = if proof_engine.is_null() {
-            Ok(ExecutionProofAction::Ignore("proof engine not enabled"))
-        } else {
-            // TODO(eip8025-grandine): spec-ordered pipeline
-            Ok(ExecutionProofAction::Ignore("stub pipeline"))
-        };
+        let result = classify_execution_proof_preparation::<P>(prepare_execution_proof(
+            &store_snapshot,
+            &signed_proof,
+        ));
 
-        MutatorMessage::ExecutionProof { result, origin }.send(&mutator_tx);
+        if let Ok(ExecutionProofPreparation::Ignore(reason)) = &result {
+            let beacon_block_root = signed_proof.message.beacon_block_root;
+            let proof_type = signed_proof.message.proof_type;
+            let validator_index = signed_proof.validator_index;
+            trace_with_peers!(
+                "execution proof ignored (block_root: {beacon_block_root:?}, proof_type: {proof_type}, validator_index: {validator_index}, outcome: IGNORE, reason: {reason})",
+            );
+        }
+
+        // The worker exits rather than waiting for live admission. A snapshot can
+        // authenticate input, but cannot authorize an engine invocation.
+        MutatorMessage::ExecutionProofPrepared {
+            result,
+            proof_engine,
+            origin,
+        }
+        .send(&mutator_tx);
+    }
+}
+
+// Only these typed errors establish peer-invalid envelope input. Binding,
+// reconstruction and other local errors must never reach the rejection arm.
+fn classify_execution_proof_preparation<P: Preset>(
+    result: Result<ExecutionProofPreparation>,
+) -> Result<ExecutionProofPreparation> {
+    match result {
+        Err(error)
+            if !matches!(
+                error.downcast_ref::<StoreError<P>>(),
+                Some(
+                    StoreError::ExecutionProofEnvelopeInvalidValidatorIndex { .. }
+                        | StoreError::ExecutionProofEnvelopeEmptyProof
+                        | StoreError::ExecutionProofEnvelopeUnsupportedProofType { .. }
+                        | StoreError::ExecutionProofEnvelopeInactiveValidator { .. }
+                        | StoreError::ExecutionProofEnvelopeInvalidSignature { .. }
+                )
+            ) =>
+        {
+            warn_with_peers!("execution proof preparation failed locally (error: {error:?})");
+            Ok(ExecutionProofPreparation::Ignore(
+                "local execution proof preparation failure",
+            ))
+        }
+        result => result,
+    }
+}
+
+const fn execution_proof_verification_outcome(
+    verdict: ProofVerdict,
+) -> ExecutionProofVerificationOutcome {
+    match verdict {
+        ProofVerdict::Valid => ExecutionProofVerificationOutcome::Valid,
+        ProofVerdict::Invalid => ExecutionProofVerificationOutcome::Invalid,
+        ProofVerdict::Undetermined => ExecutionProofVerificationOutcome::LocalFault,
+    }
+}
+
+pub struct VerifyExecutionProofTask<P: Preset, W> {
+    pub admitted: AdmittedExecutionProof,
+    pub proof_engine: Arc<dyn ProofEngine>,
+    pub mutator_tx: Sender<MutatorMessage<P, W>>,
+    pub origin: ExecutionProofOrigin,
+}
+
+impl<P: Preset, W> Run for VerifyExecutionProofTask<P, W> {
+    #[instrument(skip_all, level = "debug", name = "VerifyExecutionProofTask::run")]
+    fn run(self) {
+        let Self {
+            admitted,
+            proof_engine,
+            mutator_tx,
+            origin,
+        } = self;
+        let completion = admitted.verify_with(|input| {
+            execution_proof_verification_outcome(proof_engine.verify_execution_proof(input))
+        });
+        MutatorMessage::ExecutionProofCompleted { completion, origin }.send(&mutator_tx);
     }
 }
 
@@ -1225,24 +1311,45 @@ impl<P: Preset> Run for StateAtSlotCacheFlushTask<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, mpsc::channel};
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender, channel},
+    };
 
-    use eth2_libp2p::GossipId;
-    use fork_choice_store::{ExecutionProofAction, ExecutionProofOrigin};
-    use proof_engine::{MockProofEngine, NullProofEngine, ProofEngine, ProofVerdict};
+    use crossbeam_utils::sync::WaitGroup;
+    use eth2_libp2p::{GossipId, MessageId};
+    use execution_engine::MockExecutionEngine;
+    use fork_choice_store::{
+        Error as StoreError, ExecutionProofOrigin, ExecutionProofPreparation,
+        ExecutionProofVerificationOutcome,
+    };
+    use proof_engine::{NullProofEngine, ProofEngine, ProofVerdict};
     use pubkey_cache::PubkeyCache;
     use ssz::Hc;
+    use std_ext::ArcExt as _;
     use types::{
         config::Config,
-        eip8025::containers::{ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope},
+        eip8025::containers::{
+            ExecutionProof, ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope,
+        },
         phase0::primitives::H256,
         preset::Minimal,
     };
 
     use crate::{
-        messages::MutatorMessage,
+        controller::MutatorHandle,
+        events::EventChannels,
+        messages::{MutatorMessage, P2pMessage},
         specialized::TestController,
-        tasks::{ProcessExecutionProofTask, Run as _},
+        tasks::{
+            ProcessExecutionProofTask, Run as _, classify_execution_proof_preparation,
+            execution_proof_verification_outcome,
+        },
+        unbounded_sink::UnboundedSink,
     };
 
     // `bls` is not a direct dependency, so `SignatureBytes::default()` cannot be named.
@@ -1261,7 +1368,112 @@ mod tests {
         })
     }
 
-    fn run_stub_task(proof_engine: Arc<dyn ProofEngine>) -> MutatorMessage<Minimal, ()> {
+    const TEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[derive(Clone)]
+    struct TestP2pSink(Sender<P2pMessage<Minimal>>);
+
+    impl UnboundedSink<P2pMessage<Minimal>> for TestP2pSink {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+
+        fn unbounded_send(&self, message: P2pMessage<Minimal>) -> Result<(), P2pMessage<Minimal>> {
+            self.0.send(message).map_err(|error| error.0)
+        }
+    }
+
+    type TestGossipControllerParts = (
+        Arc<TestController<Minimal>>,
+        MutatorHandle<Minimal, WaitGroup>,
+        Receiver<P2pMessage<Minimal>>,
+    );
+
+    // Test-only selection between the default-Null constructor and explicit injection. The
+    // production Controller boundary always requires an engine Arc.
+    fn test_gossip_controller(
+        injected_proof_engine: Option<Arc<dyn ProofEngine>>,
+    ) -> TestGossipControllerParts {
+        let config = Arc::new(Config::minimal());
+        let state = factory::min_genesis_state::<Minimal>(&config, &PubkeyCache::default())
+            .expect("should build beacon state")
+            .0;
+        let block = Arc::new(genesis::beacon_block(&state));
+        let (p2p_tx, p2p_rx) = channel();
+        let p2p_sink = TestP2pSink(p2p_tx);
+        let execution_engine = Arc::new(Mutex::new(MockExecutionEngine::new(true, false, None)));
+        let pubkey_cache = Arc::new(PubkeyCache::default());
+        let event_channels = Arc::new(EventChannels::default());
+
+        let (controller, mutator_handle) = match injected_proof_engine {
+            Some(proof_engine) => TestController::with_p2p_tx_and_proof_engine(
+                config,
+                pubkey_cache,
+                block,
+                state,
+                execution_engine,
+                proof_engine,
+                p2p_sink,
+                event_channels,
+                Some(1),
+            ),
+            None => TestController::with_p2p_tx(
+                config,
+                pubkey_cache,
+                block,
+                state,
+                execution_engine,
+                p2p_sink,
+                event_channels,
+                Some(1),
+            ),
+        };
+
+        (controller, mutator_handle, p2p_rx)
+    }
+
+    fn empty_signed_proof() -> Arc<SignedExecutionProofEnvelope> {
+        let mut signed_proof = (*test_signed_proof()).clone();
+        let mut envelope = (*signed_proof.message).clone();
+        envelope.proof_data = ProofData::default();
+        signed_proof.message = Hc::from(envelope);
+        Arc::new(signed_proof)
+    }
+
+    fn test_gossip_id(label: &[u8]) -> GossipId {
+        GossipId {
+            source: GossipId::default().source,
+            message_id: MessageId::new(label),
+        }
+    }
+
+    fn receive_p2p_response(receiver: &Receiver<P2pMessage<Minimal>>) -> P2pMessage<Minimal> {
+        receiver
+            .recv_timeout(TEST_RESPONSE_TIMEOUT)
+            .expect("Controller should emit a terminal gossip response")
+    }
+
+    fn assert_ignore_identity(response: P2pMessage<Minimal>, expected: &GossipId) {
+        match response {
+            P2pMessage::Ignore(actual) => {
+                assert_eq!(actual.source, expected.source);
+                assert_eq!(actual.message_id, expected.message_id);
+            }
+            other => panic!("expected Ignore for submitted gossip identity, got {other:?}"),
+        }
+    }
+
+    fn assert_execution_proof_store_empty(controller: &TestController<Minimal>) {
+        let snapshot = controller.store_snapshot();
+        assert!(snapshot.execution_proofs().is_empty());
+        assert!(snapshot.execution_proof_roots().is_empty());
+        assert!(snapshot.execution_proof_provers().is_empty());
+    }
+
+    fn run_preparation_task(
+        proof_engine: Arc<dyn ProofEngine>,
+        signed_proof: Arc<SignedExecutionProofEnvelope>,
+    ) -> MutatorMessage<Minimal, ()> {
         let config = Arc::new(Config::minimal());
         let genesis_state = factory::min_genesis_state::<Minimal>(&config, &PubkeyCache::default())
             .expect("should build beacon state")
@@ -1276,55 +1488,263 @@ mod tests {
             store_snapshot: controller.owned_store_snapshot(),
             proof_engine,
             mutator_tx,
-            signed_proof: test_signed_proof(),
+            signed_proof,
             origin: ExecutionProofOrigin::Gossip(GossipId::default()),
         }
         .run();
 
-        mutator_rx
-            .try_recv()
-            .expect("stub task should send exactly one outcome message")
+        let message = mutator_rx.try_recv().expect("task should send an outcome");
+        assert!(
+            mutator_rx.try_recv().is_err(),
+            "task sent more than one outcome"
+        );
+        message
     }
 
     #[test]
-    fn stub_pipeline_ignores_against_mock_engine() {
-        for verdict in [
-            ProofVerdict::Valid,
-            ProofVerdict::Invalid,
-            ProofVerdict::Undetermined,
-        ] {
-            let proof_engine: Arc<dyn ProofEngine> = Arc::new(MockProofEngine::new(verdict));
+    fn execution_proof_unknown_block_ignores_before_engine() {
+        let message = run_preparation_task(
+            Arc::new(NoVerificationEngine { null: false }),
+            test_signed_proof(),
+        );
+        assert!(matches!(
+            message,
+            MutatorMessage::ExecutionProofPrepared {
+                result: Ok(ExecutionProofPreparation::Ignore(
+                    "execution proof's beacon block has not been seen"
+                )),
+                ..
+            }
+        ));
+    }
 
-            let message = run_stub_task(proof_engine);
+    struct NoVerificationEngine {
+        null: bool,
+    }
 
-            assert!(
-                matches!(
-                    message,
-                    MutatorMessage::ExecutionProof {
-                        result: Ok(ExecutionProofAction::Ignore("stub pipeline")),
-                        ..
-                    }
-                ),
-                "stub pipeline should ignore proofs regardless of the mock engine result",
-            );
+    impl ProofEngine for NoVerificationEngine {
+        fn is_null(&self) -> bool {
+            self.null
+        }
+        fn verify_execution_proof(&self, _: ExecutionProof) -> ProofVerdict {
+            panic!("preparation must never enter the verifier")
         }
     }
 
     #[test]
     fn null_proof_engine_short_circuits_to_ignore() {
-        let proof_engine: Arc<dyn ProofEngine> = Arc::new(NullProofEngine);
-
-        let message = run_stub_task(proof_engine);
-
-        assert!(
-            matches!(
+        // Empty input would REJECT during preparation, so this also proves the
+        // null-engine guard precedes preparation, not just engine dispatch.
+        let mut signed_proof = (*test_signed_proof()).clone();
+        let mut message = (*signed_proof.message).clone();
+        message.proof_data = ProofData::default();
+        signed_proof.message = Hc::from(message);
+        let proof_engines: [Arc<dyn ProofEngine>; 2] = [
+            Arc::new(NullProofEngine),
+            Arc::new(NoVerificationEngine { null: true }),
+        ];
+        for proof_engine in proof_engines {
+            let message = run_preparation_task(proof_engine, Arc::new(signed_proof.clone()));
+            assert!(matches!(
                 message,
                 MutatorMessage::ExecutionProof {
-                    result: Ok(ExecutionProofAction::Ignore("proof engine not enabled")),
+                    result: Ok(types::nonstandard::ValidationOutcomeWithReason::Ignore(
+                        "proof engine not enabled"
+                    )),
                     ..
                 }
-            ),
-            "null engine should short-circuit to `Ignore`",
+            ));
+        }
+    }
+
+    #[test]
+    fn execution_proof_empty_input_is_typed_peer_rejection() {
+        let mut signed_proof = (*test_signed_proof()).clone();
+        let mut envelope = (*signed_proof.message).clone();
+        envelope.proof_data = ProofData::default();
+        signed_proof.message = Hc::from(envelope);
+        let message = run_preparation_task(
+            Arc::new(NoVerificationEngine { null: false }),
+            Arc::new(signed_proof),
         );
+        let MutatorMessage::ExecutionProofPrepared {
+            result: Err(error), ..
+        } = message
+        else {
+            panic!("empty proof should be rejected");
+        };
+        assert!(matches!(
+            error.downcast_ref::<StoreError<Minimal>>(),
+            Some(StoreError::ExecutionProofEnvelopeEmptyProof)
+        ));
+    }
+
+    #[test]
+    fn execution_proof_preparation_rejects_only_envelope_errors() {
+        let peer_errors = [
+            StoreError::<Minimal>::ExecutionProofEnvelopeEmptyProof,
+            StoreError::ExecutionProofEnvelopeUnsupportedProofType { proof_type: 255 },
+            StoreError::ExecutionProofEnvelopeInvalidValidatorIndex {
+                validator_index: 42,
+            },
+            StoreError::ExecutionProofEnvelopeInactiveValidator {
+                validator_index: 42,
+                epoch: 1,
+            },
+            StoreError::ExecutionProofEnvelopeInvalidSignature {
+                validator_index: 42,
+            },
+        ];
+        for error in peer_errors {
+            // Context on anyhow errors must not hide the typed source.
+            assert!(
+                classify_execution_proof_preparation::<Minimal>(Err(
+                    anyhow::Error::new(error).context("preparation")
+                ))
+                .is_err()
+            );
+        }
+        for error in [
+            anyhow::anyhow!("local binding failure"),
+            StoreError::<Minimal>::InvalidExecutionPayload.into(),
+        ] {
+            assert!(matches!(
+                classify_execution_proof_preparation::<Minimal>(Err(error)),
+                Ok(ExecutionProofPreparation::Ignore(
+                    "local execution proof preparation failure"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn execution_proof_preparation_replies_through_live_mutator() {
+        let config = Arc::new(Config::minimal());
+        let state = factory::min_genesis_state::<Minimal>(&config, &PubkeyCache::default())
+            .expect("should build beacon state")
+            .0;
+        let block = Arc::new(genesis::beacon_block(&state));
+        let (controller, _mutator_handle) = TestController::quiet(config, block, state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("API response test runtime should build");
+
+        for (null, empty) in [(true, true), (false, true), (false, false)] {
+            let mut proof = (*test_signed_proof()).clone();
+            if empty {
+                let mut envelope = (*proof.message).clone();
+                envelope.proof_data = ProofData::default();
+                proof.message = Hc::from(envelope);
+            }
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            ProcessExecutionProofTask {
+                store_snapshot: controller.owned_store_snapshot(),
+                proof_engine: Arc::new(NoVerificationEngine { null }),
+                mutator_tx: controller.owned_mutator_tx(),
+                signed_proof: Arc::new(proof),
+                origin: ExecutionProofOrigin::Api(sender),
+            }
+            .run();
+            let result = runtime.block_on(async {
+                tokio::time::timeout(TEST_RESPONSE_TIMEOUT, receiver)
+                    .await
+                    .expect("live mutator should reply before the API response timeout")
+                    .expect("live mutator should not cancel the terminal API response")
+            });
+            if !null && empty {
+                assert!(result.is_err(), "active empty proof should reject");
+            } else {
+                assert!(matches!(
+                    result,
+                    Ok(types::nonstandard::ValidationOutcomeWithReason::Ignore(_))
+                ));
+            }
+            let snapshot = controller.store_snapshot();
+            assert!(snapshot.execution_proofs().is_empty());
+            assert!(snapshot.execution_proof_roots().is_empty());
+            assert!(snapshot.execution_proof_provers().is_empty());
+        }
+    }
+
+    #[test]
+    fn execution_proof_engine_verdict_mapping_preserves_local_fault() {
+        for (verdict, expected) in [
+            (
+                ProofVerdict::Valid,
+                ExecutionProofVerificationOutcome::Valid,
+            ),
+            (
+                ProofVerdict::Invalid,
+                ExecutionProofVerificationOutcome::Invalid,
+            ),
+            (
+                ProofVerdict::Undetermined,
+                ExecutionProofVerificationOutcome::LocalFault,
+            ),
+        ] {
+            assert_eq!(execution_proof_verification_outcome(verdict), expected);
+        }
+    }
+
+    #[test]
+    fn execution_proof_controller_default_engine_bypasses_empty_proof() {
+        let (controller, _mutator_handle, p2p_rx) = test_gossip_controller(None);
+        let gossip_id = test_gossip_id(b"default-null-proof");
+
+        controller.on_gossip_execution_proof(empty_signed_proof(), gossip_id.clone());
+
+        assert_ignore_identity(receive_p2p_response(&p2p_rx), &gossip_id);
+        assert_execution_proof_store_empty(&controller);
+    }
+
+    #[test]
+    fn execution_proof_controller_injected_null_engine_bypasses_empty_proof() {
+        let (controller, _mutator_handle, p2p_rx) =
+            test_gossip_controller(Some(Arc::new(NullProofEngine)));
+        let gossip_id = test_gossip_id(b"injected-null-proof");
+
+        controller.on_gossip_execution_proof(empty_signed_proof(), gossip_id.clone());
+
+        assert_ignore_identity(receive_p2p_response(&p2p_rx), &gossip_id);
+        assert_execution_proof_store_empty(&controller);
+    }
+
+    #[derive(Default)]
+    struct TrackingProofEngine {
+        null_checks: AtomicUsize,
+        verification_calls: AtomicUsize,
+    }
+
+    impl ProofEngine for TrackingProofEngine {
+        fn is_null(&self) -> bool {
+            self.null_checks.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+
+        fn verify_execution_proof(&self, _: ExecutionProof) -> ProofVerdict {
+            self.verification_calls.fetch_add(1, Ordering::SeqCst);
+            ProofVerdict::Undetermined
+        }
+    }
+
+    #[test]
+    fn execution_proof_controller_uses_injected_engine_for_unknown_block() {
+        let engine = Arc::new(TrackingProofEngine::default());
+        let proof_engine: Arc<dyn ProofEngine> = engine.clone_arc();
+        let (controller, _mutator_handle, p2p_rx) = test_gossip_controller(Some(proof_engine));
+        let gossip_id = test_gossip_id(b"injected-active-proof");
+        // Controller construction also checks the engine to initialize payload capture policy.
+        let initial_null_checks = engine.null_checks.load(Ordering::SeqCst);
+
+        controller.on_gossip_execution_proof(test_signed_proof(), gossip_id.clone());
+
+        assert_ignore_identity(receive_p2p_response(&p2p_rx), &gossip_id);
+        assert_eq!(
+            engine.null_checks.load(Ordering::SeqCst),
+            initial_null_checks + 1,
+        );
+        assert_eq!(engine.verification_calls.load(Ordering::SeqCst), 0);
+        assert_execution_proof_store_empty(&controller);
     }
 }

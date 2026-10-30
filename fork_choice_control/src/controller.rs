@@ -91,6 +91,7 @@ pub struct Controller<P: Preset, E, A, W: Wait> {
     store_snapshot: Arc<ArcSwap<Store<P, Storage<P>>>>,
     block_processor: Arc<BlockProcessor<P>>,
     execution_engine: E,
+    proof_engine: Arc<dyn ProofEngine>,
     pubkey_cache: Arc<PubkeyCache>,
     sidecars_pending_reconstruction: SidecarsPendingReconstruction<P>,
     state_at_slot_cache: Arc<StateAtSlotCache<P>>,
@@ -127,6 +128,7 @@ where
         tick: Tick,
         event_channels: Arc<EventChannels<P>>,
         execution_engine: E,
+        proof_engine: Arc<dyn ProofEngine>,
         metrics: Option<Arc<Metrics>>,
         attestation_verifier_tx: A, // impl UnboundedSink<AttestationVerifierMessage<P, W>>,
         p2p_tx: impl UnboundedSink<P2pMessage<P>>,
@@ -180,6 +182,7 @@ where
             block_processor.clone_arc(),
             event_channels,
             execution_engine.clone(),
+            !proof_engine.is_null(),
             sidecars_pending_reconstruction.clone_arc(),
             state_at_slot_cache.clone_arc(),
             storage.clone_arc(),
@@ -212,6 +215,7 @@ where
             store_snapshot,
             block_processor,
             execution_engine,
+            proof_engine,
             pubkey_cache,
             sidecars_pending_reconstruction,
             state_at_slot_cache,
@@ -797,6 +801,14 @@ where
         })
     }
 
+    pub fn on_gossip_execution_proof(
+        &self,
+        signed_proof: Arc<SignedExecutionProofEnvelope>,
+        gossip_id: GossipId,
+    ) {
+        self.spawn_execution_proof_task(signed_proof, ExecutionProofOrigin::Gossip(gossip_id));
+    }
+
     pub fn on_gossip_payload_attestation(
         &self,
         payload_attestation: Arc<PayloadAttestationMessage>,
@@ -1000,17 +1012,14 @@ where
         })
     }
 
-    // Nothing calls this until gossip wiring lands.
-    #[expect(dead_code)]
     fn spawn_execution_proof_task(
         &self,
         signed_proof: Arc<SignedExecutionProofEnvelope>,
         origin: ExecutionProofOrigin,
-        proof_engine: Arc<dyn ProofEngine>,
     ) {
         self.spawn(ProcessExecutionProofTask {
             store_snapshot: self.owned_store_snapshot(),
-            proof_engine,
+            proof_engine: self.proof_engine.clone_arc(),
             mutator_tx: self.owned_mutator_tx(),
             signed_proof,
             origin,
@@ -1056,6 +1065,7 @@ where
             store_snapshot,
             mutator_tx: self.owned_mutator_tx(),
             execution_engine: self.execution_engine.clone(),
+            capture_proof_context: !self.proof_engine.is_null(),
             wait_group: self.owned_wait_group(),
             execution_payload_envelope,
             origin,
