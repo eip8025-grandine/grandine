@@ -6771,7 +6771,6 @@ mod tests {
 
     // Controlled service-stage fixture: these coherent links model already-validated ChainLink
     // outputs. They exercise public FFG and Store lifecycle APIs, not full block-import reachability.
-    #[cfg(feature = "eth2-cache")]
     mod execution_proof_tests {
         use core::{
             sync::atomic::{AtomicUsize, Ordering},
