@@ -2734,6 +2734,24 @@ impl<P: Preset, W: Wait> Network<P, W> {
                 self.controller
                     .on_gossip_execution_payload(execution_payload_envelope, gossip_id);
             }
+            PubsubMessage::ExecutionProof(signed_proof) => {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.register_gossip_object(&["execution_proof"]);
+                }
+
+                let beacon_block_root = signed_proof.message.beacon_block_root;
+                let proof_type = signed_proof.message.proof_type;
+                let validator_index = signed_proof.validator_index;
+                trace_with_peers!(
+                    "received execution proof as gossip: \
+                     block_root: {beacon_block_root:?}, proof_type: {proof_type}, \
+                     validator_index: {validator_index} from {source}"
+                );
+
+                let gossip_id = GossipId { source, message_id };
+                self.controller
+                    .on_gossip_execution_proof(signed_proof, gossip_id);
+            }
             PubsubMessage::ExecutionPayloadBid(payload_bid) => {
                 if let Some(metrics) = self.metrics.as_ref() {
                     metrics.register_gossip_object(&["execution_payload_bid"]);
