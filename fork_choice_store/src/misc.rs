@@ -46,7 +46,10 @@ use types::{
     traits::{self, SignedBeaconBlock as _, SszValidatorList},
 };
 
-use crate::{segment::Position, store::Store};
+use crate::{
+    segment::Position,
+    store::{AcceptedExecutionPayloadEnvelope, AdmittedExecutionProof, Store},
+};
 
 const EMPTY: &str = "empty";
 const FULL: &str = "full";
@@ -1330,6 +1333,53 @@ pub enum ExecutionProofAction {
     Ignore(&'static str),
 }
 
+/// Why live admission declined a prepared execution proof without consuming either Seen key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofAdmissionDecline {
+    Retired,
+    /// The accepted payload context is missing or no longer matches the prepared statement.
+    ContextInapplicable,
+    AlreadyVerified,
+    SeenRoot,
+    SeenProver,
+}
+
+/// A live admission result carrying either protected authority or a decline reason.
+#[must_use]
+pub enum ExecutionProofAdmission {
+    /// Both Seen keys were consumed by the authorizing live Store transition.
+    Admitted(AdmittedExecutionProof),
+    Declined(ExecutionProofAdmissionDecline),
+}
+
+/// An admitted attempt's verification report, not a live Store acceptance decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofVerificationOutcome {
+    Valid,
+    Invalid,
+    LocalFault,
+}
+
+/// Why a completion is locally ignored because it is no longer applicable or no longer needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofDiscard {
+    Retired,
+    ContextInapplicable,
+    /// A verified proof already occupies this block/type pair.
+    AlreadyVerified,
+}
+
+/// The live completion decision after checking target retention and context applicability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionProofCompletionOutcome {
+    /// A valid attempt stored the first verified envelope for its block and proof type.
+    Accept,
+    Reject,
+    LocalFault,
+    /// Locally ignore a completion that is no longer applicable or no longer needed.
+    Discarded(ExecutionProofDiscard),
+}
+
 // a list of Tuple(attesting_index, positions_in_committee)
 type AttestingIndicesPositions = Vec<(ValidatorIndex, Vec<usize>)>;
 
@@ -1514,6 +1564,29 @@ pub enum ExecutionPayloadEnvelopeAction<P: Preset> {
 }
 
 impl<P: Preset> ExecutionPayloadEnvelopeAction<P> {
+    #[must_use]
+    pub const fn accepted(&self) -> bool {
+        matches!(self, Self::Accept(_))
+    }
+}
+
+/// Result of validating an execution payload envelope for the live Store path.
+///
+/// Its accepted value pairs the ordinary envelope with optional proof context captured after
+/// successful EL submission. Custom-state validation continues to use the raw action above.
+#[derive(Debug)]
+pub enum ExecutionPayloadEnvelopeValidationAction<P: Preset> {
+    Accept(AcceptedExecutionPayloadEnvelope<P>),
+    Ignore(Publishable),
+    DelayUntilBeaconBlock(Arc<SignedExecutionPayloadEnvelope<P>>, H256),
+    DelayUntilState(Arc<SignedExecutionPayloadEnvelope<P>>, H256),
+    DelayUntilData(
+        Arc<SignedExecutionPayloadEnvelope<P>>,
+        Arc<SignedBeaconBlock<P>>,
+    ),
+}
+
+impl<P: Preset> ExecutionPayloadEnvelopeValidationAction<P> {
     #[must_use]
     pub const fn accepted(&self) -> bool {
         matches!(self, Self::Accept(_))

@@ -3721,3 +3721,273 @@ fn rejects_single_attestation_from_validator_outside_committee() {
         Some(P2pMessage::Reject(_, _)),
     ));
 }
+
+#[derive(Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these fields observe independent control outcomes rather than encode a state machine"
+)]
+struct ExecutionPayloadControlObservations {
+    gossip_accept: bool,
+    gossip_reject: bool,
+    api_accept: bool,
+    accepted_marker: bool,
+    selected_envelope: bool,
+    available_event: bool,
+    gossip_event: bool,
+    payload_event: bool,
+}
+
+fn run_execution_payload_control_case(
+    commitment_count: usize,
+    execution_valid: bool,
+    use_api: bool,
+) -> ExecutionPayloadControlObservations {
+    use std::sync::{Arc, Mutex};
+
+    use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
+    use eth2_libp2p::GossipId;
+    use execution_engine::MockExecutionEngine;
+    use futures::{StreamExt as _, channel::mpsc};
+    use helper_functions::{misc, signing::SignForSingleFork as _};
+    use pubkey_cache::PubkeyCache;
+    use ssz::{Hc, ProgressiveList, SszHash as _, SszList as _};
+    use std_ext::ArcExt as _;
+    use types::{
+        config::Config,
+        deneb::primitives::KzgCommitment,
+        gloas::{
+            beacon_state::BeaconState as GloasBeaconState,
+            consts::BUILDER_INDEX_SELF_BUILD,
+            containers::{
+                BeaconBlock as GloasBeaconBlock, BeaconBlockBody as GloasBeaconBlockBody,
+                ExecutionPayload as GloasExecutionPayload, ExecutionPayloadBid,
+                ExecutionPayloadEnvelope, ExecutionRequests,
+                SignedBeaconBlock as GloasSignedBeaconBlock, SignedExecutionPayloadBid,
+                SignedExecutionPayloadEnvelope,
+            },
+        },
+        nonstandard::ValidationOutcome,
+        phase0::{
+            containers::{BeaconBlockHeader, Validator},
+            primitives::{ExecutionBlockHash, H256},
+        },
+        traits::BeaconState as _,
+    };
+
+    use crate::{Event, EventChannels, P2pMessage, specialized::TestController};
+
+    let config = Arc::new(Config::minimal().start_and_stay_in(Phase::Gloas));
+
+    let mut key_bytes = SecretKeyBytes::default();
+    key_bytes.as_mut()[31] = 1;
+    let key: SecretKey = key_bytes
+        .try_into()
+        .expect("scalar one is a valid test key");
+    let execution_requests = ExecutionRequests::<Minimal>::default();
+    let mut bid = ExecutionPayloadBid::<Minimal> {
+        block_hash: ExecutionBlockHash::repeat_byte(0x44),
+        prev_randao: H256::repeat_byte(0x55),
+        gas_limit: 30_000_000,
+        builder_index: BUILDER_INDEX_SELF_BUILD,
+        execution_requests_root: execution_requests.hash_tree_root(),
+        ..Default::default()
+    };
+    bid.blob_kzg_commitments =
+        ProgressiveList::try_from(vec![KzgCommitment::repeat_byte(0x66); commitment_count])
+            .expect("fixture commitments fit the progressive-list container");
+    let body = GloasBeaconBlockBody::<Minimal> {
+        signed_execution_payload_bid: SignedExecutionPayloadBid {
+            message: bid.clone(),
+            signature: <_>::default(),
+        },
+        ..Default::default()
+    };
+    let state = types::combined::BeaconState::from(GloasBeaconState::<Minimal> {
+        genesis_time: config.min_genesis_time,
+        validators: core::iter::once(Validator {
+            pubkey: key.to_public_key().into(),
+            activation_epoch: 0,
+            exit_epoch: types::phase0::consts::FAR_FUTURE_EPOCH,
+            ..Default::default()
+        })
+        .collect(),
+        latest_block_header: BeaconBlockHeader {
+            body_root: body.hash_tree_root(),
+            ..Default::default()
+        },
+        latest_execution_payload_bid: bid.clone(),
+        ..Default::default()
+    });
+    let block = GloasSignedBeaconBlock {
+        message: Hc::from(GloasBeaconBlock {
+            state_root: state.hash_tree_root(),
+            body,
+            ..Default::default()
+        }),
+        signature: <_>::default(),
+    };
+    let block_root = block.message.hash_tree_root();
+    assert_eq!(accessors::latest_block_root(&state), block_root);
+    let timestamp = misc::compute_timestamp_at_slot(&config, &state, state.slot())
+        .expect("fixture timestamp should be computable");
+    let post_gloas_state = state.post_gloas().expect("fixture state is Gloas");
+    let envelope_message = ExecutionPayloadEnvelope {
+        payload: GloasExecutionPayload {
+            parent_hash: post_gloas_state.latest_block_hash(),
+            prev_randao: bid.prev_randao,
+            gas_limit: bid.gas_limit,
+            timestamp,
+            withdrawals: ProgressiveList::try_from(
+                post_gloas_state
+                    .payload_expected_withdrawals()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )
+            .expect("expected withdrawals fit in the payload progressive list"),
+            block_hash: bid.block_hash,
+            slot_number: state.slot(),
+            ..Default::default()
+        },
+        execution_requests,
+        builder_index: bid.builder_index,
+        beacon_block_root: block_root,
+        parent_beacon_block_root: state.latest_block_header().parent_root,
+    };
+    let envelope = Arc::new(SignedExecutionPayloadEnvelope {
+        signature: envelope_message.sign(&config, &state, &key).into(),
+        message: envelope_message,
+    });
+    let block = Arc::new(types::combined::SignedBeaconBlock::<Minimal>::from(block));
+    let state = Arc::new(state);
+
+    let event_channels = Arc::new(EventChannels::new(32));
+    let mut available_rx = event_channels.execution_payload_available.subscribe();
+    let mut gossip_rx = event_channels.execution_payloads_gossip.subscribe();
+    let mut payload_rx = event_channels.execution_payloads.subscribe();
+    let (p2p_tx, mut p2p_rx) = mpsc::unbounded();
+    let execution_engine = Arc::new(Mutex::new(MockExecutionEngine::new(
+        execution_valid,
+        false,
+        None,
+    )));
+    let (controller, _mutator_handle) = TestController::with_p2p_tx(
+        config,
+        Arc::new(PubkeyCache::default()),
+        block,
+        state,
+        execution_engine,
+        p2p_tx,
+        event_channels.clone_arc(),
+        Some(1),
+    );
+    assert_eq!(controller.store_snapshot().phase(), Phase::Gloas);
+
+    let (gossip_accept, gossip_reject, api_accept) = if use_api {
+        let (sender, mut receiver) = mpsc::channel(1);
+        controller.on_api_execution_payload_envelope(envelope.clone_arc(), sender);
+        controller.wait_for_tasks();
+        let result = futures::executor::block_on(receiver.next())
+            .expect("accepted API payload should receive a terminal response");
+        (
+            false,
+            false,
+            matches!(result, Ok(ValidationOutcome::Accept)),
+        )
+    } else {
+        controller.on_gossip_execution_payload(envelope.clone_arc(), GossipId::default());
+        controller.wait_for_tasks();
+        let response = p2p_rx
+            .try_recv()
+            .expect("gossip payload should receive a terminal P2P response");
+        match response {
+            P2pMessage::Accept(_) => (true, false, false),
+            P2pMessage::Reject(_, _) => (false, true, false),
+            other => panic!("unexpected terminal payload response: {other:?}"),
+        }
+    };
+
+    let store = controller.store_snapshot();
+    let accepted_marker = store.is_payload_verified(block_root);
+    let selected_envelope = store
+        .cached_execution_payload_envelope_by_root(block_root)
+        .is_some_and(|selected| selected.as_ref() == envelope.as_ref());
+    let available_event = matches!(
+        available_rx.try_recv(),
+        Ok(Event::ExecutionPayloadAvailable(event)) if event.block_root == block_root
+    );
+    let gossip_event = matches!(
+        gossip_rx.try_recv(),
+        Ok(Event::ExecutionPayloadGossip(event)) if event.block_root == block_root
+    );
+    let payload_event = matches!(
+        payload_rx.try_recv(),
+        Ok(Event::ExecutionPayload(event)) if event.block_root == block_root
+    );
+
+    ExecutionPayloadControlObservations {
+        gossip_accept,
+        gossip_reject,
+        api_accept,
+        accepted_marker,
+        selected_envelope,
+        available_event,
+        gossip_event,
+        payload_event,
+    }
+}
+
+#[test]
+fn execution_payload_some_none_and_submission_failure_preserve_control_observables() {
+    // The selected binding type accepts at most 4096 versioned hashes. The ordinary mock EL
+    // accepts both submissions; the over-limit case forces only post-notification capture to None.
+    let some = run_execution_payload_control_case(2, true, false);
+    let none = run_execution_payload_control_case(4097, true, false);
+    assert_eq!(some, none);
+    assert_eq!(
+        some,
+        ExecutionPayloadControlObservations {
+            gossip_accept: true,
+            gossip_reject: false,
+            api_accept: false,
+            accepted_marker: true,
+            selected_envelope: true,
+            available_event: true,
+            gossip_event: true,
+            payload_event: true,
+        }
+    );
+
+    let api = run_execution_payload_control_case(2, true, true);
+    let api_none = run_execution_payload_control_case(4097, true, true);
+    assert_eq!(api, api_none);
+    assert_eq!(
+        api,
+        ExecutionPayloadControlObservations {
+            gossip_accept: false,
+            gossip_reject: false,
+            api_accept: true,
+            accepted_marker: true,
+            selected_envelope: true,
+            available_event: true,
+            gossip_event: true,
+            payload_event: true,
+        }
+    );
+
+    let failed = run_execution_payload_control_case(2, false, false);
+    assert_eq!(
+        failed,
+        ExecutionPayloadControlObservations {
+            gossip_accept: false,
+            gossip_reject: true,
+            api_accept: false,
+            accepted_marker: false,
+            selected_envelope: false,
+            available_event: false,
+            gossip_event: false,
+            payload_event: false,
+        }
+    );
+}
