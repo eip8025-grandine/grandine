@@ -644,6 +644,7 @@ pub struct ExecutionPayloadEnvelopeTask<P: Preset, E, W> {
     pub store_snapshot: Arc<Store<P, Storage<P>>>,
     pub mutator_tx: Sender<MutatorMessage<P, W>>,
     pub execution_engine: E,
+    pub capture_proof_context: bool,
     pub wait_group: W,
     pub execution_payload_envelope: Arc<SignedExecutionPayloadEnvelope<P>>,
     pub origin: ExecutionPayloadEnvelopeOrigin,
@@ -668,6 +669,7 @@ impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for ExecutionPayloadEnvelop
             store_snapshot,
             mutator_tx,
             execution_engine,
+            capture_proof_context,
             wait_group,
             execution_payload_envelope,
             origin,
@@ -690,6 +692,7 @@ impl<P: Preset, E: ExecutionEngine<P> + Send, W> Run for ExecutionPayloadEnvelop
             &origin,
             &execution_engine,
             MultiVerifier::default(),
+            capture_proof_context,
         );
 
         MutatorMessage::ExecutionPayloadEnvelope {
@@ -1731,11 +1734,16 @@ mod tests {
         let proof_engine: Arc<dyn ProofEngine> = engine.clone_arc();
         let (controller, _mutator_handle, p2p_rx) = test_gossip_controller(Some(proof_engine));
         let gossip_id = test_gossip_id(b"injected-active-proof");
+        // Controller construction also checks the engine to initialize payload capture policy.
+        let initial_null_checks = engine.null_checks.load(Ordering::SeqCst);
 
         controller.on_gossip_execution_proof(test_signed_proof(), gossip_id.clone());
 
         assert_ignore_identity(receive_p2p_response(&p2p_rx), &gossip_id);
-        assert_eq!(engine.null_checks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.null_checks.load(Ordering::SeqCst),
+            initial_null_checks + 1,
+        );
         assert_eq!(engine.verification_calls.load(Ordering::SeqCst), 0);
         assert_execution_proof_store_empty(&controller);
     }

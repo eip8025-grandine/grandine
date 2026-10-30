@@ -3742,20 +3742,25 @@ fn run_execution_payload_control_case(
     commitment_count: usize,
     execution_valid: bool,
     use_api: bool,
-) -> ExecutionPayloadControlObservations {
+    proof_engine: Arc<dyn proof_engine::ProofEngine>,
+) -> (ExecutionPayloadControlObservations, bool) {
     use std::sync::{Arc, Mutex};
 
     use bls::{SecretKey, SecretKeyBytes, traits::SecretKey as _};
     use eth2_libp2p::GossipId;
     use execution_engine::MockExecutionEngine;
     use futures::{StreamExt as _, channel::mpsc};
-    use helper_functions::{misc, signing::SignForSingleFork as _};
+    use helper_functions::{
+        misc,
+        signing::{SignForSingleFork as _, SignForSingleForkAtSlot},
+    };
     use pubkey_cache::PubkeyCache;
     use ssz::{Hc, ProgressiveList, SszHash as _, SszList as _};
     use std_ext::ArcExt as _;
     use types::{
         config::Config,
         deneb::primitives::KzgCommitment,
+        eip8025::containers::{ExecutionProofEnvelope, ProofData, SignedExecutionProofEnvelope},
         gloas::{
             beacon_state::BeaconState as GloasBeaconState,
             consts::BUILDER_INDEX_SELF_BUILD,
@@ -3859,6 +3864,23 @@ fn run_execution_payload_control_case(
         signature: envelope_message.sign(&config, &state, &key).into(),
         message: envelope_message,
     });
+    let proof_message = ExecutionProofEnvelope {
+        proof_data: ProofData::try_from(vec![0x42]).expect("non-empty proof bytes fit"),
+        proof_type: 1,
+        beacon_block_root: block_root,
+    };
+    let proof = SignedExecutionProofEnvelope {
+        signature: SignForSingleForkAtSlot::<Minimal>::sign(
+            &proof_message,
+            &config,
+            &state,
+            state.slot(),
+            &key,
+        )
+        .into(),
+        message: Hc::from(proof_message),
+        validator_index: 0,
+    };
     let block = Arc::new(types::combined::SignedBeaconBlock::<Minimal>::from(block));
     let state = Arc::new(state);
 
@@ -3872,12 +3894,13 @@ fn run_execution_payload_control_case(
         false,
         None,
     )));
-    let (controller, _mutator_handle) = TestController::with_p2p_tx(
+    let (controller, _mutator_handle) = TestController::with_p2p_tx_and_proof_engine(
         config,
         Arc::new(PubkeyCache::default()),
         block,
         state,
         execution_engine,
+        proof_engine,
         p2p_tx,
         event_channels.clone_arc(),
         Some(1),
@@ -3926,24 +3949,50 @@ fn run_execution_payload_control_case(
         Ok(Event::ExecutionPayload(event)) if event.block_root == block_root
     );
 
-    ExecutionPayloadControlObservations {
-        gossip_accept,
-        gossip_reject,
-        api_accept,
-        accepted_marker,
-        selected_envelope,
-        available_event,
-        gossip_event,
-        payload_event,
-    }
+    // Preparation checks the live full-Q evidence without entering a proof engine or consuming
+    // Seen. The healthy enabled case makes this a positive as well as a negative capture check.
+    let proof_context_available = match fork_choice_store::prepare_execution_proof(&store, &proof) {
+        Ok(fork_choice_store::ExecutionProofPreparation::Prepared(_)) => true,
+        Ok(fork_choice_store::ExecutionProofPreparation::Ignore(_)) => false,
+        Err(error) => {
+            assert!(
+                commitment_count > 4096,
+                "healthy fixture must prepare: {error:#}"
+            );
+            false
+        }
+    };
+    assert!(store.execution_proof_roots().is_empty());
+    assert!(store.execution_proof_provers().is_empty());
+    (
+        ExecutionPayloadControlObservations {
+            gossip_accept,
+            gossip_reject,
+            api_accept,
+            accepted_marker,
+            selected_envelope,
+            available_event,
+            gossip_event,
+            payload_event,
+        },
+        proof_context_available,
+    )
 }
 
 #[test]
 fn execution_payload_some_none_and_submission_failure_preserve_control_observables() {
     // The selected binding type accepts at most 4096 versioned hashes. The ordinary mock EL
     // accepts both submissions; the over-limit case forces only post-notification capture to None.
-    let some = run_execution_payload_control_case(2, true, false);
-    let none = run_execution_payload_control_case(4097, true, false);
+    use proof_engine::{MockProofEngine, NullProofEngine, ProofEngine, ProofVerdict};
+    use std_ext::ArcExt as _;
+
+    let enabled: Arc<dyn ProofEngine> = Arc::new(MockProofEngine::new(ProofVerdict::Undetermined));
+    let (some, some_context) =
+        run_execution_payload_control_case(2, true, false, enabled.clone_arc());
+    let (none, none_context) =
+        run_execution_payload_control_case(4097, true, false, enabled.clone_arc());
+    assert!(some_context);
+    assert!(!none_context);
     assert_eq!(some, none);
     assert_eq!(
         some,
@@ -3959,8 +4008,11 @@ fn execution_payload_some_none_and_submission_failure_preserve_control_observabl
         }
     );
 
-    let api = run_execution_payload_control_case(2, true, true);
-    let api_none = run_execution_payload_control_case(4097, true, true);
+    let (api, api_context) = run_execution_payload_control_case(2, true, true, enabled.clone_arc());
+    let (api_none, api_none_context) =
+        run_execution_payload_control_case(4097, true, true, enabled.clone_arc());
+    assert!(api_context);
+    assert!(!api_none_context);
     assert_eq!(api, api_none);
     assert_eq!(
         api,
@@ -3976,7 +4028,22 @@ fn execution_payload_some_none_and_submission_failure_preserve_control_observabl
         }
     );
 
-    let failed = run_execution_payload_control_case(2, false, false);
+    for (use_api, expected) in [(false, &some), (true, &api)] {
+        let (disabled, context) =
+            run_execution_payload_control_case(2, true, use_api, Arc::new(NullProofEngine));
+        assert_eq!(&disabled, expected);
+        assert!(
+            !context,
+            "Null must skip proof context without changing payload outcomes"
+        );
+    }
+
+    let (failed, failed_context) = run_execution_payload_control_case(2, false, false, enabled);
+    let (disabled_failed, disabled_failed_context) =
+        run_execution_payload_control_case(2, false, false, Arc::new(NullProofEngine));
+    assert!(!failed_context);
+    assert!(!disabled_failed_context);
+    assert_eq!(failed, disabled_failed);
     assert_eq!(
         failed,
         ExecutionPayloadControlObservations {
@@ -4933,6 +5000,7 @@ mod execution_proof_tests {
                 store_snapshot: snapshot,
                 mutator_tx: self.controller.owned_mutator_tx(),
                 execution_engine: self.controller.execution_engine().clone_arc(),
+                capture_proof_context: true,
                 wait_group: self.controller.owned_wait_group(),
                 execution_payload_envelope: payload.clone_arc(),
                 origin: ExecutionPayloadEnvelopeOrigin::Gossip(gossip_id.clone()),

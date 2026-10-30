@@ -341,6 +341,7 @@ fn accepted_payload_carrier<S: Storage<Minimal>>(
             &ExecutionPayloadEnvelopeOrigin::Own,
             engine,
             NullVerifier,
+            true,
         )
         .expect("ordinary payload validation should return an action")
     {
@@ -6535,6 +6536,7 @@ fn execution_proof_payload_context_capture_is_skipped_when_engine_submission_fai
             &ExecutionPayloadEnvelopeOrigin::Own,
             &engine,
             NullVerifier,
+            true,
         )
         .expect_err("ordinary EL submission failure must remain an error");
 
@@ -6571,11 +6573,25 @@ fn execution_proof_payload_capture_is_not_run_before_ordinary_rejection() {
             &ExecutionPayloadEnvelopeOrigin::Own,
             &engine,
             NullVerifier,
+            true,
         )
         .expect_err("ordinary bid binding rejection should remain an error");
 
     assert!(matches!(
         error.downcast_ref::<Error<Minimal>>(),
+        Some(Error::ExecutionPayloadBlockHashMismatch { .. })
+    ));
+    let disabled_error = store
+        .validate_execution_payload_envelope(
+            &invalid_envelope,
+            &ExecutionPayloadEnvelopeOrigin::Own,
+            &engine,
+            NullVerifier,
+            false,
+        )
+        .expect_err("disabled proof capture must not bypass ordinary payload rejection");
+    assert!(matches!(
+        disabled_error.downcast_ref::<Error<Minimal>>(),
         Some(Error::ExecutionPayloadBlockHashMismatch { .. })
     ));
     assert!(
@@ -6739,6 +6755,7 @@ fn execution_proof_payload_capture_is_skipped_for_ignore_and_delay_actions() {
             &ExecutionPayloadEnvelopeOrigin::Own,
             &ignored_engine,
             NullVerifier,
+            true,
         )
         .expect("duplicate envelope should be ignored before execution");
     assert!(matches!(
@@ -6771,6 +6788,7 @@ fn execution_proof_payload_capture_is_skipped_for_ignore_and_delay_actions() {
             &ExecutionPayloadEnvelopeOrigin::Own,
             &delayed_engine,
             NullVerifier,
+            true,
         )
         .expect("unknown block should delay the envelope before execution");
     assert!(matches!(
@@ -6827,6 +6845,7 @@ fn execution_proof_payload_signature_error_skips_notification_and_capture() {
             &ExecutionPayloadEnvelopeOrigin::Gossip(GossipId::default()),
             &engine,
             NullVerifier,
+            true,
         )
         .expect_err("a validly encoded signature from the wrong key must fail authentication");
 
@@ -6921,6 +6940,7 @@ fn execution_proof_payload_data_availability_delay_skips_notification_and_captur
             &ExecutionPayloadEnvelopeOrigin::Own,
             &engine,
             NullVerifier,
+            true,
         )
         .expect("missing Gloas data columns should delay, not reject");
     assert!(matches!(
@@ -7004,6 +7024,7 @@ fn execution_proof_payload_state_slot_mismatch_rejects_without_notification_or_c
             &ExecutionPayloadEnvelopeOrigin::Own,
             &engine,
             NullVerifier,
+            true,
         )
         .expect_err("an inconsistent selected state must preserve ordinary rejection");
     assert!(matches!(
@@ -7027,30 +7048,30 @@ fn execution_proof_payload_state_slot_mismatch_rejects_without_notification_or_c
 
 #[test]
 fn execution_proof_capture_disabled_preserves_ordinary_payload_validation_observables() {
-    let (store, state, envelope) = payload_validation_fixture();
+    let (mut store, _, envelope) = payload_validation_fixture();
     let ordinary_engine = recording_payload_engine(&store, false);
     let ordinary = accepted_payload_carrier(&store, &envelope, &ordinary_engine);
-    assert!(ordinary.proof_public_input.is_some());
+    let public_input = ordinary
+        .proof_public_input
+        .expect("enabled capture should retain the healthy statement");
 
     let disabled_engine = recording_payload_engine(&store, false);
     let block_root = envelope.block_root();
     let disabled = store
-        .validate_execution_payload_envelope_with_state(
-            envelope.clone_arc(),
+        .validate_execution_payload_envelope(
+            &envelope,
             &ExecutionPayloadEnvelopeOrigin::Own,
-            || {
-                store
-                    .chain_link(block_root)
-                    .map(|link| link.block.clone_arc())
-            },
-            || Some(state.clone_arc()),
             &disabled_engine,
+            NullVerifier,
+            false,
         )
         .expect("capture-disabled validation should preserve ordinary acceptance");
-    assert!(matches!(
-        disabled,
-        ExecutionPayloadEnvelopeAction::Accept(_)
-    ));
+    let ExecutionPayloadEnvelopeValidationAction::Accept(disabled) = disabled else {
+        panic!("capture-disabled validation should still accept the payload");
+    };
+    assert!(disabled.proof_public_input.is_none());
+    assert_eq!(ordinary_engine.requests.lock().len(), 1);
+    assert_eq!(disabled_engine.requests.lock().len(), 1);
     assert_eq!(
         recorded_payload_request(&ordinary_engine, 0),
         recorded_payload_request(&disabled_engine, 0)
@@ -7065,6 +7086,15 @@ fn execution_proof_capture_disabled_preserves_ordinary_payload_validation_observ
             .load(Ordering::SeqCst),
         1
     );
+
+    // Validate both carriers before application, as with concurrent payload workers. A later
+    // capture-disabled selection must revoke the enabled carrier's obsolete evidence.
+    store.apply_execution_payload_envelope(ordinary, true);
+    assert!(store.execution_proof_context_is_applicable(block_root, &public_input));
+    store.apply_execution_payload_envelope(disabled, true);
+    assert!(store.is_payload_verified(block_root));
+    assert!(!store.execution_proof_contexts.contains_key(&block_root));
+    assert_selected_payload_application(&store, &envelope, None, true);
 }
 
 #[test]

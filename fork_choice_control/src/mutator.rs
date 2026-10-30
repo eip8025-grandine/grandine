@@ -120,6 +120,10 @@ const MAX_CONSECUTIVE_FAILED_ARCHIVES: u8 = 2;
 const MAX_DELAYED_REQUESTED_ENVELOPES_UNTIL_BLOCK_IN_EPOCHS: usize = 16;
 
 #[expect(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "verifier capture policy is independent of loading and archive task state"
+)]
 pub struct Mutator<P: Preset, E, W, TS, PS, LS, NS, SS, VS> {
     pubkey_cache: Arc<PubkeyCache>,
     store: Arc<Store<P, Storage<P>>>,
@@ -128,6 +132,8 @@ pub struct Mutator<P: Preset, E, W, TS, PS, LS, NS, SS, VS> {
     block_processor: Arc<BlockProcessor<P>>,
     event_channels: Arc<EventChannels<P>>,
     execution_engine: E,
+    // Controller-derived verifier policy for all delayed payload retries. Store stays engine-free.
+    capture_proof_context: bool,
     delayed_until_blobs: HashMap<H256, PendingBlock<P>>,
     delayed_until_block: HashMap<H256, Delayed<P>>,
     delayed_until_data: HashMap<H256, PendingExecutionPayloadEnvelope<P>>,
@@ -189,6 +195,7 @@ where
         block_processor: Arc<BlockProcessor<P>>,
         event_channels: Arc<EventChannels<P>>,
         execution_engine: E,
+        capture_proof_context: bool,
         sidecars_pending_reconstruction: SidecarsPendingReconstruction<P>,
         state_at_slot_cache: Arc<StateAtSlotCache<P>>,
         storage: Arc<Storage<P>>,
@@ -211,6 +218,7 @@ where
             block_processor,
             event_channels,
             execution_engine,
+            capture_proof_context,
             delayed_until_blobs: HashMap::new(),
             delayed_until_block: HashMap::new(),
             delayed_until_data: HashMap::new(),
@@ -4986,6 +4994,7 @@ where
             store_snapshot: self.owned_store(),
             mutator_tx: self.owned_mutator_tx(),
             execution_engine: self.execution_engine.clone(),
+            capture_proof_context: self.capture_proof_context,
             wait_group,
             execution_payload_envelope,
             origin,
@@ -6838,7 +6847,7 @@ mod tests {
                 AttestationVerifierMessage, MutatorMessage, P2pMessage, PoolMessage, SubnetMessage,
                 SyncMessage, ValidatorMessage,
             },
-            misc::{MutatorRejectionReason, ProcessingTimings},
+            misc::{MutatorRejectionReason, PendingExecutionPayloadEnvelope, ProcessingTimings},
             mutator::Mutator,
             specialized::TestExecutionEngine,
             state_at_slot_cache::StateAtSlotCache,
@@ -8020,6 +8029,7 @@ mod tests {
                     block_processor,
                     Arc::new(EventChannels::new(16)),
                     execution_engine,
+                    !proof_engine.is_null(),
                     Arc::new(SccHashMap::new()),
                     Arc::new(StateAtSlotCache::build()),
                     storage,
@@ -8068,6 +8078,7 @@ mod tests {
                     &origin,
                     &self.mutator.execution_engine,
                     MultiVerifier::default(),
+                    self.mutator.capture_proof_context,
                 );
                 assert!(matches!(
                     &result,
@@ -8583,6 +8594,83 @@ mod tests {
             // the pre-transition snapshot; only their gossip identities differ.
             let probes = prepare_retired_probe_pair(&harness, &harness.anchor, accepted_snapshot);
             finish_retired_attempts(&mut harness, &topology, &attempts, probes, verdict);
+        }
+
+        #[test]
+        fn execution_payload_retry_preserves_proof_context_capture_policy() {
+            for capture_proof_context in [false, true] {
+                let mut harness = ProofServiceHarness::new();
+                // Isolate the shared retry seam used by block/state/data-delayed payloads.
+                // Controller policy derivation is covered by the ordinary submission regression.
+                harness.mutator.capture_proof_context = capture_proof_context;
+                let gossip_id = test_gossip_id(0x11);
+                harness.mutator.retry_execution_payload_envelope(
+                    (),
+                    PendingExecutionPayloadEnvelope {
+                        execution_payload_envelope: harness.anchor.payload.clone_arc(),
+                        origin: ExecutionPayloadEnvelopeOrigin::Gossip(gossip_id.clone()),
+                        seen_before_deadline: true,
+                        processing_timings: ProcessingTimings::new(),
+                        tracing_span: tracing::Span::none(),
+                    },
+                );
+                let message = harness
+                    .mutator
+                    .mutator_rx
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("retried payload worker must finish validation");
+                let MutatorMessage::ExecutionPayloadEnvelope {
+                    wait_group,
+                    result,
+                    origin,
+                    payload_envelope_identifier,
+                    seen_before_deadline,
+                    processing_timings,
+                    tracing_span,
+                } = message
+                else {
+                    panic!("retry must return an ordinary payload validation result");
+                };
+                assert!(matches!(
+                    &result,
+                    Ok(ExecutionPayloadEnvelopeValidationAction::Accept(_))
+                ));
+                harness.mutator.handle_execution_payload_envelope(
+                    wait_group,
+                    result,
+                    origin,
+                    payload_envelope_identifier,
+                    seen_before_deadline,
+                    processing_timings,
+                    tracing_span,
+                );
+                harness.receive_p2p(P2pOutcome::Accept, &gossip_id);
+                let snapshot = harness.store_snapshot.load_full();
+                assert!(snapshot.is_payload_verified(harness.anchor.block_root));
+                assert_eq!(
+                    snapshot
+                        .cached_execution_payload_envelope_by_root(harness.anchor.block_root)
+                        .expect("retried payload must be applied")
+                        .as_ref(),
+                    harness.anchor.payload.as_ref(),
+                );
+                let attempt = build_proof_attempt(&harness.anchor, &snapshot, 0, 0xa1, 0x21);
+                let preparation =
+                    fork_choice_store::prepare_execution_proof(&snapshot, &attempt.signed_proof)
+                        .expect("healthy retry fixture must not reject proof preparation");
+                match preparation {
+                    ExecutionProofPreparation::Prepared(_) => assert!(capture_proof_context),
+                    ExecutionProofPreparation::Ignore(reason) => {
+                        assert!(!capture_proof_context);
+                        assert_eq!(
+                            reason,
+                            "execution proof's accepted payload context is no longer applicable"
+                        );
+                    }
+                }
+                assert_observation(&StoreObservation::capture(&snapshot), &[], None);
+                assert_eq!(harness.engine.invocation_count(), 0);
+            }
         }
 
         #[test]
