@@ -37,6 +37,7 @@ options=(
     --package eth1_api
     --package eth2_cache_utils
     --package execution_engine
+    --package execution_proof_publisher
     --package factory
     --package features
     --package fork_choice_control

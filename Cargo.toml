@@ -27,6 +27,7 @@ members = [
     'eth1_api',
     'eth2_cache_utils',
     'execution_engine',
+    'execution_proof_publisher',
     'factory',
     'features',
     'fork_choice_control',

@@ -1,0 +1,30 @@
+# Design 0012's devnet: one Grandine participant with geth, Gloas at genesis.
+#
+# `run.sh` builds `grandine-eip8025-devnet:local` and passes this file to
+# ethereum-package. Nothing else in the enclave publishes execution proofs,
+# and no port is published to the host.
+
+participants:
+  - el_type: geth
+    # The image zkBoost's testnet uses.
+    el_image: ethpandaops/geth:glamsterdam-devnet-8-aa1f2fc
+    cl_type: grandine
+    cl_image: grandine-eip8025-devnet:local
+    # Grandine runs the participant's validators itself.
+    use_separate_vc: false
+    cl_extra_params:
+      - --execution-proof-type=1=mock
+      - --execution-proof-type=2=sp1:0x00662ca6c9db4ecb22d9ac4c320612caeac9c320f92e3ab019af4f544e35c88b
+    cl_extra_env_vars:
+      # Adds the engine's verdict line and P1's outcome lines to the default
+      # filter, as agreed with the P1 owner.
+      GRANDINE_LOG: fork_choice_control=trace,proof_engine=debug
+
+network_params:
+  preset: mainnet
+  network_id: "3151908"
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 0
+
+additional_services: []
