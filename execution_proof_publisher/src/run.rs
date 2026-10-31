@@ -273,6 +273,10 @@ impl<P: Preset> Publication<'_, P> {
         }
 
         for step in steps {
+            // TEMPORARY: run only the tampered SP1 proof test (step 4).
+            if step.number != 3 {
+                continue;
+            }
             let handle = handles
                 .iter()
                 .find(|handle| handle.role() == step.role)
