@@ -66,7 +66,7 @@ cleanup() {
 trap cleanup EXIT
 
 publisher() {
-    docker run --rm --user "$(id -u):$(id -g)" --entrypoint execution_proof_publisher "$@"
+    docker run --rm --userns=keep-id --user "$(id -u):$(id -g)" --entrypoint execution_proof_publisher "$@"
 }
 
 # Parameters and versions.
@@ -127,7 +127,7 @@ fi
 
 echo "publishing to $address" >&2
 publisher_status=0
-publisher --network "$network" --volume "$bundle:/bundle" --volume "$keys:/keys:ro" "$image" run \
+publisher --network "$network" --volume "$bundle:/bundle:Z" --volume "$keys:/keys:ro,Z" "$image" run \
     --beacon-url "http://$address:$beacon_port" \
     --config /bundle/network-configs/config.yaml \
     --keystore-dir "/keys${keystore_dir#"$keys"}" \
@@ -138,7 +138,7 @@ publisher --network "$network" --volume "$bundle:/bundle" --volume "$keys:/keys:
 echo "publisher_exit: $publisher_status" >> "$bundle/versions.txt"
 
 # Replace the streamed log with the complete one.
-kill "$log_follower"
+kill "$log_follower" 2>/dev/null || true
 wait "$log_follower" 2>/dev/null || true
 log_follower=
 kurtosis service logs --all "$enclave" "$service" > "$bundle/grandine.log" 2>&1
@@ -146,7 +146,7 @@ kurtosis service logs --all "$enclave" "$service" > "$bundle/grandine.log" 2>&1
 # The evaluation sets the exit code, including for a run that stopped early.
 trap - ERR
 verdict_status=0
-publisher --volume "$bundle:/bundle" "$image" evaluate \
+publisher --volume "$bundle:/bundle:Z" "$image" evaluate \
     --report /bundle/report.jsonl \
     --log /bundle/grandine.log \
     --verdict /bundle/verdict.json \
