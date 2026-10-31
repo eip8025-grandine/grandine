@@ -1,0 +1,5 @@
+# BuildKit reads this file for `scripts/eip8025_devnet/Dockerfile` only.
+# `.git` stays in the context because `grandine_version` reads it.
+**/target
+consensus-spec-tests
+eth2-cache

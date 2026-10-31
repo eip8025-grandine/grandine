@@ -5924,6 +5924,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "execution_proof_publisher"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bls",
+ "chrono",
+ "clap",
+ "eip_2335",
+ "eth2_libp2p",
+ "fork_choice_store",
+ "fs-err",
+ "futures",
+ "helper_functions",
+ "hex",
+ "kzg_utils",
+ "proof_engine",
+ "pubkey_cache",
+ "regex",
+ "reqwest 0.13.2",
+ "scc 3.7.0",
+ "serde",
+ "serde_json",
+ "serde_utils",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "ssz",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "types",
+]
+
+[[package]]
 name = "eyre"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
